@@ -1,10 +1,8 @@
 fastapi
-hypercorn
-openai
-numpy
-chromadb
-supabase-py
 uvicorn
-python-dotenv
-httpx
-websockets
+openai
+supabase
+langchain
+PyPDF2
+python-multipart
+chromadb
