@@ -161,91 +161,6 @@ class RAGSystem:
             print(f"Response generation error: {e}")
             return "I apologize, but I couldn't generate a response."
         
-    def generate_response_without_ai(self, query: str, pdf_ids=None, yt_id=None):
-        """
-        Generate a response using ChromaDB similarity search without OpenAI
-        
-        Args:
-            query (str): User's input query
-            pdf_ids (List[str], optional): List of PDF IDs to search within
-            yt_id (str, optional): YouTube ID to search within
-        
-        Returns:
-            str: A generated response based on the most similar text chunks
-        """
-        try:
-            # Generate query embedding using the same method
-            query_embedding = self.generate_embedding(query)
-            
-            # Perform similarity search across collections
-            results = {
-                'pdf': [],
-                'yt': []
-            }
-            
-            # PDF search
-            if pdf_ids:
-                pdf_collection = self.chroma_client.get_collection("pdf_embeddings")
-                pdf_results = pdf_collection.query(
-                    query_embeddings=[query_embedding],
-                    where={"pdf_id": {"$in": pdf_ids}},
-                    n_results=5
-                )
-                results['pdf'] = pdf_results.get('documents', [])
-            
-            # YouTube search
-            if yt_id:
-                yt_collection = self.chroma_client.get_collection("youtube_embeddings")
-                yt_results = yt_collection.query(
-                    query_embeddings=[query_embedding],
-                    where={"yt_id": yt_id},
-                    n_results=5
-                )
-                results['yt'] = yt_results.get('documents', [])
-            
-            # Combine and flatten results
-            all_chunks = []
-            for collection_type in ['pdf', 'yt']:
-                for doc_list in results[collection_type]:
-                    if isinstance(doc_list, list):
-                        all_chunks.extend(doc_list)
-                    elif isinstance(doc_list, str):
-                        all_chunks.append(doc_list)
-            
-            # If no chunks found, return a default message
-            if not all_chunks:
-                return "I couldn't find any relevant information to answer your query."
-            
-            # Basic response generation by concatenating most relevant chunks
-            context = "\n".join(all_chunks[:3])  # Use top 3 chunks
-            
-            # Simple extractive response generation
-            response_chunks = []
-            for chunk in all_chunks[:3]:
-                # Look for sentences that seem to directly answer the query
-                sentences = chunk.split('.')
-                query_keywords = set(query.lower().split())
-                
-                relevant_sentences = [
-                    sent.strip() + '.' 
-                    for sent in sentences 
-                    if any(keyword in sent.lower() for keyword in query_keywords)
-                ]
-                
-                response_chunks.extend(relevant_sentences)
-            
-            # Limit response length and create a coherent summary
-            response = ' '.join(response_chunks[:5])
-            
-            # Fallback if no specific sentences found
-            if not response:
-                response = f"Based on the context, here's a summary: {context[:500]}..."
-            
-            return response
-        
-        except Exception as e:
-            logger.error(f"Error in ChromaDB response generation: {e}")
-            return "I apologize, but I couldn't generate a response at this time."    
 
 # FastAPI App
 app = FastAPI()
@@ -292,11 +207,7 @@ async def process_rag_request(request: RAGRequest):
 
         # Generate response
         response = rag_system.generate_response(request.query, text_chunks[0])
-        # response = rag_system.generate_response_without_ai(
-        #     request.query, 
-        #     request.pdfIds, 
-        #     request.ytId
-        # )
+      
         # print(f"response from ai", response)
 
 
