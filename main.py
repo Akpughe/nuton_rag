@@ -226,6 +226,96 @@ async def process_rag_request(request: RAGRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+@app.post("/process-yt-embeddings")
+async def process_yt_embeddings(request: YTEmbeddingRequest):
+    try:
+        # Initialize ChromaDB client
+        chroma_client = chromadb.HttpClient(host='https://thirsty-christian-akpughe-0d8a1b81.koyeb.app', port=8000)
+        
+        # Create or get collection
+        collection = chroma_client.get_or_create_collection("youtube_embeddings")
+        
+        # Text splitting
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=150000, 
+            chunk_overlap=1000
+        )
+        chunks = text_splitter.split_text(request.text)
+        
+        # Generate embeddings and insert into ChromaDB
+        for i, chunk in enumerate(chunks):
+            embedding = generate_embedding(chunk)
+            collection.add(
+                ids=[f"{request.yt_id}_{i}"],
+                embeddings=[embedding],
+                metadatas=[{
+                    "yt_id": request.yt_id,
+                    "content": chunk,
+                    "created_at": datetime.now().isoformat()
+                }],
+                documents=[chunk]
+            )
+        
+        return {"status": "success", "chunks_processed": len(chunks)}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))  
+
+@app.post("/upload-yt")
+async def upload_yt(request: YTUploadRequest):
+    try:
+        # Use text splitter to chunk the text
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=150000,  # Consistent with PDF upload 
+            chunk_overlap=100
+        )
+        text_chunks = text_splitter.split_text(request.text)
+        
+        # Upload YouTube metadata to Supabase
+        yt_upload = rag_system.supabase.table('yts').insert({
+            'space_id': request.space_id,
+            'yt_url': str(request.yt_link),
+            'thumbnail': request.thumbnail,
+            'extracted_text': request.text
+        }).execute()
+        
+        # Get the inserted YouTube record ID
+        yt_id = yt_upload.data[0]['id']
+        
+        # Process embeddings for chunks
+        chroma_client = chromadb.HttpClient(host='https://thirsty-christian-akpughe-0d8a1b81.koyeb.app', port=8000)
+        collection = chroma_client.get_or_create_collection("youtube_embeddings")
+        
+        for i, chunk in enumerate(text_chunks):
+            try:
+                # Generate embedding for each chunk
+                embedding = rag_system.generate_embedding(chunk)
+                
+                # Add to ChromaDB
+                collection.add(
+                    ids=[f"{yt_id}_{i}"],
+                    embeddings=[embedding],
+                    metadatas=[{
+                        "yt_id": yt_id,
+                        "chunk_index": i,
+                        "created_at": datetime.now().isoformat()
+                    }],
+                    documents=[chunk]
+                )
+            except Exception as chunk_error:
+                print(f"Error processing YouTube chunk {i}: {chunk_error}")
+        
+        return {
+            "status": "success", 
+            "yt_id": yt_id, 
+            "yt_link": str(request.yt_link), 
+            "chunks_processed": len(text_chunks)
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))    
+
 
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
