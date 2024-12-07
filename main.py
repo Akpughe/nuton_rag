@@ -231,7 +231,7 @@ async def process_rag_request(request: RAGRequest):
 async def process_yt_embeddings(request: YTEmbeddingRequest):
     try:
         # Initialize ChromaDB client
-        chroma_client = chromadb.HttpClient(host='https://thirsty-christian-akpughe-0d8a1b81.koyeb.app', port=8000)
+        chroma_client = chromadb.HttpClient(host = os.getenv('CHROMA_DB_CONNECTION_STRING'), port=8000)
         
         # Create or get collection
         collection = chroma_client.get_or_create_collection("youtube_embeddings")
@@ -284,7 +284,7 @@ async def upload_yt(request: YTUploadRequest):
         yt_id = yt_upload.data[0]['id']
         
         # Process embeddings for chunks
-        chroma_client = chromadb.HttpClient(host='https://thirsty-christian-akpughe-0d8a1b81.koyeb.app', port=8000)
+        chroma_client = chromadb.HttpClient(host = os.getenv('CHROMA_DB_CONNECTION_STRING'), port=8000)
         collection = chroma_client.get_or_create_collection("youtube_embeddings")
         
         for i, chunk in enumerate(text_chunks):
