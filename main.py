@@ -57,7 +57,7 @@ class RAGSystem:
             )
             
             # ChromaDB configuration from environment
-            chroma_host = os.getenv('CHROMA_HOST', 'https://thirsty-christian-akpughe-0d8a1b81.koyeb.app')
+            chroma_host = os.getenv('CHROMA_HOST',  os.getenv('CHROMA_DB_CONNECTION_STRING'))
             chroma_port = int(os.getenv('CHROMA_PORT', 8000))
             self.chroma_client = chromadb.HttpClient(host=chroma_host, port=chroma_port)
 
@@ -276,7 +276,7 @@ async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
         text_chunks = text_splitter.split_text(full_text)
         
         # Process embeddings for each chunk
-        chroma_client = chromadb.HttpClient(host='https://thirsty-christian-akpughe-0d8a1b81.koyeb.app', port=8000)
+        chroma_client = chromadb.HttpClient(host = os.getenv('CHROMA_DB_CONNECTION_STRING'), port=8000)
         collection = chroma_client.get_or_create_collection("pdf_embeddings")
         
         for i, chunk in enumerate(text_chunks):
