@@ -1,0 +1,10 @@
+fastapi
+hypercorn
+openai
+numpy
+chromadb
+supabase-py
+uvicorn
+python-dotenv
+httpx
+websockets
