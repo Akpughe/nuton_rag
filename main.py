@@ -11,6 +11,10 @@ from datetime import datetime
 import PyPDF2
 import io
 from dotenv import load_dotenv
+import logging
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
 
