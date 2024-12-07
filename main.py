@@ -354,7 +354,7 @@ async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
             except Exception as chunk_error:
                 print(f"Error processing chunk {i}: {chunk_error}")
         
-        return {"status": "success", "pdf_id": pdf_id, "file_url": public_url, "chunks_processed": len(text_chunks)}
+        return {"status": "success", "pdf_id": pdf_id, "file_url": public_url, "extracted_text": full_text, "chunks_processed": len(text_chunks)}
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
