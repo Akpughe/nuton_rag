@@ -239,14 +239,42 @@ async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
         page_text_map = []  # Store text and page number for each section
         
         for page_num, page in enumerate(pdf_reader.pages, start=1):
-            page_content = page.extract_text()
-            # Store start position, text, and page number
-            page_text_map.append({
-                'start': len(full_text),
-                'text': page_content,
-                'page_num': page_num
-            })
-            full_text += page_content + "\n"
+            try:
+                # Alternative text extraction methods
+                try:
+                    # First, try the standard extract_text()
+                    page_content = page.extract_text()
+                except Exception as standard_extract_error:
+                    # If standard extraction fails, try alternative approaches
+                    try:
+                        # Extract text from page objects more directly
+                        page_content = page.get_text()
+                    except Exception as alternative_extract_error:
+                        # If both fail, log the error and skip this page
+                        print(f"Failed to extract text from page {page_num}")
+                        print(f"Standard extract error: {standard_extract_error}")
+                        print(f"Alternative extract error: {alternative_extract_error}")
+                        page_content = ""
+                
+                # Remove any problematic characters
+                page_content = ''.join(char for char in page_content if char.isprintable())
+                
+                # Store start position, text, and page number
+                page_text_map.append({
+                    'start': len(full_text),
+                    'text': page_content,
+                    'page_num': page_num
+                })
+                full_text += page_content + "\n"
+            
+            except Exception as page_error:
+                print(f"Unexpected error extracting text from page {page_num}: {page_error}")
+                traceback.print_exc()  # Print full stack trace for debugging
+                continue
+        
+        # If no text was extracted at all, raise an error
+        if not full_text.strip():
+            raise ValueError("No text could be extracted from the PDF")
         
         # Compress and upload PDF to Supabase Storage
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
