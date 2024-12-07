@@ -106,7 +106,7 @@ class RAGSystem:
                 # Flatten documents
                 results = [doc for sublist in documents for doc in (sublist if isinstance(sublist, list) else [sublist])]
             
-            # YouTube search (existing logic)
+            # YouTube search
             if yt_id:
                 yt_collection = self.chroma_client.get_collection("youtube_embeddings")
 
@@ -185,6 +185,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.get("/")
+async def root():
+    return {"greeting": "Hello!", "message": "Welcome to Nuton RAG!"}
 
 @app.post("/rag")
 async def process_rag_request(request: RAGRequest):
