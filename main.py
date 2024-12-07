@@ -2,7 +2,7 @@ import os
 from fastapi import File, UploadFile, Form, HTTPException, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 import openai
 import chromadb
 from supabase import create_client, Client
@@ -12,12 +12,12 @@ import PyPDF2
 import io
 from dotenv import load_dotenv
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
-
 
 class RAGRequest(BaseModel):
     query: str
@@ -27,6 +27,7 @@ class RAGRequest(BaseModel):
 class RAGResponse(BaseModel):
     response: str
     role: str
+    page_references: Optional[Dict[str, List[int]]] = None
 
 class PDFEmbeddingRequest(BaseModel):
     pdf_id: str
@@ -73,12 +74,10 @@ class RAGSystem:
         return response.data[0].embedding
 
     def similarity_search(self, query_embedding, pdf_ids=None, yt_id=None):
-        """Perform similarity search across collections"""
+        """Perform similarity search across collections with page tracking"""
         try:
-            # Prepare collections
-            # yt_collection = self.chroma_client.get_collection("youtube_embeddings")
-
             results = []
+            page_references = {}
             
             # PDF search
             if pdf_ids:
@@ -88,12 +87,26 @@ class RAGSystem:
                     where={"pdf_id": {"$in": pdf_ids}},
                     n_results=5
                 )
-                documents = pdf_results.get('documents', [])
-            if documents:
-                # Flatten the list of lists into a single list of strings
+                
+                documents = pdf_results.get('documents', [[]])
+                metadatas = pdf_results.get('metadatas', [[]])
+                
+                # Flatten documents and track page references
+                for pdf_metadata_list in metadatas:
+                    for metadata in pdf_metadata_list:
+                        pdf_id = metadata.get('pdf_id', 'unknown')
+                        page = metadata.get('page', 'unknown')
+                        
+                        if pdf_id not in page_references:
+                            page_references[pdf_id] = []
+                        
+                        if page not in page_references[pdf_id] and page != 'unknown':
+                            page_references[pdf_id].append(page)
+                
+                # Flatten documents
                 results = [doc for sublist in documents for doc in (sublist if isinstance(sublist, list) else [sublist])]
-
-            # YouTube search
+            
+            # YouTube search (existing logic)
             if yt_id:
                 yt_collection = self.chroma_client.get_collection("youtube_embeddings")
 
@@ -107,11 +120,11 @@ class RAGSystem:
                     # Flatten the list of lists into a single list of strings
                     results.extend([doc for sublist in yt_documents for doc in (sublist if isinstance(sublist, list) else [sublist])])    
             
-            return results
+            return results, page_references
         
         except Exception as e:
             print(f"Similarity search error: {e}")
-            return []
+            return [], {}
 
     def retrieve_content(self, pdf_ids=None, yt_id=None):
         """Retrieve content from Supabase"""
@@ -160,7 +173,6 @@ class RAGSystem:
         except Exception as e:
             print(f"Response generation error: {e}")
             return "I apologize, but I couldn't generate a response."
-        
 
 # FastAPI App
 app = FastAPI()
@@ -168,15 +180,11 @@ rag_system = RAGSystem()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
-
-@app.get("/")
-async def root():
-    return {"greeting": "Hello!", "message": "Welcome to Nuton RAG!"}
 
 @app.post("/rag")
 async def process_rag_request(request: RAGRequest):
@@ -184,14 +192,12 @@ async def process_rag_request(request: RAGRequest):
         # Generate query embedding
         query_embedding = rag_system.generate_embedding(request.query)
 
-        # Perform similarity search
-        search_results = rag_system.similarity_search(
+        # Perform similarity search with page references
+        search_results, page_refs = rag_system.similarity_search(
             query_embedding, 
             request.pdfIds, 
             request.ytId
         )
-
-        # print(f"result", search_results)
 
         # Retrieve content
         if not search_results:
@@ -207,92 +213,15 @@ async def process_rag_request(request: RAGRequest):
 
         # Generate response
         response = rag_system.generate_response(request.query, text_chunks[0])
-      
-        # print(f"response from ai", response)
 
-
-        return RAGResponse(response=response, role="assistant")
+        return RAGResponse(
+            response=response, 
+            role="assistant", 
+            page_references=page_refs
+        )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
-@app.post("/process-pdf-embeddings")
-async def process_pdf_embeddings(request: PDFEmbeddingRequest):
-    try:
-        # Initialize ChromaDB client
-        chroma_client = chromadb.HttpClient(host='https://thirsty-christian-akpughe-0d8a1b81.koyeb.app', port=8000)
-        
-        # Create or get collection
-        collection = chroma_client.get_or_create_collection("pdf_embeddings")
-        
-        # Text splitting
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=150000, 
-            chunk_overlap=1000
-        )
-        chunks = text_splitter.split_text(request.text)
-        
-        # Generate embeddings and insert into ChromaDB
-        for i, chunk in enumerate(chunks):
-            embedding = generate_embedding(chunk)
-            collection.add(
-                ids=[f"{request.pdf_id}_{i}"],
-                embeddings=[embedding],
-                metadatas=[{
-                    "pdf_id": request.pdf_id,
-                    "content": chunk,
-                    "created_at": datetime.now().isoformat()
-                }],
-                documents=[chunk]
-            )
-        
-        return {"status": "success", "chunks_processed": len(chunks)}
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-@app.post("/process-yt-embeddings")
-async def process_yt_embeddings(request: YTEmbeddingRequest):
-    try:
-        # Initialize ChromaDB client
-        chroma_client = chromadb.HttpClient(host='https://thirsty-christian-akpughe-0d8a1b81.koyeb.app', port=8000)
-        
-        # Create or get collection
-        collection = chroma_client.get_or_create_collection("youtube_embeddings")
-        
-        # Text splitting
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=150000, 
-            chunk_overlap=1000
-        )
-        chunks = text_splitter.split_text(request.text)
-        
-        # Generate embeddings and insert into ChromaDB
-        for i, chunk in enumerate(chunks):
-            embedding = generate_embedding(chunk)
-            collection.add(
-                ids=[f"{request.yt_id}_{i}"],
-                embeddings=[embedding],
-                metadatas=[{
-                    "yt_id": request.yt_id,
-                    "content": chunk,
-                    "created_at": datetime.now().isoformat()
-                }],
-                documents=[chunk]
-            )
-        
-        return {"status": "success", "chunks_processed": len(chunks)}
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))    
-
-def generate_embedding(text: str):
-    """Generate embedding for text"""
-    response = openai.embeddings.create(
-        model="text-embedding-ada-002",
-        input=text
-    )
-    return response.data[0].embedding
 
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
@@ -301,10 +230,19 @@ async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
         pdf_content = await file.read()
         pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
         
-        # Extract text
+        # Extract text with advanced page tracking
         full_text = ""
-        for page in pdf_reader.pages:
-            full_text += page.extract_text() + "\n"
+        page_text_map = []  # Store text and page number for each section
+        
+        for page_num, page in enumerate(pdf_reader.pages, start=1):
+            page_content = page.extract_text()
+            # Store start position, text, and page number
+            page_text_map.append({
+                'start': len(full_text),
+                'text': page_content,
+                'page_num': page_num
+            })
+            full_text += page_content + "\n"
         
         # Compress and upload PDF to Supabase Storage
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -332,7 +270,7 @@ async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
         
         # Use text splitter to chunk the text
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=150000,  # Reduced chunk size 
+            chunk_size=10000,  # Reduced chunk size for more precise page tracking
             chunk_overlap=100
         )
         text_chunks = text_splitter.split_text(full_text)
@@ -343,16 +281,20 @@ async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
         
         for i, chunk in enumerate(text_chunks):
             try:
+                # Determine page for chunk
+                page_number = determine_page_for_chunk(chunk, page_text_map)
+                
                 # Generate embedding for each chunk
                 embedding = rag_system.generate_embedding(chunk)
                 
-                # Add to ChromaDB
+                # Add to ChromaDB with page information
                 collection.add(
                     ids=[f"{pdf_id}_{i}"],
                     embeddings=[embedding],
                     metadatas=[{
                         "pdf_id": pdf_id,
                         "chunk_index": i,
+                        "page": page_number,
                         "created_at": datetime.now().isoformat()
                     }],
                     documents=[chunk]
@@ -360,66 +302,36 @@ async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
             except Exception as chunk_error:
                 print(f"Error processing chunk {i}: {chunk_error}")
         
-        return {"status": "success", "pdf_id": pdf_id, "file_url": public_url, "extracted_text": full_text, "chunks_processed": len(text_chunks)}
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-
-@app.post("/upload-yt")
-async def upload_yt(request: YTUploadRequest):
-    try:
-        # Use text splitter to chunk the text
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=150000,  # Consistent with PDF upload 
-            chunk_overlap=100
-        )
-        text_chunks = text_splitter.split_text(request.text)
-        
-        # Upload YouTube metadata to Supabase
-        yt_upload = rag_system.supabase.table('yts').insert({
-            'space_id': request.space_id,
-            'yt_url': str(request.yt_link),
-            'thumbnail': request.thumbnail,
-            'extracted_text': request.text
-        }).execute()
-        
-        # Get the inserted YouTube record ID
-        yt_id = yt_upload.data[0]['id']
-        
-        # Process embeddings for chunks
-        chroma_client = chromadb.HttpClient(host='https://thirsty-christian-akpughe-0d8a1b81.koyeb.app', port=8000)
-        collection = chroma_client.get_or_create_collection("youtube_embeddings")
-        
-        for i, chunk in enumerate(text_chunks):
-            try:
-                # Generate embedding for each chunk
-                embedding = rag_system.generate_embedding(chunk)
-                
-                # Add to ChromaDB
-                collection.add(
-                    ids=[f"{yt_id}_{i}"],
-                    embeddings=[embedding],
-                    metadatas=[{
-                        "yt_id": yt_id,
-                        "chunk_index": i,
-                        "created_at": datetime.now().isoformat()
-                    }],
-                    documents=[chunk]
-                )
-            except Exception as chunk_error:
-                print(f"Error processing YouTube chunk {i}: {chunk_error}")
-        
         return {
             "status": "success", 
-            "yt_id": yt_id, 
-            "yt_link": str(request.yt_link), 
+            "pdf_id": pdf_id, 
+            "file_url": public_url, 
+            "extracted_text": full_text, 
             "chunks_processed": len(text_chunks)
         }
     
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))    
-   
+        raise HTTPException(status_code=500, detail=str(e))
+
+def determine_page_for_chunk(chunk: str, page_text_map: List[Dict]) -> int:
+    """
+    Determine the page number for a given text chunk
+    
+    Args:
+    - chunk: Text chunk to locate
+    - page_text_map: List of page text mappings
+    
+    Returns:
+    - Page number where the chunk is most likely located
+    """
+    # Iterate through pages and check if chunk is in page text
+    for page_info in page_text_map:
+        # Check if chunk is in the page text
+        if chunk in page_info['text']:
+            return page_info['page_num']
+    
+    # If no exact match, return the last page
+    return page_text_map[-1]['page_num']
 
 if __name__ == "__main__":
     import uvicorn
