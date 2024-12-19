@@ -13,6 +13,7 @@ import io
 from dotenv import load_dotenv
 import logging
 import re
+import json
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -21,6 +22,10 @@ load_dotenv()
 
 class RAGRequest(BaseModel):
     query: str
+    pdfIds: Optional[List[str]] = None
+    ytId: Optional[str] = None
+    audioIds: Optional[List[str]] = None
+class QuizGenerationRequest(BaseModel):
     pdfIds: Optional[List[str]] = None
     ytId: Optional[str] = None
 
@@ -42,6 +47,10 @@ class YTUploadRequest(BaseModel):
 class YTEmbeddingRequest(BaseModel):
     yt_id: str
     text: str
+
+class GeneralEmbeddingRequest(BaseModel):
+    audio_id: str
+    text: str    
 
 class RAGSystem:
     def __init__(self):
@@ -73,7 +82,7 @@ class RAGSystem:
         )
         return response.data[0].embedding
 
-    def similarity_search(self, query_embedding, pdf_ids=None, yt_id=None):
+    def similarity_search(self, query_embedding, pdf_ids=None, yt_id=None, audio_ids=None):
         """Perform similarity search across collections with page tracking"""
         try:
             results = []
@@ -106,6 +115,21 @@ class RAGSystem:
                 # Flatten documents
                 results = [doc for sublist in documents for doc in (sublist if isinstance(sublist, list) else [sublist])]
             
+            if audio_ids:
+                audio_collection = self.chroma_client.get_collection("audio_embeddings")
+                audio_results = audio_collection.query(
+                    query_embeddings=[query_embedding],
+                    where={"audio_id": {"$in": audio_ids}},
+                    n_results=5
+                )
+
+                documents = audio_results.get('documents', [[]])
+
+                if documents:
+                    # Flatten the list of lists into a single list of strings
+                    results = [doc for sublist in documents for doc in (sublist if isinstance(sublist, list) else [sublist])]
+                
+
             # YouTube search
             if yt_id:
                 yt_collection = self.chroma_client.get_collection("youtube_embeddings")
@@ -126,7 +150,7 @@ class RAGSystem:
             print(f"Similarity search error: {e}")
             return [], {}
 
-    def retrieve_content(self, pdf_ids=None, yt_id=None):
+    def retrieve_content(self, pdf_ids=None, yt_id=None, audio_ids=None):
         """Retrieve content from Supabase"""
         combined_text = ""
 
@@ -139,6 +163,11 @@ class RAGSystem:
         if yt_id:
             yts = self.supabase.table('yts').select('extracted_text').eq('id', yt_id).execute()
             combined_text += "\n".join([item['extracted_text'] for item in yts.data])
+
+        # Retrieve Audio transcripts
+        if audio_ids:
+            audio = self.supabase.table('recordings').select('extracted_text').in_('id', audio_ids).execute()
+            combined_text += "\n".join([item['extracted_text'] for item in audio.data])
 
         return combined_text
 
@@ -173,6 +202,7 @@ class RAGSystem:
         except Exception as e:
             print(f"Response generation error: {e}")
             return "I apologize, but I couldn't generate a response."
+        
 
 # FastAPI App
 app = FastAPI()
@@ -200,14 +230,16 @@ async def process_rag_request(request: RAGRequest):
         search_results, page_refs = rag_system.similarity_search(
             query_embedding, 
             request.pdfIds, 
-            request.ytId
+            request.ytId,
+            request.audioIds
         )
 
         # Retrieve content
         if not search_results:
             combined_text = rag_system.retrieve_content(
                 request.pdfIds, 
-                request.ytId
+                request.ytId,
+                request.audioIds
             )
         else:
             combined_text = "\n".join(search_results)
@@ -245,7 +277,7 @@ async def process_yt_embeddings(request: YTEmbeddingRequest):
         
         # Generate embeddings and insert into ChromaDB
         for i, chunk in enumerate(chunks):
-            embedding = generate_embedding(chunk)
+            embedding = rag_system.generate_embedding(chunk)
             collection.add(
                 ids=[f"{request.yt_id}_{i}"],
                 embeddings=[embedding],
@@ -261,6 +293,43 @@ async def process_yt_embeddings(request: YTEmbeddingRequest):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))  
+
+@app.post("/process-audio-embeddings")
+async def process_general_embeddings(request: GeneralEmbeddingRequest):
+    try:
+        # Initialize ChromaDB client
+        chroma_client = chromadb.HttpClient(
+            host=os.getenv('CHROMA_DB_CONNECTION_STRING'), port=8000
+        )
+        
+        # Create or get collection for general content
+        collection = chroma_client.get_or_create_collection("audio_embeddings")
+        
+        # Text splitting
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=150000, 
+            chunk_overlap=1000
+        )
+        chunks = text_splitter.split_text(request.text)
+        
+        # Generate embeddings and insert into ChromaDB
+        for i, chunk in enumerate(chunks):
+            embedding = rag_system.generate_embedding(chunk)
+            collection.add(
+                ids=[f"{request.audio_id}_{i}"],
+                embeddings=[embedding],
+                metadatas=[{
+                    "audio_id": request.audio_id,
+                    "content": chunk,
+                    "created_at": datetime.now().isoformat()
+                }],
+                documents=[chunk]
+            )
+        
+        return {"status": "success", "chunks_processed": len(chunks)}
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))    
 
 @app.post("/upload-yt")
 async def upload_yt(request: YTUploadRequest):
@@ -434,6 +503,8 @@ async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
     
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
 
 def determine_page_for_chunk(chunk: str, page_text_map: List[Dict]) -> int:
     """
