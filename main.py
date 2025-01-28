@@ -386,6 +386,20 @@ async def upload_yt(request: YTUploadRequest):
         raise HTTPException(status_code=500, detail=str(e))    
 
 
+def clean_filename(filename):
+    """
+    Cleans the filename by replacing special characters and spaces with underscores.
+    Converts the filename to lowercase.
+    """
+    # Replace special characters and spaces with underscores
+    cleaned_name = re.sub(r'[^a-zA-Z0-9._-]', '_', filename)
+    # Convert to lowercase
+    cleaned_name = cleaned_name.lower()
+    # Replace multiple underscores with a single underscore
+    cleaned_name = re.sub(r'_+', '_', cleaned_name)
+    return cleaned_name
+
+
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
     try:
@@ -437,7 +451,8 @@ async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
         
         # Compress and upload PDF to Supabase Storage
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        file_path = f"pdf_files/{timestamp}_{file.filename}"
+        cleaned_filename = clean_filename(file.filename)
+        file_path = f"pdf_files/{timestamp}_{cleaned_filename}"
         
         # Use the Supabase client from the RAGSystem instance
         storage_upload = rag_system.supabase.storage.from_('pdf_files').upload(
