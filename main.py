@@ -278,7 +278,7 @@ async def process_yt_embeddings(request: YTEmbeddingRequest):
         
         # Text splitting
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=150000, 
+            chunk_size=50000, 
             chunk_overlap=1000
         )
         chunks = text_splitter.split_text(request.text)
@@ -315,7 +315,7 @@ async def process_general_embeddings(request: GeneralEmbeddingRequest):
         
         # Text splitting
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=150000, 
+            chunk_size=50000, 
             chunk_overlap=1000
         )
         chunks = text_splitter.split_text(request.text)
@@ -344,7 +344,7 @@ async def upload_yt(request: YTUploadRequest):
     try:
         # Use text splitter to chunk the text
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=150000,  # Consistent with PDF upload 
+            chunk_size=24000,  # Consistent with PDF upload 
             chunk_overlap=100
         )
         text_chunks = text_splitter.split_text(request.text)
