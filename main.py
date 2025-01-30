@@ -1,6 +1,7 @@
 import os
 from fastapi import File, UploadFile, Form, HTTPException, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl
 from typing import List, Optional, Dict, Tuple
 import openai
@@ -14,11 +15,18 @@ from dotenv import load_dotenv
 import logging
 import re
 import json
+import time
+
+from sub import QuizRequest, StreamingQuizResponse, OptimizedStudyGenerator
+
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
+
+# Initialize the OptimizedStudyGenerator
+study_generator = OptimizedStudyGenerator()
 
 class RAGRequest(BaseModel):
     query: str
@@ -519,7 +527,64 @@ async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/generate-quiz-stream")
+async def create_quiz_stream(space_id:str, request: QuizRequest):
+    try:
+        start_time = time.time()
+        content, references = await study_generator.get_relevant_content_parallel(
+            request.pdf_ids,
+            request.yt_ids,
+            request.audio_ids
+        )
+        logger.info(f"Content retrieval time: {time.time() - start_time:.2f}s")
 
+        if not content:
+            raise HTTPException(status_code=404, detail="No content found")
+
+        rag_system.supabase.table('generated_content').update({
+            'quiz': []
+        }).eq('space_id', space_id).execute()
+
+        async def stream():
+            accumulated_questions: List[Dict[Any, Any]] = []
+
+            async for batch in study_generator.generate_questions_stream(
+                content,
+                request.num_questions,
+                request.difficulty,
+                request.batch_size
+            ):
+                # Parse the batch JSON for cleaner logging
+                try:
+                    batch_data = json.loads(batch)
+
+                    logger.info(f"Streaming batch {batch_data.get('current_batch', 'unknown')}: {json.dumps(batch_data, indent=2)}")
+
+                    # Extract questions from the batch and add to accumulated list
+                    if 'questions' in batch_data:
+                        accumulated_questions.extend(batch_data['questions'])
+
+                        # Update Supabase with the accumulated questions
+                        rag_system.supabase.table('generated_content').update({
+                            'quiz': accumulated_questions
+                        }).eq('space_id', space_id).execute()
+                        
+                        logger.info(f"Updated Supabase with {len(accumulated_questions)} total questions")
+
+                except json.JSONDecodeError:
+                    logger.error("Failed to decode batch JSON")
+                
+                yield batch
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+    except Exception as e:
+        logger.error(f"Error in create_quiz_stream: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+def update_quiz (space_id, content) :
+    rag_system.supabase.table('generated_content').update(content).eq("space_id",space_id).execute()
 
 def determine_page_for_chunk(chunk: str, page_text_map: List[Dict]) -> int:
     """
