@@ -278,7 +278,7 @@ async def process_yt_embeddings(request: YTEmbeddingRequest):
         
         # Text splitting
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=50000, 
+            chunk_size=5000, 
             chunk_overlap=1000
         )
         chunks = text_splitter.split_text(request.text)
@@ -315,7 +315,7 @@ async def process_general_embeddings(request: GeneralEmbeddingRequest):
         
         # Text splitting
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=50000, 
+            chunk_size=5000, 
             chunk_overlap=1000
         )
         chunks = text_splitter.split_text(request.text)
