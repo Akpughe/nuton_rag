@@ -344,7 +344,7 @@ async def upload_yt(request: YTUploadRequest):
     try:
         # Use text splitter to chunk the text
         text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=24000,  # Consistent with PDF upload 
+            chunk_size=5000,  # Consistent with PDF upload 
             chunk_overlap=100
         )
         text_chunks = text_splitter.split_text(request.text)
