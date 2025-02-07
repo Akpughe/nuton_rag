@@ -16,6 +16,7 @@ import logging
 import re
 import json
 import time
+import httpx
 
 from sub import QuizRequest, StreamingQuizResponse, OptimizedStudyGenerator
 
@@ -27,6 +28,8 @@ load_dotenv()
 
 # Initialize the OptimizedStudyGenerator
 study_generator = OptimizedStudyGenerator()
+
+nuton_api = "https://api.nuton.app"
 
 class RAGRequest(BaseModel):
     query: str
@@ -463,24 +466,38 @@ async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
         file_path = f"pdf_files/{timestamp}_{cleaned_filename}"
         
         # Use the Supabase client from the RAGSystem instance
-        storage_upload = rag_system.supabase.storage.from_('pdf_files').upload(
-            file_path, 
-            pdf_content, 
-            file_options={"content-type": file.content_type}
-        )
+        # storage_upload = rag_system.supabase.storage.from_('pdf_files').upload(
+        #     file_path, 
+        #     pdf_content, 
+        #     file_options={"content-type": file.content_type}
+        # )
         
-        # Get public URL
-        public_url = rag_system.supabase.storage.from_('pdf_files').get_public_url(file_path)
+        # # Get public URL
+        # public_url = rag_system.supabase.storage.from_('pdf_files').get_public_url(file_path)
         
         # Save PDF metadata to database
         pdf_upload = rag_system.supabase.table('pdfs').insert({
             'space_id': space_id,  # Passed from frontend
-            'file_path': public_url,
+            # 'file_path': public_url,
             'extracted_text': full_text
         }).execute()
         
         # Get the inserted PDF record ID
         pdf_id = pdf_upload.data[0]['id']
+
+        # implement endpoint here to trigger upload in the background
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{nuton_api}/upload",
+                json={
+                    "pdf_id": pdf_id,
+                    "file": file
+                },
+                timeout=60.0  # 30 second timeout
+            )
+
+            if response.status_code != 200:
+                print(f"Error from worker service: {response.text}")
         
         # Use text splitter to chunk the text
         text_splitter = RecursiveCharacterTextSplitter(
