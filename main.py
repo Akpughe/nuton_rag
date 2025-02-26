@@ -19,6 +19,7 @@ import time
 import httpx
 
 from sub import QuizRequest, StreamingQuizResponse, OptimizedStudyGenerator
+from pdf_handler import PDFHandler
 
 
 logger = logging.getLogger(__name__)
@@ -495,155 +496,11 @@ async def upload_yt(request: YTUploadRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))    
 
-
-def clean_filename(filename):
-    """
-    Cleans the filename by replacing special characters and spaces with underscores.
-    Converts the filename to lowercase.
-    """
-    # Replace special characters and spaces with underscores
-    cleaned_name = re.sub(r'[^a-zA-Z0-9._-]', '_', filename)
-    # Convert to lowercase
-    cleaned_name = cleaned_name.lower()
-    # Replace multiple underscores with a single underscore
-    cleaned_name = re.sub(r'_+', '_', cleaned_name)
-    return cleaned_name
-
+pdf_handler = PDFHandler()
 
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
-    try:
-        # Read PDF
-        pdf_content = await file.read()
-        pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
-        
-        # Extract text with advanced page tracking
-        full_text = ""
-        page_text_map = []  # Store text and page number for each section
-        
-        for page_num, page in enumerate(pdf_reader.pages, start=1):
-            try:
-                # Alternative text extraction methods
-                try:
-                    # First, try the standard extract_text()
-                    page_content = page.extract_text()
-                except Exception as standard_extract_error:
-                    # If standard extraction fails, try alternative approaches
-                    try:
-                        # Extract text from page objects more directly
-                        page_content = page.get_text()
-                    except Exception as alternative_extract_error:
-                        # If both fail, log the error and skip this page
-                        print(f"Failed to extract text from page {page_num}")
-                        print(f"Standard extract error: {standard_extract_error}")
-                        print(f"Alternative extract error: {alternative_extract_error}")
-                        page_content = ""
-                
-                # Remove any problematic characters
-                page_content = ''.join(char for char in page_content if char.isprintable())
-                
-                # Store start position, text, and page number
-                page_text_map.append({
-                    'start': len(full_text),
-                    'text': page_content,
-                    'page_num': page_num
-                })
-                full_text += page_content + "\n"
-            
-            except Exception as page_error:
-                print(f"Unexpected error extracting text from page {page_num}: {page_error}")
-                traceback.print_exc()  # Print full stack trace for debugging
-                continue
-        
-        # If no text was extracted at all, raise an error
-        if not full_text.strip():
-            raise ValueError("No text could be extracted from the PDF")
-        
-        # Compress and upload PDF to Supabase Storage
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        cleaned_filename = clean_filename(file.filename)
-        file_path = f"pdf_files/{timestamp}_{cleaned_filename}"
-        
-        # Use the Supabase client from the RAGSystem instance
-        # storage_upload = rag_system.supabase.storage.from_('pdf_files').upload(
-        #     file_path, 
-        #     pdf_content, 
-        #     file_options={"content-type": file.content_type}
-        # )
-        
-        # # Get public URL
-        # public_url = rag_system.supabase.storage.from_('pdf_files').get_public_url(file_path)
-        
-        # Save PDF metadata to database
-        pdf_upload = rag_system.supabase.table('pdfs').insert({
-            'space_id': space_id,  # Passed from frontend
-            # 'file_path': public_url,
-            'extracted_text': full_text
-        }).execute()
-        
-        # Get the inserted PDF record ID
-        pdf_id = pdf_upload.data[0]['id']
-
-        # implement endpoint here to trigger upload in the background
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{nuton_api}/upload",
-                files={
-                    "file": (file.file)
-                },
-                data={"pdf_id": pdf_id},
-                timeout=60.0
-            )
-
-            print('response',response)
-
-            if response.status_code != 200:
-                print(f"Error from worker service: {response.text}")
-        
-        # Use text splitter to chunk the text
-        text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=10000,  # Reduced chunk size for more precise page tracking
-            chunk_overlap=100
-        )
-        text_chunks = text_splitter.split_text(full_text)
-        
-        # Process embeddings for each chunk
-        chroma_client = chromadb.HttpClient(host = os.getenv('CHROMA_DB_CONNECTION_STRING'), port=8000)
-        collection = chroma_client.get_or_create_collection("pdf_embeddings")
-        
-        for i, chunk in enumerate(text_chunks):
-            try:
-                # Determine page for chunk
-                page_number = determine_page_for_chunk(chunk, page_text_map)
-                
-                # Generate embedding for each chunk
-                embedding = rag_system.generate_embedding(chunk)
-                
-                # Add to ChromaDB with page information
-                collection.add(
-                    ids=[f"{pdf_id}_{i}"],
-                    embeddings=[embedding],
-                    metadatas=[{
-                        "pdf_id": pdf_id,
-                        "chunk_index": i,
-                        "page": page_number,
-                        "created_at": datetime.now().isoformat()
-                    }],
-                    documents=[chunk]
-                )
-            except Exception as chunk_error:
-                print(f"Error processing chunk {i}: {chunk_error}")
-        
-        return {
-            "status": "success", 
-            "pdf_id": pdf_id, 
-            # "file_url": public_url, 
-            "extracted_text": full_text, 
-            "chunks_processed": len(text_chunks)
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return await pdf_handler.handle_pdf_upload(file, space_id, rag_system, nuton_api)
 
 @app.post("/generate-quiz-stream")
 async def create_quiz_stream(space_id:str, request: QuizRequest):
