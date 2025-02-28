@@ -498,9 +498,35 @@ async def upload_yt(request: YTUploadRequest):
 
 pdf_handler = PDFHandler()
 
+@app.post("/upload-document")
+async def upload_document(file: UploadFile = File(...), space_id: str = Form(None)):
+    """
+    Handles upload of both PDF and PPTX files.
+    Automatically detects file type and uses appropriate handler.
+    """
+    # Get file extension (lowercase)
+    file_extension = file.filename.lower().split('.')[-1]
+    
+    # Validate file type
+    if file_extension not in ['pdf', 'pptx']:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported file type. Only PDF and PPTX files are supported."
+        )
+    
+    try:
+        if file_extension == 'pdf':
+            return await pdf_handler.handle_pdf_upload(file, space_id, rag_system, nuton_api)
+        else:  # pptx
+            return await pdf_handler.handle_pptx_upload(file, space_id, rag_system, nuton_api)
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Keep the old endpoint for backward compatibility
 @app.post("/upload-pdf")
 async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
-    return await pdf_handler.handle_pdf_upload(file, space_id, rag_system, nuton_api)
+    return await upload_document(file, space_id)
 
 @app.post("/generate-quiz-stream")
 async def create_quiz_stream(space_id:str, request: QuizRequest):

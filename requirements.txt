@@ -8,3 +8,9 @@ PyPDF2
 python-multipart
 chromadb
 aiohttp
+pytesseract 
+pdf2image  
+Pillow
+opencv-python
+numpy
+python-pptx
