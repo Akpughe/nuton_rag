@@ -501,24 +501,27 @@ pdf_handler = PDFHandler()
 @app.post("/upload-document")
 async def upload_document(file: UploadFile = File(...), space_id: str = Form(None)):
     """
-    Handles upload of both PDF and PPTX files.
+    Handles upload of PDF, PPTX, and DOCX files.
     Automatically detects file type and uses appropriate handler.
     """
     # Get file extension (lowercase)
     file_extension = file.filename.lower().split('.')[-1]
     
     # Validate file type
-    if file_extension not in ['pdf', 'pptx']:
+    supported_extensions = {'pdf', 'pptx', 'docx', 'doc'}
+    if file_extension not in supported_extensions:
         raise HTTPException(
             status_code=400,
-            detail="Unsupported file type. Only PDF and PPTX files are supported."
+            detail=f"Unsupported file type. Only {', '.join(supported_extensions)} files are supported."
         )
     
     try:
         if file_extension == 'pdf':
             return await pdf_handler.handle_pdf_upload(file, space_id, rag_system, nuton_api)
-        else:  # pptx
+        elif file_extension in ['pptx']:
             return await pdf_handler.handle_pptx_upload(file, space_id, rag_system, nuton_api)
+        else:  # docx or doc
+            return await pdf_handler.handle_docx_upload(file, space_id, rag_system, nuton_api)
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

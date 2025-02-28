@@ -10,6 +10,7 @@ import logging
 import os
 from pptx import Presentation
 from io import BytesIO
+from docx import Document
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,36 @@ class PDFHandler:
             full_text += slide_text + "\n"
         
         return full_text.strip(), slide_text_map
+
+    @staticmethod
+    def extract_docx_text(file_content):
+        """
+        Extracts text from a Word (.docx) file.
+        Returns a tuple of (full_text, paragraph_text_map).
+        """
+        full_text = ""
+        paragraph_text_map = []
+        
+        # Load the document from bytes
+        doc = Document(BytesIO(file_content))
+        
+        # Extract text from paragraphs
+        for para_num, paragraph in enumerate(doc.paragraphs, start=1):
+            text = paragraph.text.strip()
+            if text:
+                # Clean the extracted text
+                text = ''.join(char for char in text if char.isprintable())
+                
+                # Add to the paragraph map
+                paragraph_text_map.append({
+                    'start': len(full_text),
+                    'text': text,
+                    'paragraph_num': para_num
+                })
+                
+                full_text += text + "\n"
+        
+        return full_text.strip(), paragraph_text_map
 
     async def handle_pdf_upload(self, file, space_id, rag_system, nuton_api):
         try:
@@ -243,6 +274,78 @@ class PDFHandler:
             return {
                 "status": "success", 
                 "pdf_id": pptx_id,  # Using pdf_id for consistency
+                "extracted_text": full_text, 
+                "chunks_processed": len(text_chunks)
+            }
+        
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def handle_docx_upload(self, file, space_id, rag_system, nuton_api):
+        """
+        Handles the upload and processing of Word (.docx) files.
+        Similar to handle_pdf_upload but for Word documents.
+        """
+        try:
+            # Read DOCX
+            docx_content = await file.read()
+            full_text, paragraph_text_map = self.extract_docx_text(docx_content)
+            
+            if not full_text.strip():
+                raise ValueError("No text could be extracted from the Word document")
+            
+            # Save DOCX metadata to database
+            docx_upload = rag_system.supabase.table('pdfs').insert({
+                'space_id': space_id,
+                'extracted_text': full_text
+            }).execute()
+            
+            docx_id = docx_upload.data[0]['id']
+
+            # Trigger upload in the background
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{nuton_api}/upload",
+                    files={"file": (file.filename, docx_content, file.content_type)},
+                    data={"pdf_id": docx_id},  # Using pdf_id for consistency
+                    timeout=60.0
+                )
+
+                if response.status_code != 200:
+                    print(f"Error from worker service: {response.text}")
+            
+            # Process text chunks and embeddings
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=10000,
+                chunk_overlap=100
+            )
+            text_chunks = text_splitter.split_text(full_text)
+            
+            collection = self.chroma_client.get_or_create_collection("pdf_embeddings")
+            
+            for i, chunk in enumerate(text_chunks):
+                try:
+                    # Find the paragraph number for this chunk
+                    paragraph_number = self.determine_page_for_chunk(chunk, paragraph_text_map)
+                    embedding = rag_system.generate_embedding(chunk)
+                    
+                    collection.add(
+                        ids=[f"{docx_id}_{i}"],
+                        embeddings=[embedding],
+                        metadatas=[{
+                            "pdf_id": docx_id,  # Using pdf_id for consistency
+                            "chunk_index": i,
+                            "page": paragraph_number,  # This will represent the paragraph number
+                            "created_at": datetime.now().isoformat()
+                        }],
+                        documents=[chunk]
+                    )
+                except Exception as chunk_error:
+                    print(f"Error processing chunk {i}: {chunk_error}")
+            
+            return {
+                "status": "success", 
+                "pdf_id": docx_id,  # Using pdf_id for consistency
                 "extracted_text": full_text, 
                 "chunks_processed": len(text_chunks)
             }
