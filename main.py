@@ -5,6 +5,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl
 from typing import List, Optional, Dict, Tuple
 import openai
+from groq import Groq
 import chromadb
 from supabase import create_client, Client
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -73,6 +74,10 @@ class RAGSystem:
             openai.api_key = os.getenv('OPENAI_API_KEY')
             if not openai.api_key:
                 raise ValueError("OpenAI API key is missing")
+
+            self.groq = Groq(
+                api_key=os.environ.get("GROQ_API_KEY"),
+            )
 
             self.supabase: Client = create_client(
                 os.getenv('SUPABASE_URL'), 
@@ -218,6 +223,105 @@ class RAGSystem:
     #         print(f"Response generation error: {e}")
     #         return "I apologize, but I couldn't generate a response."
 
+    def generate_response_groq(self, query: str, context: str, use_knowledge_base: bool):
+        """Generate response using Groq"""
+        try:
+            if use_knowledge_base:
+                # Only check relevance when using knowledge base
+                relevance_check_message = (
+                    "You are a relevance checker. Determine if the query is related to the context. "
+                    "Respond with only 'RELEVANT' or 'NOT_RELEVANT'. "
+                    "Example: If context is about AI and query asks about AI models - respond 'RELEVANT'. "
+                    "If context is about AI but query asks about cooking recipes - respond 'NOT_RELEVANT'."
+                )
+                
+                relevance_check = self.groq.chat.completions.create(
+                    model="mixtral-8x7b-32768",  # Using Mixtral for relevance check
+                    messages=[
+                        {"role": "system", "content": relevance_check_message},
+                        {"role": "user", "content": f"Context: {context}\nQuery: {query}"}
+                    ],
+                    temperature=0,
+                    max_tokens=10
+                )
+                
+                is_relevant = relevance_check.choices[0].message.content.strip() == "RELEVANT"
+                
+                if not is_relevant:
+                    return (
+                        "I apologize, but your query appears to be unrelated to the provided context. "
+                        "Please ensure your question is relevant to the context provided."
+                    )
+                
+                system_message = (
+                    "Answer the following question based on the provided context and external knowledge. "
+                    "Keep the response concise yet detailed enough for deep understanding. "
+                    "Use plain simple english. "
+                    "Use an engaging, conversational, yet formal tone. "
+                    "Keep responses under 3 sentences where possible. "
+                    "Include only the most relevant technical details. "
+                    "Prioritize clarity over comprehensiveness. "
+                    "Clearly indicate when you're using information beyond the context"
+                )
+                
+                user_message = (
+                    f"Context: {context}\n\n"
+                    f"Query: {query}\n\n"
+                    "You may reference information beyond the context when helpful, "
+                    "but always prioritize the context provided."
+                )
+            else:
+                system_message = (
+                    "You are a helpful assistant limited to the provided context only. "
+                    "Follow these rules strictly:\n"
+                    "1. ONLY use information from the provided context\n"
+                    "2. If the context doesn't contain enough information to answer the query, "
+                    "state this explicitly\n"
+                    "3. Do not add any external knowledge or assumptions\n"
+                    "4. If terms are unclear and not explained in the context, "
+                    "ask for clarification instead of explaining them"
+                )
+                
+                user_message = (
+                    f"Context: {context}\n\n"
+                    f"Query: {query}\n\n"
+                    "IMPORTANT: Use ONLY the information in the context above. "
+                    "Do not add any external knowledge."
+                )
+
+            # Generate the response using Groq
+            response = self.groq.chat.completions.create(
+                model="mixtral-8x7b-32768",  # Using Mixtral model
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": user_message}
+                ],
+                temperature=0.7,
+                max_tokens=1024
+            )
+
+            # Extract and clean the response
+            generated_response = response.choices[0].message.content.strip()
+
+            # Ensure the response stays relevant and avoids hallucinations
+            if not use_knowledge_base:
+                context_words = set(word.lower() for word in context.split())
+                response_words = set(word.lower() for word in generated_response.split())
+                
+                context_overlap = response_words.intersection(context_words)
+                if len(context_overlap) < 2:
+                    return (
+                        "I apologize, but I couldn't generate a response that stays within "
+                        "the bounds of the provided context. Please try rephrasing your query."
+                    )
+                
+            return generated_response
+
+        except Exception as e:
+            logger.error(f"Response generation error: {e}")
+            return "I apologize, but I couldn't generate a response."
+    
+    
     def generate_response(self, query: str, context: str, use_knowledge_base: bool):
         """Generate response using OpenAI"""
         try:
@@ -389,7 +493,7 @@ async def process_rag_request(request: RAGRequest):
         text_chunks = rag_system.chunk_text(combined_text)
 
         # Generate response
-        response = rag_system.generate_response(request.query, text_chunks[0], request.use_knowledge_base)
+        response = rag_system.generate_response_groq(request.query, text_chunks[0], request.use_knowledge_base)
 
         return RAGResponse(
             response=response, 
