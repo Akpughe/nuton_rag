@@ -22,8 +22,6 @@ class PDFHandler:
         self.chroma_client = chromadb.HttpClient(
             host=chroma_host, 
             port=chroma_port,
-            # tenant="default_tenant",
-            # database="default_database"
         )
     
     @staticmethod
@@ -38,14 +36,22 @@ class PDFHandler:
         return cleaned_name
 
     @staticmethod
-    def determine_page_for_chunk(chunk: str, page_text_map: list[dict]) -> int:
+    def determine_page_for_chunk(chunk: str, page_text_map: list[dict], key: str) -> int:
         """
-        Determine the page number for a given text chunk
+        Determine the page or slide number for a given text chunk.
+        
+        Args:
+        - chunk: Text chunk to locate
+        - page_text_map: List of page or slide text mappings
+        - key: The key to use for determining the page/slide number ('page_num' or 'slide_num')
+        
+        Returns:
+        - Page or slide number where the chunk is most likely located
         """
         for page_info in page_text_map:
             if chunk in page_info['text']:
-                return page_info['page_num']
-        return page_text_map[-1]['page_num']
+                return page_info[key]  # Use the specified key to get the number
+        return page_text_map[-1][key]  # Return the last page/slide number if not found
 
     @staticmethod
     def extract_pptx_text(file_content):
@@ -182,7 +188,7 @@ class PDFHandler:
             
             for i, chunk in enumerate(text_chunks):
                 try:
-                    page_number = self.determine_page_for_chunk(chunk, page_text_map)
+                    page_number = self.determine_page_for_chunk(chunk, page_text_map, 'page_num')
                     embedding = rag_system.generate_embedding(chunk)
                     
                     collection.add(
@@ -229,6 +235,8 @@ class PDFHandler:
             }).execute()
             
             pptx_id = pptx_upload.data[0]['id']
+            # print('pptx',pptx_upload.data )
+            # print('pptx_id',pptx_id )
 
             # Trigger upload in the background
             async with httpx.AsyncClient() as client:
@@ -250,11 +258,12 @@ class PDFHandler:
             text_chunks = text_splitter.split_text(full_text)
             
             collection = self.chroma_client.get_or_create_collection("pdf_embeddings")
+
             
             for i, chunk in enumerate(text_chunks):
                 try:
-                    # Find the slide number for this chunk
-                    slide_number = self.determine_page_for_chunk(chunk, slide_text_map)
+                    # Find the slide number for this chunk using 'slide_num' key
+                    slide_number = self.determine_page_for_chunk(chunk, slide_text_map, 'slide_num')
                     embedding = rag_system.generate_embedding(chunk)
                     
                     collection.add(
@@ -326,7 +335,7 @@ class PDFHandler:
             for i, chunk in enumerate(text_chunks):
                 try:
                     # Find the paragraph number for this chunk
-                    paragraph_number = self.determine_page_for_chunk(chunk, paragraph_text_map)
+                    paragraph_number = self.determine_page_for_chunk(chunk, paragraph_text_map, 'paragraph_num')
                     embedding = rag_system.generate_embedding(chunk)
                     
                     collection.add(

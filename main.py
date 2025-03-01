@@ -110,6 +110,7 @@ class RAGSystem:
                     where={"pdf_id": {"$in": pdf_ids}},
                     n_results=5
                 )
+
                 
                 documents = pdf_results.get('documents', [[]])
                 metadatas = pdf_results.get('metadatas', [[]])
@@ -330,6 +331,35 @@ app.add_middleware(
 @app.get("/")
 async def root():
     return {"greeting": "Hello!", "message": "Welcome to Nuton RAG!"}
+
+@app.get("/get-chroma-data")
+async def get_chroma_data():
+    try:
+        # Initialize ChromaDB client
+        chroma_client = chromadb.HttpClient(host=os.getenv('CHROMA_DB_CONNECTION_STRING'), port=8000)
+        
+
+        # Retrieve data from PDF embeddings
+        pdf_collection = chroma_client.get_collection("pdf_embeddings")
+        pdf_data = pdf_collection.get()
+
+
+        # # Retrieve data from audio embeddings
+        # audio_collection = chroma_client.get_collection("audio_embeddings")
+        # audio_data = audio_collection.get()  # Ensure this is valid
+
+        # Retrieve data from YouTube embeddings
+        yt_collection = chroma_client.get_collection("youtube_embeddings")
+        yt_data = yt_collection.get()  # Ensure this is valid
+
+        return {
+            "pdf_data": pdf_data,
+            # "audio_data": audio_data,
+            "yt_data": yt_data
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/rag")
 async def process_rag_request(request: RAGRequest):
@@ -586,6 +616,61 @@ async def create_quiz_stream(space_id:str, request: QuizRequest):
         logger.error(f"Error in create_quiz_stream: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/generate-flashcards")
+async def create_flashcards(space_id: str, request: QuizRequest):
+    try:
+        start_time = time.time()
+        content, references = await study_generator.get_relevant_content_parallel(
+            request.pdf_ids,
+            request.yt_ids,
+            request.audio_ids
+        )
+        logger.info(f"Content retrieval time: {time.time() - start_time:.2f}s")
+
+        if not content:
+            raise HTTPException(status_code=404, detail="No content found")
+
+        # Update the flashcards column in the generated_content table
+        rag_system.supabase.table('generated_content').update({
+            'flashcards': []
+        }).eq('space_id', space_id).execute()
+
+        async def stream():
+            accumulated_flashcards: List[Dict[str, str]] = []
+
+            async for batch in study_generator.generate_flashcards_stream(
+                content,
+                request.num_questions,  # Assuming num_questions is the number of flashcards to generate
+                request.difficulty,
+                request.batch_size
+            ):
+                # Parse the batch JSON for cleaner logging
+                try:
+                    batch_data = json.loads(batch)
+
+                    logger.info(f"Streaming batch {batch_data.get('current_batch', 'unknown')}: {json.dumps(batch_data, indent=2)}")
+
+                    # Extract flashcards from the batch and add to accumulated list
+                    if 'flashcards' in batch_data:
+                        accumulated_flashcards.extend(batch_data['flashcards'])
+
+                        # Update Supabase with the accumulated flashcards
+                        rag_system.supabase.table('generated_content').update({
+                            'flashcards': accumulated_flashcards
+                        }).eq('space_id', space_id).execute()
+                        
+                        logger.info(f"Updated Supabase with {len(accumulated_flashcards)} total flashcards")
+
+                except json.JSONDecodeError:
+                    logger.error("Failed to decode batch JSON")
+                
+                yield batch
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+    except Exception as e:
+        logger.error(f"Error in create_flashcards: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 def update_quiz (space_id, content) :
     rag_system.supabase.table('generated_content').update(content).eq("space_id",space_id).execute()
