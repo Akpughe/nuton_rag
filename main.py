@@ -672,28 +672,6 @@ async def create_flashcards(space_id: str, request: QuizRequest):
         logger.error(f"Error in create_flashcards: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-def update_quiz (space_id, content) :
-    rag_system.supabase.table('generated_content').update(content).eq("space_id",space_id).execute()
-
-def determine_page_for_chunk(chunk: str, page_text_map: List[Dict]) -> int:
-    """
-    Determine the page number for a given text chunk
-    
-    Args:
-    - chunk: Text chunk to locate
-    - page_text_map: List of page text mappings
-    
-    Returns:
-    - Page number where the chunk is most likely located
-    """
-    # Iterate through pages and check if chunk is in page text
-    for page_info in page_text_map:
-        # Check if chunk is in the page text
-        if chunk in page_info['text']:
-            return page_info['page_num']
-    
-    # If no exact match, return the last page
-    return page_text_map[-1]['page_num']
 
 if __name__ == "__main__":
     import uvicorn
