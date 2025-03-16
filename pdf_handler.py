@@ -124,7 +124,12 @@ class PDFHandler:
         try:
             # Read PDF
             pdf_content = await file.read()
-            pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
+            
+            try:
+                pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
+            except Exception as pdf_error:
+                logger.error(f"Error reading PDF: {pdf_error}")
+                raise ValueError(f"Invalid or corrupted PDF file: {str(pdf_error)}")
             
             # Extract text with advanced page tracking
             full_text = ""
@@ -138,7 +143,7 @@ class PDFHandler:
                         try:
                             page_content = page.get_text()
                         except Exception as alternative_extract_error:
-                            print(f"Failed to extract text from page {page_num}")
+                            logger.warning(f"Failed to extract text from page {page_num}: {alternative_extract_error}")
                             page_content = ""
                     
                     page_content = ''.join(char for char in page_content if char.isprintable())
@@ -151,31 +156,40 @@ class PDFHandler:
                     full_text += page_content + "\n"
                 
                 except Exception as page_error:
-                    print(f"Unexpected error extracting text from page {page_num}: {page_error}")
+                    logger.error(f"Unexpected error extracting text from page {page_num}: {page_error}")
                     continue
             
             if not full_text.strip():
-                raise ValueError("No text could be extracted from the PDF")
+                raise ValueError("No text could be extracted from the PDF. The file may be scanned, encrypted, or contain only images.")
             
             # Save PDF metadata to database
-            pdf_upload = rag_system.supabase.table('pdfs').insert({
-                'space_id': space_id,
-                'extracted_text': full_text
-            }).execute()
-            
-            pdf_id = pdf_upload.data[0]['id']
+            try:
+                pdf_upload = rag_system.supabase.table('pdfs').insert({
+                    'space_id': space_id,
+                    'extracted_text': full_text
+                }).execute()
+                
+                pdf_id = pdf_upload.data[0]['id']
+            except Exception as db_error:
+                logger.error(f"Database error: {db_error}")
+                raise ValueError(f"Failed to save PDF metadata to database: {str(db_error)}")
 
             # Trigger upload in the background
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{nuton_api}/upload",
-                    files={"file": (file.filename, pdf_content, file.content_type)},
-                    data={"pdf_id": pdf_id},
-                    timeout=60.0
-                )
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"{nuton_api}/upload",
+                        files={"file": (file.filename, pdf_content, file.content_type)},
+                        data={"pdf_id": pdf_id},
+                        timeout=60.0
+                    )
 
-                if response.status_code != 200:
-                    print(f"Error from worker service: {response.text}")
+                    if response.status_code != 200:
+                        logger.error(f"Error from worker service: {response.text}")
+                        # Continue processing even if worker service fails
+            except Exception as upload_error:
+                logger.error(f"Error uploading to worker service: {upload_error}")
+                # Continue processing even if worker service fails
             
             # Process text chunks and embeddings
             text_splitter = RecursiveCharacterTextSplitter(
@@ -184,8 +198,13 @@ class PDFHandler:
             )
             text_chunks = text_splitter.split_text(full_text)
             
-            collection = self.chroma_client.get_or_create_collection("pdf_embeddings")
+            try:
+                collection = self.chroma_client.get_or_create_collection("pdf_embeddings")
+            except Exception as chroma_error:
+                logger.error(f"ChromaDB error: {chroma_error}")
+                raise ValueError(f"Failed to connect to vector database: {str(chroma_error)}")
             
+            chunk_errors = 0
             for i, chunk in enumerate(text_chunks):
                 try:
                     page_number = self.determine_page_for_chunk(chunk, page_text_map, 'page_num')
@@ -203,17 +222,27 @@ class PDFHandler:
                         documents=[chunk]
                     )
                 except Exception as chunk_error:
-                    print(f"Error processing chunk {i}: {chunk_error}")
+                    logger.error(f"Error processing chunk {i}: {chunk_error}")
+                    chunk_errors += 1
+                    # Continue processing other chunks
+            
+            if chunk_errors == len(text_chunks):
+                raise ValueError("Failed to process any text chunks. Check embedding service.")
             
             return {
                 "status": "success", 
                 "pdf_id": pdf_id,
                 "extracted_text": full_text, 
-                "chunks_processed": len(text_chunks)
+                "chunks_processed": len(text_chunks) - chunk_errors,
+                "chunks_failed": chunk_errors
             }
         
+        except ValueError as ve:
+            # Re-raise ValueError as HTTPException with 400 status code
+            raise HTTPException(status_code=400, detail=str(ve))
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.error(f"Unexpected error in handle_pdf_upload: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
 
     async def handle_pptx_upload(self, file, space_id, rag_system, nuton_api):
         """
@@ -223,32 +252,44 @@ class PDFHandler:
         try:
             # Read PPTX
             pptx_content = await file.read()
-            full_text, slide_text_map = self.extract_pptx_text(pptx_content)
+            
+            try:
+                full_text, slide_text_map = self.extract_pptx_text(pptx_content)
+            except Exception as pptx_error:
+                logger.error(f"Error extracting text from PPTX: {pptx_error}")
+                raise ValueError(f"Invalid or corrupted PowerPoint file: {str(pptx_error)}")
             
             if not full_text.strip():
-                raise ValueError("No text could be extracted from the PowerPoint file")
+                raise ValueError("No text could be extracted from the PowerPoint file. The file may contain only images or non-textual content.")
             
             # Save PPTX metadata to database
-            pptx_upload = rag_system.supabase.table('pdfs').insert({
-                'space_id': space_id,
-                'extracted_text': full_text
-            }).execute()
-            
-            pptx_id = pptx_upload.data[0]['id']
-            # print('pptx',pptx_upload.data )
-            # print('pptx_id',pptx_id )
+            try:
+                pptx_upload = rag_system.supabase.table('pdfs').insert({
+                    'space_id': space_id,
+                    'extracted_text': full_text
+                }).execute()
+                
+                pptx_id = pptx_upload.data[0]['id']
+            except Exception as db_error:
+                logger.error(f"Database error: {db_error}")
+                raise ValueError(f"Failed to save PowerPoint metadata to database: {str(db_error)}")
 
             # Trigger upload in the background
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{nuton_api}/upload",
-                    files={"file": (file.filename, pptx_content, file.content_type)},
-                    data={"pdf_id": pptx_id},  # Using pdf_id for consistency with existing structure
-                    timeout=60.0
-                )
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"{nuton_api}/upload",
+                        files={"file": (file.filename, pptx_content, file.content_type)},
+                        data={"pdf_id": pptx_id},  # Using pdf_id for consistency with existing structure
+                        timeout=60.0
+                    )
 
-                if response.status_code != 200:
-                    print(f"Error from worker service: {response.text}")
+                    if response.status_code != 200:
+                        logger.error(f"Error from worker service: {response.text}")
+                        # Continue processing even if worker service fails
+            except Exception as upload_error:
+                logger.error(f"Error uploading to worker service: {upload_error}")
+                # Continue processing even if worker service fails
             
             # Process text chunks and embeddings
             text_splitter = RecursiveCharacterTextSplitter(
@@ -257,9 +298,13 @@ class PDFHandler:
             )
             text_chunks = text_splitter.split_text(full_text)
             
-            collection = self.chroma_client.get_or_create_collection("pdf_embeddings")
+            try:
+                collection = self.chroma_client.get_or_create_collection("pdf_embeddings")
+            except Exception as chroma_error:
+                logger.error(f"ChromaDB error: {chroma_error}")
+                raise ValueError(f"Failed to connect to vector database: {str(chroma_error)}")
 
-            
+            chunk_errors = 0
             for i, chunk in enumerate(text_chunks):
                 try:
                     # Find the slide number for this chunk using 'slide_num' key
@@ -278,17 +323,27 @@ class PDFHandler:
                         documents=[chunk]
                     )
                 except Exception as chunk_error:
-                    print(f"Error processing chunk {i}: {chunk_error}")
+                    logger.error(f"Error processing chunk {i}: {chunk_error}")
+                    chunk_errors += 1
+                    # Continue processing other chunks
+            
+            if chunk_errors == len(text_chunks):
+                raise ValueError("Failed to process any text chunks. Check embedding service.")
             
             return {
                 "status": "success", 
                 "pdf_id": pptx_id,  # Using pdf_id for consistency
                 "extracted_text": full_text, 
-                "chunks_processed": len(text_chunks)
+                "chunks_processed": len(text_chunks) - chunk_errors,
+                "chunks_failed": chunk_errors
             }
         
+        except ValueError as ve:
+            # Re-raise ValueError as HTTPException with 400 status code
+            raise HTTPException(status_code=400, detail=str(ve))
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.error(f"Unexpected error in handle_pptx_upload: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to process PowerPoint file: {str(e)}")
 
     async def handle_docx_upload(self, file, space_id, rag_system, nuton_api):
         """
@@ -298,30 +353,44 @@ class PDFHandler:
         try:
             # Read DOCX
             docx_content = await file.read()
-            full_text, paragraph_text_map = self.extract_docx_text(docx_content)
+            
+            try:
+                full_text, paragraph_text_map = self.extract_docx_text(docx_content)
+            except Exception as docx_error:
+                logger.error(f"Error extracting text from DOCX: {docx_error}")
+                raise ValueError(f"Invalid or corrupted Word document: {str(docx_error)}")
             
             if not full_text.strip():
-                raise ValueError("No text could be extracted from the Word document")
+                raise ValueError("No text could be extracted from the Word document. The file may contain only images or non-textual content.")
             
             # Save DOCX metadata to database
-            docx_upload = rag_system.supabase.table('pdfs').insert({
-                'space_id': space_id,
-                'extracted_text': full_text
-            }).execute()
-            
-            docx_id = docx_upload.data[0]['id']
+            try:
+                docx_upload = rag_system.supabase.table('pdfs').insert({
+                    'space_id': space_id,
+                    'extracted_text': full_text
+                }).execute()
+                
+                docx_id = docx_upload.data[0]['id']
+            except Exception as db_error:
+                logger.error(f"Database error: {db_error}")
+                raise ValueError(f"Failed to save Word document metadata to database: {str(db_error)}")
 
             # Trigger upload in the background
-            async with httpx.AsyncClient() as client:
-                response = await client.post(
-                    f"{nuton_api}/upload",
-                    files={"file": (file.filename, docx_content, file.content_type)},
-                    data={"pdf_id": docx_id},  # Using pdf_id for consistency
-                    timeout=60.0
-                )
+            try:
+                async with httpx.AsyncClient() as client:
+                    response = await client.post(
+                        f"{nuton_api}/upload",
+                        files={"file": (file.filename, docx_content, file.content_type)},
+                        data={"pdf_id": docx_id},  # Using pdf_id for consistency
+                        timeout=60.0
+                    )
 
-                if response.status_code != 200:
-                    print(f"Error from worker service: {response.text}")
+                    if response.status_code != 200:
+                        logger.error(f"Error from worker service: {response.text}")
+                        # Continue processing even if worker service fails
+            except Exception as upload_error:
+                logger.error(f"Error uploading to worker service: {upload_error}")
+                # Continue processing even if worker service fails
             
             # Process text chunks and embeddings
             text_splitter = RecursiveCharacterTextSplitter(
@@ -330,8 +399,13 @@ class PDFHandler:
             )
             text_chunks = text_splitter.split_text(full_text)
             
-            collection = self.chroma_client.get_or_create_collection("pdf_embeddings")
+            try:
+                collection = self.chroma_client.get_or_create_collection("pdf_embeddings")
+            except Exception as chroma_error:
+                logger.error(f"ChromaDB error: {chroma_error}")
+                raise ValueError(f"Failed to connect to vector database: {str(chroma_error)}")
             
+            chunk_errors = 0
             for i, chunk in enumerate(text_chunks):
                 try:
                     # Find the paragraph number for this chunk
@@ -350,14 +424,24 @@ class PDFHandler:
                         documents=[chunk]
                     )
                 except Exception as chunk_error:
-                    print(f"Error processing chunk {i}: {chunk_error}")
+                    logger.error(f"Error processing chunk {i}: {chunk_error}")
+                    chunk_errors += 1
+                    # Continue processing other chunks
+            
+            if chunk_errors == len(text_chunks):
+                raise ValueError("Failed to process any text chunks. Check embedding service.")
             
             return {
                 "status": "success", 
                 "pdf_id": docx_id,  # Using pdf_id for consistency
                 "extracted_text": full_text, 
-                "chunks_processed": len(text_chunks)
+                "chunks_processed": len(text_chunks) - chunk_errors,
+                "chunks_failed": chunk_errors
             }
         
+        except ValueError as ve:
+            # Re-raise ValueError as HTTPException with 400 status code
+            raise HTTPException(status_code=400, detail=str(ve))
         except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e)) 
+            logger.error(f"Unexpected error in handle_docx_upload: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to process Word document: {str(e)}") 
