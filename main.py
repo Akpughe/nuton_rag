@@ -84,9 +84,12 @@ class RAGSystem:
             )
 
             self.supabase: Client = create_client(
-                os.getenv('SUPABASE_URL'), 
-                os.getenv('SUPABASE_KEY')
+                os.getenv('SUPABASE_URL_DEV'), 
+                os.getenv('SUPABASE_KEY_DEV')
             )
+
+            print("supabase url", os.getenv('SUPABASE_URL_DEV'))
+            print("supabase key", os.getenv('SUPABASE_KEY_DEV'))
             
             # ChromaDB configuration from environment
             chroma_host = os.getenv('CHROMA_HOST',  os.getenv('CHROMA_DB_CONNECTION_STRING'))
@@ -920,37 +923,156 @@ async def upload_yt(request: YTUploadRequest):
 pdf_handler = PDFHandler()
 
 @app.post("/upload-document")
-async def upload_document(file: UploadFile = File(...), space_id: str = Form(None)):
+async def upload_document(file: UploadFile = File(...), space_id: str = Form(None), file_path: str = Form(None)):
     """
     Handles upload of PDF, PPTX, and DOCX files.
     Automatically detects file type and uses appropriate handler.
     """
+    if not file:
+        raise HTTPException(
+            status_code=400,
+            detail="No file provided for upload."
+        )
+    
     # Get file extension (lowercase)
-    file_extension = file.filename.lower().split('.')[-1]
+    try:
+        file_extension = file.filename.lower().split('.')[-1]
+    except (AttributeError, IndexError):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid filename format. Please ensure the file has a proper extension."
+        )
     
     # Validate file type
     supported_extensions = {'pdf', 'pptx', 'docx', 'doc'}
     if file_extension not in supported_extensions:
         raise HTTPException(
             status_code=400,
-            detail=f"Unsupported file type. Only {', '.join(supported_extensions)} files are supported."
+            detail=f"Unsupported file type: '{file_extension}'. Only {', '.join(supported_extensions)} files are supported."
         )
     
     try:
+        # Check if file content is valid
+        file_content = await file.read()
+        if not file_content:
+            raise HTTPException(
+                status_code=400,
+                detail="Empty file content. Please upload a valid file."
+            )
+        
+        # Reset file position for handlers to read it again
+        await file.seek(0)
+        
+        # Process file based on its extension
         if file_extension == 'pdf':
-            return await pdf_handler.handle_pdf_upload(file, space_id, rag_system, nuton_api)
+            return await pdf_handler.handle_pdf_upload(file, space_id, rag_system, nuton_api, file_path)
         elif file_extension in ['pptx']:
-            return await pdf_handler.handle_pptx_upload(file, space_id, rag_system, nuton_api)
+            return await pdf_handler.handle_pptx_upload(file, space_id, rag_system, nuton_api, file_path)
         else:  # docx or doc
-            return await pdf_handler.handle_docx_upload(file, space_id, rag_system, nuton_api)
+            return await pdf_handler.handle_docx_upload(file, space_id, rag_system, nuton_api, file_path)
             
+    except HTTPException:
+        # Re-raise HTTP exceptions without modification
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error processing file {file.filename}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error processing file: {str(e)}"
+        )
+
+@app.post("/upload-multiple-documents")
+async def upload_multiple_documents(files: List[UploadFile] = File(...), space_id: str = Form(None), file_path: List[str] = Form(None)):
+    """
+    Handles upload of multiple files of different types (PDF, PPTX, DOCX, DOC).
+    Processes each file based on its extension.
+    """
+    if not files:
+        raise HTTPException(
+            status_code=400,
+            detail="No files provided for upload."
+        )
+    
+    supported_extensions = {'pdf', 'pptx', 'docx', 'doc'}
+    results = []
+    errors = []
+    
+    # Initialize file_path list if None
+    if file_path is None:
+        file_path = [None] * len(files)
+    
+    # Ensure file_path has the same length as files
+    if len(file_path) < len(files):
+        file_path.extend([None] * (len(files) - len(file_path)))
+    
+    for index, file in enumerate(files):
+        try:
+            # Get file extension (lowercase)
+            try:
+                file_extension = file.filename.lower().split('.')[-1]
+            except (AttributeError, IndexError):
+                errors.append({
+                    "filename": getattr(file, "filename", "unknown"),
+                    "error": "Invalid filename format. Please ensure the file has a proper extension."
+                })
+                continue
+            
+            # Validate file type
+            if file_extension not in supported_extensions:
+                errors.append({
+                    "filename": file.filename,
+                    "error": f"Unsupported file type: '{file_extension}'. Only {', '.join(supported_extensions)} files are supported."
+                })
+                continue
+            
+            # Check if file content is valid
+            file_content = await file.read()
+            if not file_content:
+                errors.append({
+                    "filename": file.filename,
+                    "error": "Empty file content. Please upload a valid file."
+                })
+                continue
+            
+            # Reset file position for handlers to read it again
+            await file.seek(0)
+            
+            # Get the corresponding file path for this file
+            current_file_path = file_path[index] if index < len(file_path) else None
+            
+            # Process file based on its extension
+            if file_extension == 'pdf':
+                result = await pdf_handler.handle_pdf_upload(file, space_id, rag_system, nuton_api, current_file_path)
+            elif file_extension in ['pptx']:
+                result = await pdf_handler.handle_pptx_upload(file, space_id, rag_system, nuton_api, current_file_path)
+            else:  # docx or doc
+                result = await pdf_handler.handle_docx_upload(file, space_id, rag_system, nuton_api, current_file_path)
+            
+            # Add filename to result for clarity
+            result["filename"] = file.filename
+            results.append(result)
+            
+        except Exception as e:
+            logger.error(f"Error processing file {getattr(file, 'filename', 'unknown')}: {str(e)}")
+            errors.append({
+                "filename": getattr(file, "filename", "unknown"),
+                "error": str(e)
+            })
+    
+    # Return summary of processed files and errors
+    return {
+        "status": "completed",
+        "successful_uploads": results,
+        "failed_uploads": errors,
+        "total_files": len(files),
+        "successful_count": len(results),
+        "failed_count": len(errors)
+    }
 
 # Keep the old endpoint for backward compatibility
 @app.post("/upload-pdf")
-async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None)):
-    return await upload_document(file, space_id)
+async def upload_pdf(file: UploadFile = File(...), space_id: str = Form(None), file_path: str = Form(None)):
+    return await upload_document(file, space_id, file_path)
 
 @app.post("/generate-quiz-stream")
 async def create_quiz_stream(space_id:str, request: QuizRequest):

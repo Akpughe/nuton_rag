@@ -120,7 +120,7 @@ class PDFHandler:
         
         return full_text.strip(), paragraph_text_map
 
-    async def handle_pdf_upload(self, file, space_id, rag_system, nuton_api):
+    async def handle_pdf_upload(self, file, space_id, rag_system, nuton_api, file_path):
         try:
             # Read PDF
             pdf_content = await file.read()
@@ -162,11 +162,14 @@ class PDFHandler:
             if not full_text.strip():
                 raise ValueError("No text could be extracted from the PDF. The file may be scanned, encrypted, or contain only images.")
             
+            print("space_id", space_id)
             # Save PDF metadata to database
             try:
                 pdf_upload = rag_system.supabase.table('pdfs').insert({
                     'space_id': space_id,
-                    'extracted_text': full_text
+                    'extracted_text': full_text,
+                    'file_type': 'pdf',
+                    'file_path': file_path
                 }).execute()
                 
                 pdf_id = pdf_upload.data[0]['id']
@@ -244,7 +247,7 @@ class PDFHandler:
             logger.error(f"Unexpected error in handle_pdf_upload: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to process PDF: {str(e)}")
 
-    async def handle_pptx_upload(self, file, space_id, rag_system, nuton_api):
+    async def handle_pptx_upload(self, file, space_id, rag_system, nuton_api, file_path):
         """
         Handles the upload and processing of PowerPoint (.pptx) files.
         Similar to handle_pdf_upload but for PowerPoint presentations.
@@ -266,7 +269,9 @@ class PDFHandler:
             try:
                 pptx_upload = rag_system.supabase.table('pdfs').insert({
                     'space_id': space_id,
-                    'extracted_text': full_text
+                    'extracted_text': full_text,
+                    'file_type': 'pptx',
+                    'file_path': file_path
                 }).execute()
                 
                 pptx_id = pptx_upload.data[0]['id']
@@ -345,7 +350,7 @@ class PDFHandler:
             logger.error(f"Unexpected error in handle_pptx_upload: {e}")
             raise HTTPException(status_code=500, detail=f"Failed to process PowerPoint file: {str(e)}")
 
-    async def handle_docx_upload(self, file, space_id, rag_system, nuton_api):
+    async def handle_docx_upload(self, file, space_id, rag_system, nuton_api, file_path):
         """
         Handles the upload and processing of Word (.docx) files.
         Similar to handle_pdf_upload but for Word documents.
@@ -367,7 +372,9 @@ class PDFHandler:
             try:
                 docx_upload = rag_system.supabase.table('pdfs').insert({
                     'space_id': space_id,
-                    'extracted_text': full_text
+                    'extracted_text': full_text,
+                    'file_type': 'docx',
+                    'file_path': file_path
                 }).execute()
                 
                 docx_id = docx_upload.data[0]['id']
