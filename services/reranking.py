@@ -14,6 +14,7 @@ class RetrievalResult(NamedTuple):
     document_id: Optional[str] = None
     space_id: Optional[str] = None
     relevance_score: float = 0.0
+    metadata: Optional[Dict[str, Any]] = None
     index: int = 0
 
 class RetrievalResults(NamedTuple):
@@ -114,6 +115,7 @@ class RetrievalEngine:
     def retrieve_and_rerank(self, query, embeddings, document_ids=None, space_id=None):
         """
         Retrieve and rerank documents, with optional filtering by document_ids and space_id
+        Works with both document content and YouTube video content
         """
         # Initial Retrieval
         query_embedding = embeddings[0]['embedding']
@@ -130,11 +132,22 @@ class RetrievalEngine:
         # Add document_id filter if provided
         if document_ids:
             if isinstance(document_ids, list) and len(document_ids) > 1:
-                filter_dict["document_id"] = {"$in": document_ids}
+                # When multiple IDs are provided, we need to check both document_id and video_id fields
+                # Create an OR condition for document_id or video_id
+                filter_dict["$or"] = [
+                    {"document_id": {"$in": document_ids}},
+                    {"video_id": {"$in": document_ids}}
+                ]
+                logger.info(f"Using OR filter for multiple document_ids: {document_ids}")
             else:
-                # Handle single document_id (either as string or single-item list)
+                # Handle single document_id
                 doc_id = document_ids[0] if isinstance(document_ids, list) else document_ids
-                filter_dict["document_id"] = doc_id
+                # Create an OR condition for document_id or video_id
+                filter_dict["$or"] = [
+                    {"document_id": doc_id},
+                    {"video_id": doc_id}
+                ]
+                logger.info(f"Using OR filter for single document_id: {doc_id}")
         
         # Add space_id filter if provided
         if space_id:
@@ -145,7 +158,7 @@ class RetrievalEngine:
         
         try:
             # Simple query with retry logic
-            max_retries = 2
+            max_retries = 3  # Increased retries
             for attempt in range(max_retries):
                 try:
                     # Try the query with both filters
@@ -161,18 +174,33 @@ class RetrievalEngine:
                         logger.info(f"Query successful on attempt {attempt+1}: {len(retrieval_results.get('matches', []))} matches")
                         break
                         
-                    # If no results with both filters and this isn't the last attempt, try relaxing filters
-                    if not retrieval_results.get('matches') and attempt < max_retries-1 and document_ids and space_id:
-                        # Try with only document_ids filter (highest priority)
-                        logger.warning("No results with both filters, trying only document_id filter")
-                        doc_filter = {}
-                        if isinstance(document_ids, list) and len(document_ids) > 1:
-                            doc_filter["document_id"] = {"$in": document_ids}
-                        else:
-                            doc_id = document_ids[0] if isinstance(document_ids, list) else document_ids
-                            doc_filter["document_id"] = doc_id
-                        
-                        filter_dict = doc_filter
+                    # If no results with complex filter, try simpler filters
+                    if not retrieval_results.get('matches') and attempt < max_retries-1:
+                        if document_ids and space_id:
+                            # Try with only document_ids filter (highest priority)
+                            logger.warning("No results with both filters, trying only document_id filter")
+                            if isinstance(document_ids, list) and len(document_ids) > 1:
+                                # Try with direct $in for document_id
+                                filter_dict = {"document_id": {"$in": document_ids}}
+                            else:
+                                doc_id = document_ids[0] if isinstance(document_ids, list) else document_ids
+                                filter_dict = {"document_id": doc_id}
+                            logger.info(f"Retrying with simplified filter: {filter_dict}")
+                        elif document_ids:
+                            # Try a different field name (video_id instead of document_id)
+                            if attempt == 1:
+                                logger.warning("No results with document_id filter, trying video_id filter")
+                                if isinstance(document_ids, list) and len(document_ids) > 1:
+                                    filter_dict = {"video_id": {"$in": document_ids}}
+                                else:
+                                    doc_id = document_ids[0] if isinstance(document_ids, list) else document_ids
+                                    filter_dict = {"video_id": doc_id}
+                                logger.info(f"Retrying with video_id filter: {filter_dict}")
+                            # Last attempt: try with space_id only if available
+                            elif space_id:
+                                logger.warning("No results with document_id or video_id filters, trying only space_id")
+                                filter_dict = {"space_id": space_id}
+                                logger.info(f"Retrying with space_id only: {filter_dict}")
                     
                 except Exception as e:
                     logger.error(f"Query attempt {attempt+1} failed: {str(e)}")
@@ -182,6 +210,32 @@ class RetrievalEngine:
                     # Short delay before retry
                     import time
                     time.sleep(0.5)
+                    
+            # If we still have no results, try one last query with no filter
+            if not retrieval_results.get('matches'):
+                logger.warning("No results with any filters, attempting query without filters")
+                try:
+                    retrieval_results = self.pinecone_index.query(
+                        vector=query_embedding, 
+                        top_k=self.top_k, 
+                        include_metadata=True
+                    )
+                    logger.info(f"Unfiltered query returned {len(retrieval_results.get('matches', []))} matches")
+                    
+                    # Apply space_id filter client-side if provided
+                    if space_id:
+                        filtered_matches = [
+                            match for match in retrieval_results.get('matches', [])
+                            if match.get('metadata', {}).get('space_id') == space_id
+                        ]
+                        if filtered_matches:
+                            logger.info(f"Client-side space_id filtering reduced to {len(filtered_matches)} matches")
+                            retrieval_results['matches'] = filtered_matches
+                        else:
+                            logger.warning("Client-side space_id filtering removed all matches")
+                    
+                except Exception as e:
+                    logger.error(f"Unfiltered query failed: {str(e)}")
                         
             # Format the results into our return structure
             results = []
@@ -189,13 +243,23 @@ class RetrievalEngine:
                 metadata = match.get('metadata', {})
                 document = metadata.get('text', '')
                 document_id = metadata.get('document_id')
+                video_id = metadata.get('video_id')
                 match_space_id = metadata.get('space_id')
                 score = match.get('score', 0.0)
+                source_type = metadata.get('source_type', 'unknown')
+                
+                logger.info(f"Match {i}: doc_id={document_id}, video_id={video_id}, space_id={match_space_id}, source_type={source_type}, score={score}")
                 
                 # Only include results that match the requested space_id if it was provided
                 # This additional check ensures we respect both filters even if we had to relax one
                 if space_id and match_space_id != space_id:
+                    logger.info(f"Skipping match {i} due to space_id mismatch: {match_space_id} != {space_id}")
                     continue
+                
+                # Ensure we have a valid document_id for result tracking
+                if not document_id and video_id:
+                    document_id = video_id
+                    logger.info(f"Using video_id as document_id for result: {video_id}")
                     
                 results.append(
                     RetrievalResult(
@@ -203,6 +267,7 @@ class RetrievalEngine:
                         document_id=document_id,
                         space_id=match_space_id,
                         relevance_score=score,
+                        metadata=metadata,  # Add full metadata to result
                         index=i
                     )
                 )
@@ -212,5 +277,4 @@ class RetrievalEngine:
                 
         except Exception as e:
             logger.error(f"Error querying Pinecone: {str(e)}")
-            # Return empty results when an error occurs
             return RetrievalResults(results=[], query=query)

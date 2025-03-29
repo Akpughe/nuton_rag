@@ -1,5 +1,5 @@
 import os
-from fastapi import File, UploadFile, Form, HTTPException, FastAPI, Body
+from fastapi import File, UploadFile, Form, HTTPException, FastAPI, Body, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, HttpUrl
@@ -23,9 +23,17 @@ from starlette.requests import Request
 import tempfile
 import shutil
 from openai import OpenAI
+from youtube_transcript_api import YouTubeTranscriptApi
+import groq
+
 
 from sub import QuizRequest, StreamingQuizResponse, OptimizedStudyGenerator
 from pdf_handler import PDFHandler
+
+# Import Pinecone study services
+from pinecone_study_service import PineconeStudyGenerator
+from pinecone_index_manager import PineconeIndexManager
+from optimize_content_processing import OptimizedContentProcessor
 
 # Import our service components
 from services.document_processing import MultiFileDocumentProcessor
@@ -34,6 +42,7 @@ from services.embedding import MultiFileVectorIndexer
 from services.reranking import RetrievalEngine
 from services.response_generator import ResponseGenerator
 from services.legacy_rag import RAGSystem
+from services.youtube_processing import YouTubeTranscriptProcessor
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -42,6 +51,10 @@ load_dotenv()
 
 # Initialize the OptimizedStudyGenerator
 study_generator = OptimizedStudyGenerator()
+
+# Initialize the Pinecone-based study generator
+pinecone_study_generator = PineconeStudyGenerator()
+pinecone_index_manager = PineconeIndexManager()
 
 nuton_api = "https://api.nuton.app"
 
@@ -97,6 +110,9 @@ class IntegratedProcessingResponse(BaseModel):
     document_ids: Optional[Dict[str, str]] = None
     indexed_chunks: Optional[int] = None
     total_chunks: Optional[int] = None
+
+class YTTranscriptRequest(BaseModel):
+    yt_link: str
 
 # Create instances of our service components
 document_processor = MultiFileDocumentProcessor()
@@ -679,6 +695,63 @@ async def create_flashcards(space_id: str, request: QuizRequest):
         logger.error(f"Error in create_flashcards: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+
+@app.get("/yt-transcript")
+async def get_yt_transcript(request: YTTranscriptRequest):
+    # Extract video ID from various YouTube URL formats
+    if "youtu.be/" in request.yt_link:
+        # Handle youtu.be format
+        yt_id = request.yt_link.split("youtu.be/")[1].split("?")[0]
+        print(yt_id)
+    elif "youtube.com/watch?v=" in request.yt_link:
+        # Handle youtube.com format
+        yt_id = request.yt_link.split("watch?v=")[1].split("&")[0]
+        print(yt_id)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL format")
+    try:
+        # Try to get English transcript first
+        transcript = YouTubeTranscriptApi.get_transcript(yt_id, languages=['en'])
+    except:
+        try:
+            # If English not available, get transcript in any language and translate
+            transcript = YouTubeTranscriptApi.get_transcript(yt_id)
+            
+            # Initialize Groq client
+            client = groq.Client(api_key=os.getenv('GROQ_API_KEY'))
+            
+            # Combine transcript text for translation
+            full_text = " ".join([line['text'] for line in transcript])
+            
+            # Translate using Groq
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",  # Using Llama model from Groq
+                messages=[
+                    {"role": "system", "content": "You are a translator. Translate the following text to English:"},
+                    {"role": "user", "content": full_text}
+                ]
+            )
+            
+            translated_text = response.choices[0].message.content
+            
+            # Update transcript with translated text
+            words = translated_text.split()
+            words_per_line = len(words) // len(transcript)
+            
+            for i, line in enumerate(transcript):
+                start_idx = i * words_per_line
+                end_idx = start_idx + words_per_line
+                line['text'] = " ".join(words[start_idx:end_idx])
+                
+        except Exception as e:
+            raise HTTPException(status_code=404, detail=f"Could not get transcript: {str(e)}")
+    
+    for line in transcript:
+        print(f"{line['text']} ({line['start']}-{line['start'] + line['duration']}s)")
+    
+    return transcript
+
 # New endpoint for integrated document processing
 @app.post("/integrated/process-documents", response_model=IntegratedProcessingResponse)
 async def integrated_process_documents(
@@ -777,6 +850,10 @@ async def integrated_process_documents(
 # New endpoint for querying with the integrated components
 @app.post("/integrated/query")
 async def integrated_query(request: IntegratedRAGRequest):
+    """
+    Retrieve relevant information and generate a response based on the query.
+    Works with all indexed content including documents (PDFs, DOCX, PPTX) and YouTube video transcripts.
+    """
     try:
         # Add logging and timing
         start_time = time.time()
@@ -818,8 +895,8 @@ async def integrated_query(request: IntegratedRAGRequest):
         embedding_time = time.time()
         logging.info(f"Embedding generation took {embedding_time - start_time:.2f} seconds")
         
-        # Retrieve and rerank documents
-        logging.info("Retrieving and reranking documents...")
+        # Retrieve and rerank documents (works with both document and YouTube video content)
+        logging.info("Retrieving and reranking content from documents and videos...")
         rerank_results = retrieval_engine.retrieve_and_rerank(
             request.query, 
             [{'embedding': query_embedding}],
@@ -828,7 +905,7 @@ async def integrated_query(request: IntegratedRAGRequest):
         )
         
         retrieval_time = time.time()
-        logging.info(f"Document retrieval took {retrieval_time - embedding_time:.2f} seconds")
+        logging.info(f"Content retrieval took {retrieval_time - embedding_time:.2f} seconds")
         
         # Check if we got any results
         if not hasattr(rerank_results, 'results') or not rerank_results.results:
@@ -838,7 +915,8 @@ async def integrated_query(request: IntegratedRAGRequest):
                 "response": "I couldn't find any relevant information to answer your query. Please try a different question or upload more relevant documents.",
                 "contexts": [],
                 "space_id": request.space_id,
-                "document_ids": request.document_ids
+                "document_ids": request.document_ids,
+                "sources": []
             }
         
         # Extract the text contexts from reranked results
@@ -847,7 +925,38 @@ async def integrated_query(request: IntegratedRAGRequest):
         for result in rerank_results.results:
             context = result.document
             contexts.append(context)
+        
+        # Prepare source attribution
+        sources = []
+        for result in rerank_results.results[:3]:  # Get top 3 sources for citation
+            metadata = result.metadata if hasattr(result, 'metadata') else {}
             
+            if metadata.get('source_type') == 'youtube_video':
+                # YouTube video source
+                sources.append({
+                    "type": "youtube",
+                    "id": metadata.get('video_id'),
+                    "url": metadata.get('source_url'),
+                    "title": metadata.get('title', f"YouTube Video {metadata.get('youtube_id', '')}"),
+                    "thumbnail": metadata.get('thumbnail')
+                })
+            elif metadata.get('document_id'):
+                # Document source
+                sources.append({
+                    "type": "document",
+                    "id": metadata.get('document_id'),
+                    "file_type": metadata.get('file_type', 'unknown'),
+                    "title": metadata.get('source_file', 'Document')
+                })
+        
+        # Deduplicate sources by id
+        unique_sources = []
+        seen_ids = set()
+        for source in sources:
+            if source['id'] not in seen_ids:
+                seen_ids.add(source['id'])
+                unique_sources.append(source)
+        
         # Generate response using the response generator
         logging.info("Generating final response with contexts")
         response_text = response_generator.generate_response(
@@ -865,7 +974,8 @@ async def integrated_query(request: IntegratedRAGRequest):
             "response": response_text,
             "contexts": contexts[:3],  # Return top 3 contexts for reference
             "space_id": request.space_id,
-            "document_ids": request.document_ids
+            "document_ids": request.document_ids,
+            "sources": unique_sources
         }
     
     except Exception as e:
@@ -875,6 +985,984 @@ async def integrated_query(request: IntegratedRAGRequest):
             detail=f"An error occurred during query processing: {str(e)}"
         )
 
+# Request model for Pinecone-based quiz and flashcard generation
+class PineconeStudyRequest(BaseModel):
+    document_ids: List[str]
+    num_questions: int = 15
+    difficulty: str = "medium"
+    batch_size: int = 3
+    space_id: Optional[str] = None
+
+# New model for integrated quiz generation
+class IntegratedQuizRequest(BaseModel):
+    document_ids: List[str]
+    space_id: str
+    num_questions: int = 15
+    difficulty: str = "medium"
+    batch_size: int = 3
+    question_types: Optional[List[str]] = None  # ["mcq", "true_false"] or subset
+    
+# Add a new endpoint for integrated quiz generation
+@app.post("/integrated/generate-quiz")
+async def integrated_generate_quiz(request: IntegratedQuizRequest, background_tasks: BackgroundTasks):
+    """Generate quiz questions using the integrated approach to avoid Pinecone filtering issues"""
+    try:
+        start_time = time.time()
+        logging.info(f"Processing quiz generation for space_id: {request.space_id}, document_ids: {request.document_ids}")
+        
+        # Process question type preferences
+        question_types = request.question_types or ["mcq", "true_false"]  # Default to both if not specified
+        logging.info(f"Question types selected: {question_types}")
+        
+        # Validate question types
+        valid_types = ["mcq", "true_false"]
+        for q_type in question_types:
+            if q_type.lower() not in valid_types:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Invalid question type: {q_type}. Supported types are: {', '.join(valid_types)}"
+                )
+        
+        # Create retrieval engine - Initialize only once if possible
+        retrieval_engine = RetrievalEngine(top_k=20)  # Larger top_k for more content
+        
+        # Generate a semantic query to get relevant content for quiz generation
+        semantic_query = "key concepts, definitions, important facts, and core principles"
+        logging.info(f"Using semantic query: '{semantic_query}' to retrieve content")
+        
+        # Generate embedding for the semantic query
+        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        embedding_response = client.embeddings.create(
+            model="text-embedding-ada-002",
+            input=semantic_query
+        )
+        query_embedding = embedding_response.data[0].embedding
+        
+        embedding_time = time.time()
+        logging.info(f"Embedding generation took {embedding_time - start_time:.2f} seconds")
+        
+        # Retrieve documents
+        logging.info("Retrieving relevant content for quiz generation...")
+        rerank_results = retrieval_engine.retrieve_and_rerank(
+            semantic_query, 
+            [{'embedding': query_embedding}],
+            document_ids=request.document_ids,
+            space_id=request.space_id
+        )
+        
+        retrieval_time = time.time()
+        logging.info(f"Content retrieval took {retrieval_time - embedding_time:.2f} seconds")
+        
+        # Check if we got any results
+        if not hasattr(rerank_results, 'results') or not rerank_results.results:
+            logging.warning("No content found in Pinecone for these document IDs")
+            raise HTTPException(
+                status_code=404, 
+                detail="No content found for the provided document IDs. Please ensure documents are properly indexed."
+            )
+        
+        # Extract the text from reranked results
+        logging.info(f"Found {len(rerank_results.results)} chunks of content")
+        content_chunks = []
+        for result in rerank_results.results:
+            content_chunks.append(result.document)
+            
+        # Combine content for quiz generation
+        combined_content = "\n\n".join(content_chunks)
+        
+        # If space_id is provided, prepare for saving to Supabase
+        if request.space_id:
+            try:
+                # Clear existing quiz data
+                rag_system.supabase.table('generated_content').update({
+                    'quiz': []
+                }).eq('space_id', request.space_id).execute()
+            except Exception as e:
+                logger.error(f"Error clearing existing quiz data: {e}")
+
+        # Stream back quiz questions
+        async def stream():
+            accumulated_questions = []
+            # Use the pinecone_study_generator's question generation function
+            # but with our retrieved content instead of relying on its content retrieval
+            async for batch in pinecone_study_generator.generate_questions_stream(
+                combined_content,
+                request.num_questions,
+                request.difficulty,
+                request.batch_size,
+                question_types=question_types  # Pass question types to the generator
+            ):
+                try:
+                    batch_data = json.loads(batch)
+                    logger.info(f"Streaming batch {batch_data.get('current_batch', 'unknown')} with {len(batch_data.get('questions', []))} questions")
+                    
+                    # Add questions to our collection for saving later
+                    if 'questions' in batch_data:
+                        accumulated_questions.extend(batch_data.get('questions', []))
+                    
+                    # If space_id is provided, update Supabase
+                    if request.space_id:
+                        try:
+                            rag_system.supabase.table('generated_content').update({
+                                'quiz': accumulated_questions
+                            }).eq('space_id', request.space_id).execute()
+                            logger.info(f"Updated Supabase with {len(accumulated_questions)} total questions")
+                        except Exception as e:
+                            logger.error(f"Error updating Supabase: {e}")
+                    
+                    # If this is the last batch, save all questions to database
+                    if batch_data.get('is_complete', False):
+                        # Use background task to avoid blocking the response
+                        background_tasks.add_task(
+                            pinecone_study_generator.save_quiz_to_db,
+                            request.document_ids, 
+                            accumulated_questions
+                        )
+                        
+                except json.JSONDecodeError:
+                    logger.error("Failed to decode batch JSON")
+                
+                yield batch
+
+        # Return streaming response
+        return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"Error in integrated quiz generation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/pinecone/generate-flashcards")
+async def create_pinecone_flashcards(request: PineconeStudyRequest, background_tasks: BackgroundTasks):
+    """Generate flashcards using Pinecone for document retrieval"""
+    try:
+        start_time = time.time()
+        content, references = await pinecone_study_generator.get_relevant_content(request.document_ids)
+        logger.info(f"Pinecone content retrieval time: {time.time() - start_time:.2f}s")
+
+        if not content:
+            raise HTTPException(status_code=404, detail="No content found for the provided document IDs")
+
+        # If space_id is provided, prepare for saving to Supabase
+        if request.space_id:
+            try:
+                # Clear existing flashcards data
+                rag_system.supabase.table('generated_content').update({
+                    'flashcards': []
+                }).eq('space_id', request.space_id).execute()
+            except Exception as e:
+                logger.error(f"Error clearing existing flashcards data: {e}")
+
+        async def stream():
+            accumulated_flashcards = []
+            async for batch in pinecone_study_generator.generate_flashcards_stream(
+                content,
+                request.num_questions,
+                request.difficulty,
+                request.batch_size
+            ):
+                try:
+                    batch_data = json.loads(batch)
+                    logger.info(f"Streaming batch {batch_data.get('current_batch', 'unknown')} with {len(batch_data.get('flashcards', []))} flashcards")
+                    
+                    # Add flashcards to our collection for saving later
+                    if 'flashcards' in batch_data:
+                        accumulated_flashcards.extend(batch_data.get('flashcards', []))
+                    
+                    # If space_id is provided, update Supabase
+                    if request.space_id:
+                        try:
+                            rag_system.supabase.table('generated_content').update({
+                                'flashcards': accumulated_flashcards
+                            }).eq('space_id', request.space_id).execute()
+                            logger.info(f"Updated Supabase with {len(accumulated_flashcards)} total flashcards")
+                        except Exception as e:
+                            logger.error(f"Error updating Supabase: {e}")
+                    
+                    # If this is the last batch, save all flashcards to database
+                    if batch_data.get('is_complete', False):
+                        # Use background task to avoid blocking the response
+                        background_tasks.add_task(
+                            pinecone_study_generator.save_flashcards_to_db,
+                            request.document_ids, 
+                            accumulated_flashcards
+                        )
+                        
+                except json.JSONDecodeError:
+                    logger.error("Failed to decode batch JSON")
+                
+                yield batch
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+    except Exception as e:
+        logger.error(f"Error in create_pinecone_flashcards: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/pinecone/index-document")
+async def index_document_with_pinecone(
+    file: UploadFile = File(...), 
+    document_id: Optional[str] = Form(None),
+    space_id: Optional[str] = Form(None)
+):
+    """Index a document using Pinecone for vector storage"""
+    try:
+        # Read and process the file
+        content = await file.read()
+        file_extension = file.filename.lower().split('.')[-1]
+        
+        # Generate a document ID if not provided
+        if not document_id:
+            document_id = f"{int(time.time())}_{file.filename.replace('.', '_')}"
+        
+        # Process based on file type
+        if file_extension == 'pdf':
+            # Process PDF file
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
+            text_content = ""
+            
+            # Extract text from each page
+            for page_num in range(len(pdf_reader.pages)):
+                page = pdf_reader.pages[page_num]
+                text_content += page.extract_text() + "\n\n"
+                
+            # Chunk the text
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=100
+            )
+            chunks = text_splitter.split_text(text_content)
+            
+            # Format chunks with page metadata
+            document_chunks = []
+            for i, chunk in enumerate(chunks):
+                # Estimate page number based on position in document
+                estimated_page = min(i // 2 + 1, len(pdf_reader.pages))
+                document_chunks.append({
+                    "text": chunk,
+                    "page": estimated_page
+                })
+        else:
+            # For other document types, process as plain text
+            text_content = content.decode('utf-8', errors='replace')
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=100
+            )
+            chunks = text_splitter.split_text(text_content)
+            document_chunks = [{"text": chunk, "page": "1"} for chunk in chunks]
+        
+        # Index the document chunks to Pinecone
+        pinecone_index_manager.index_document_chunks(document_id, document_chunks)
+        
+        # If space_id is provided, save document metadata to Supabase
+        if space_id:
+            try:
+                rag_system.supabase.table('documents').insert({
+                    'id': document_id,
+                    'space_id': space_id,
+                    'filename': file.filename,
+                    'content_type': file.content_type,
+                    'indexed_at': datetime.now().isoformat(),
+                    'chunk_count': len(document_chunks)
+                }).execute()
+            except Exception as e:
+                logger.error(f"Error saving document metadata to Supabase: {e}")
+        
+        return {
+            "status": "success",
+            "message": f"Document indexed successfully with {len(document_chunks)} chunks",
+            "document_id": document_id
+        }
+        
+    except Exception as e:
+        logger.error(f"Error indexing document with Pinecone: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/pinecone/search-documents")
+async def search_documents_with_pinecone(
+    query: str,
+    document_ids: Optional[List[str]] = None,
+    top_k: int = 10
+):
+    """Search for relevant document chunks using Pinecone"""
+    try:
+        start_time = time.time()
+        
+        # Search documents
+        results = pinecone_index_manager.search_documents(query, document_ids, top_k)
+        
+        # Process results
+        processed_results = []
+        for match in results:
+            processed_results.append({
+                "text": match.metadata.get("text", ""),
+                "document_id": match.metadata.get("document_id", ""),
+                "page": match.metadata.get("page", "unknown"),
+                "score": match.score
+            })
+        
+        logger.info(f"Pinecone search completed in {time.time() - start_time:.2f}s with {len(processed_results)} results")
+        
+        return {
+            "query": query,
+            "results": processed_results,
+            "total_results": len(processed_results),
+            "search_time_seconds": time.time() - start_time
+        }
+        
+    except Exception as e:
+        logger.error(f"Error searching documents with Pinecone: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# New model for integrated flashcard generation
+class IntegratedFlashcardRequest(BaseModel):
+    document_ids: List[str]
+    space_id: str
+    num_flashcards: int = 15
+    difficulty: str = "medium"
+    batch_size: int = 3
+    flashcard_types: Optional[List[str]] = None  # Default: ["detailed"] (optional: "basic", "cloze")
+
+@app.post("/integrated/generate-flashcards")
+async def integrated_generate_flashcards(request: IntegratedFlashcardRequest, background_tasks: BackgroundTasks):
+    """Generate flashcards using the integrated approach to avoid Pinecone filtering issues"""
+    try:
+        start_time = time.time()
+        logging.info(f"Processing flashcard generation for space_id: {request.space_id}, document_ids: {request.document_ids}")
+        
+        # Process flashcard type preferences - default to only detailed flashcards
+        flashcard_types = request.flashcard_types or ["detailed"]  # Default to detailed flashcards only
+        logging.info(f"Flashcard types selected: {flashcard_types}")
+        
+        # Validate flashcard types
+        valid_types = ["basic", "detailed", "cloze"]
+        for f_type in flashcard_types:
+            if f_type.lower() not in valid_types:
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"Invalid flashcard type: {f_type}. Supported types are: {', '.join(valid_types)}"
+                )
+        
+        # Create retrieval engine - Initialize only once if possible
+        retrieval_engine = RetrievalEngine(top_k=20)  # Larger top_k for more content
+        
+        # Generate a semantic query to get relevant content for flashcard generation
+        semantic_query = "key concepts, definitions, important facts, and principles worth memorizing"
+        logging.info(f"Using semantic query: '{semantic_query}' to retrieve content")
+        
+        # Generate embedding for the semantic query
+        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        embedding_response = client.embeddings.create(
+            model="text-embedding-ada-002",
+            input=semantic_query
+        )
+        query_embedding = embedding_response.data[0].embedding
+        
+        embedding_time = time.time()
+        logging.info(f"Embedding generation took {embedding_time - start_time:.2f} seconds")
+        
+        # Retrieve documents
+        logging.info("Retrieving relevant content for flashcard generation...")
+        rerank_results = retrieval_engine.retrieve_and_rerank(
+            semantic_query, 
+            [{'embedding': query_embedding}],
+            document_ids=request.document_ids,
+            space_id=request.space_id
+        )
+        
+        retrieval_time = time.time()
+        logging.info(f"Content retrieval took {retrieval_time - embedding_time:.2f} seconds")
+        
+        # Check if we got any results
+        if not hasattr(rerank_results, 'results') or not rerank_results.results:
+            logging.warning("No content found in Pinecone for these document IDs")
+            raise HTTPException(
+                status_code=404, 
+                detail="No content found for the provided document IDs. Please ensure documents are properly indexed."
+            )
+        
+        # Extract the text from reranked results
+        logging.info(f"Found {len(rerank_results.results)} chunks of content")
+        content_chunks = []
+        for result in rerank_results.results:
+            content_chunks.append(result.document)
+            
+        # Combine content for flashcard generation
+        combined_content = "\n\n".join(content_chunks)
+        
+        # If space_id is provided, prepare for saving to Supabase
+        if request.space_id:
+            try:
+                # Clear existing flashcards data
+                rag_system.supabase.table('generated_content').update({
+                    'flashcards': []
+                }).eq('space_id', request.space_id).execute()
+            except Exception as e:
+                logger.error(f"Error clearing existing flashcards data: {e}")
+
+        # Stream back flashcards
+        async def stream():
+            accumulated_flashcards = []
+            # Use the pinecone_study_generator's flashcard generation function
+            async for batch in pinecone_study_generator.generate_flashcards_stream(
+                combined_content,
+                request.num_flashcards,
+                request.difficulty,
+                request.batch_size,
+                flashcard_types=flashcard_types  # Pass flashcard types to the generator
+            ):
+                try:
+                    batch_data = json.loads(batch)
+                    logger.info(f"Streaming batch {batch_data.get('current_batch', 'unknown')} with {len(batch_data.get('flashcards', []))} flashcards")
+                    
+                    # Add flashcards to our collection for saving later
+                    if 'flashcards' in batch_data:
+                        accumulated_flashcards.extend(batch_data.get('flashcards', []))
+                    
+                    # If space_id is provided, update Supabase
+                    if request.space_id:
+                        try:
+                            rag_system.supabase.table('generated_content').update({
+                                'flashcards': accumulated_flashcards
+                            }).eq('space_id', request.space_id).execute()
+                            logger.info(f"Updated Supabase with {len(accumulated_flashcards)} total flashcards")
+                        except Exception as e:
+                            logger.error(f"Error updating Supabase: {e}")
+                    
+                    # If this is the last batch, save all flashcards to database
+                    if batch_data.get('is_complete', False):
+                        # Use background task to avoid blocking the response
+                        background_tasks.add_task(
+                            pinecone_study_generator.save_flashcards_to_db,
+                            request.document_ids, 
+                            accumulated_flashcards
+                        )
+                        
+                except json.JSONDecodeError:
+                    logger.error("Failed to decode batch JSON")
+                
+                yield batch
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
+    except Exception as e:
+        logger.error(f"Error in integrated flashcard generation: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+class ProcessYouTubeVideosRequest(BaseModel):
+    video_urls: List[str]
+    space_id: str
+
+class YouTubeTranscriptExtractRequest(BaseModel):
+    video_url: str
+
+@app.post("/integrated/extract-youtube-transcript")
+async def extract_youtube_transcript(request: YouTubeTranscriptExtractRequest):
+    """
+    Extract transcript from a YouTube video without processing or indexing
+    """
+    try:
+        # Initialize YouTube processor
+        youtube_processor = YouTubeTranscriptProcessor()
+        
+        # Extract video ID from URL
+        video_id = youtube_processor._extract_video_id(request.video_url)
+        if not video_id:
+            return {
+                "status": "error",
+                "message": f"Invalid YouTube URL format: {request.video_url}"
+            }
+        
+        # Get video thumbnail
+        thumbnail = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+        
+        try:
+            # Try to get English transcript first
+            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+            full_text = youtube_processor._transcript_to_text(transcript)
+        except Exception as e:
+            logger.error(f"Error getting English transcript: {e}")
+            try:
+                # If English not available, get transcript in any language and translate
+                transcript = YouTubeTranscriptApi.get_transcript(video_id)
+                
+                # Extract raw text from transcript
+                raw_text = " ".join([line['text'] for line in transcript])
+                
+                # Translate using Groq
+                response = youtube_processor.groq_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=[
+                        {"role": "system", "content": "You are a translator. Translate the following text to English:"},
+                        {"role": "user", "content": raw_text}
+                    ]
+                )
+                
+                full_text = response.choices[0].message.content
+            except Exception as translate_error:
+                logger.error(f"Failed to get and translate transcript: {translate_error}")
+                return {
+                    "status": "error",
+                    "message": f"Failed to get transcript for video: {str(e)}, {str(translate_error if 'translate_error' in locals() else '')}"
+                }
+        
+        return {
+            "status": "success",
+            "video_id": video_id,
+            "thumbnail": thumbnail,
+            "transcript": full_text
+        }
+    
+    except Exception as e:
+        logger.error(f"Error extracting YouTube transcript: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"An error occurred during transcript extraction: {str(e)}"
+        }
+
+@app.post("/integrated/process-youtube-videos", response_model=IntegratedProcessingResponse)
+async def process_youtube_videos(request: ProcessYouTubeVideosRequest):
+    """
+    Process multiple YouTube videos, extract transcripts, and index them for RAG
+    """
+    try:
+        # Initialize YouTube processor
+        youtube_processor = YouTubeTranscriptProcessor()
+        
+        # Process the videos and extract transcripts
+        processing_result = youtube_processor.process_videos(request.video_urls, request.space_id)
+        
+        if not processing_result.get('documents'):
+            return IntegratedProcessingResponse(
+                status="error",
+                message=f"YouTube video processing failed: {processing_result.get('message', 'Unknown error')}"
+            )
+        
+        # 2. Chunk the processed documents using the same chunker as document processing
+        chunks = chunker.chunk_documents(processing_result['documents'])
+        
+        # Log metadata of first chunk for debugging
+        if chunks and len(chunks) > 0:
+            logger.info(f"First chunk metadata: {chunks[0].metadata}")
+        
+        # 3. Create embeddings for the chunks and index them
+        indexing_result = vector_indexer.embed_and_index_chunks(chunks)
+        
+        return IntegratedProcessingResponse(
+            status="success",
+            message=f"Successfully processed {len(processing_result['document_ids'])} videos and indexed {indexing_result['indexed_chunks']} chunks",
+            document_ids=processing_result['document_ids'],  # This was previously video_ids, now using document_ids
+            indexed_chunks=indexing_result['indexed_chunks'],
+            total_chunks=indexing_result['total_chunks']
+        )
+    
+    except Exception as e:
+        logging.error(f"Error in YouTube video processing: {str(e)}")
+        return IntegratedProcessingResponse(
+            status="error",
+            message=f"An error occurred during processing: {str(e)}"
+        )
+
+class YouTubeUploadRequest(BaseModel):
+    video_urls: List[str]
+    space_id: str
+
+@app.post("/integrated/upload-youtube-videos")
+async def upload_youtube_videos(request: YouTubeUploadRequest):
+    """
+    Upload multiple YouTube videos, extract transcripts, and process for RAG.
+    Similar to batch document uploading but specifically for YouTube videos.
+    """
+    if not request.video_urls:
+        raise HTTPException(
+            status_code=400,
+            detail="No video URLs provided for upload."
+        )
+    
+    youtube_processor = YouTubeTranscriptProcessor()
+    results = []
+    errors = []
+    
+    # Process each video URL
+    for video_url in request.video_urls:
+        try:
+            # Extract video ID and validate URL
+            video_id = youtube_processor._extract_video_id(video_url)
+            if not video_id:
+                errors.append({
+                    "video_url": video_url,
+                    "error": "Invalid YouTube URL format"
+                })
+                continue
+            
+            # Process single video
+            result = youtube_processor.process_single_video(video_url, request.space_id)
+            
+            if result.get('status') == 'success':
+                # Add to successful results
+                results.append({
+                    "video_url": video_url,
+                    "document_id": result.get('document_id'),  # Changed from video_id to document_id
+                    "thumbnail": result.get('thumbnail')
+                })
+                
+                # Get the document for chunking and indexing
+                if result.get('documents'):
+                    # Chunk the document
+                    chunks = chunker.chunk_documents(result['documents'])
+                    
+                    # Log first chunk metadata for debugging
+                    if chunks and len(chunks) > 0:
+                        logger.info(f"First chunk metadata for {video_url}: {chunks[0].metadata}")
+                    
+                    # Create embeddings and index chunks
+                    index_result = vector_indexer.embed_and_index_chunks(chunks)
+                    logger.info(f"Indexing result for {video_url}: {index_result}")
+            else:
+                errors.append({
+                    "video_url": video_url,
+                    "error": result.get('message', 'Unknown error')
+                })
+                
+        except Exception as e:
+            logger.error(f"Error processing video {video_url}: {str(e)}")
+            errors.append({
+                "video_url": video_url,
+                "error": str(e)
+            })
+    
+    # Return summary of processed videos and errors
+    return {
+        "status": "completed",
+        "successful_uploads": results,
+        "failed_uploads": errors,
+        "total_videos": len(request.video_urls),
+        "successful_count": len(results),
+        "failed_count": len(errors)
+    }
+
+@app.get("/test/youtube-query/{space_id}/{video_id}")
+async def test_youtube_query(space_id: str, video_id: str):
+    """
+    Test endpoint to verify YouTube videos can be properly queried
+    """
+    try:
+        # Create a simple test query
+        test_query = "summarize the video"
+        
+        # Log test information
+        logger.info(f"Running test query '{test_query}' for video_id: {video_id} in space: {space_id}")
+        
+        # Initialize the retrieval engine
+        retrieval_engine = RetrievalEngine(top_k=5)
+        
+        # Generate embedding for the query
+        client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+        embedding_response = client.embeddings.create(
+            model="text-embedding-ada-002",
+            input=test_query
+        )
+        query_embedding = embedding_response.data[0].embedding
+        
+        # Retrieve content 
+        rerank_results = retrieval_engine.retrieve_and_rerank(
+            test_query, 
+            [{'embedding': query_embedding}],
+            document_ids=[video_id],
+            space_id=space_id
+        )
+        
+        # Check if we got results
+        if not hasattr(rerank_results, 'results') or not rerank_results.results:
+            logger.warning(f"No results found for video {video_id} in space {space_id}")
+            
+            # Try querying Pinecone directly to check if the video exists
+            vector_indexer = MultiFileVectorIndexer()
+            index_stats = vector_indexer.index.describe_index_stats()
+            
+            # Try querying with metadata filtering only
+            filter_query = {
+                "document_id": {"$eq": video_id}
+            }
+            
+            try:
+                # Direct Pinecone query with metadata filter
+                direct_results = vector_indexer.index.query(
+                    vector=query_embedding,
+                    filter=filter_query,
+                    top_k=5,
+                    include_metadata=True
+                )
+                
+                return {
+                    "status": "direct_query_results",
+                    "message": "No results found via RetrievalEngine, but direct Pinecone query found results",
+                    "direct_results": direct_results,
+                    "index_stats": index_stats
+                }
+            except Exception as e:
+                logger.error(f"Error in direct Pinecone query: {str(e)}")
+                
+                # Try with a different filter as a last resort
+                try:
+                    # Try using the video_id field instead
+                    video_filter = {
+                        "video_id": {"$eq": video_id}
+                    }
+                    
+                    video_results = vector_indexer.index.query(
+                        vector=query_embedding,
+                        filter=video_filter,
+                        top_k=5,
+                        include_metadata=True
+                    )
+                    
+                    return {
+                        "status": "video_id_query_results",
+                        "message": "Found results using video_id filter instead of document_id",
+                        "video_results": video_results,
+                        "index_stats": index_stats
+                    }
+                except Exception as e2:
+                    logger.error(f"Error in video_id filter query: {str(e2)}")
+                
+                return {
+                    "status": "no_results",
+                    "message": "No results found for this video",
+                    "index_stats": index_stats,
+                    "error": str(e)
+                }
+            
+        # Extract contexts from results
+        contexts = []
+        for result in rerank_results.results:
+            context = result.document
+            contexts.append(context)
+            
+        # Generate response
+        response_text = response_generator.generate_response(
+            test_query,
+            contexts,
+            use_external_knowledge=False
+        )
+        
+        return {
+            "status": "success",
+            "query": test_query,
+            "response": response_text,
+            "contexts": contexts[:3],
+            "result_count": len(rerank_results.results)
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in test query: {str(e)}", exc_info=True)
+        return {
+            "status": "error",
+            "message": f"An error occurred: {str(e)}"
+        }
+
+@app.get("/debug/youtube-video/{video_id}")
+async def debug_youtube_video(video_id: str):
+    """
+    Diagnostic endpoint to check YouTube video processing and indexing
+    """
+    try:
+        # Get video data from Supabase
+        youtube_processor = YouTubeTranscriptProcessor()
+        
+        try:
+            supabase_result = youtube_processor.supabase.table('yts').select('*').eq('id', video_id).execute()
+            video_data = supabase_result.data[0] if supabase_result.data else None
+        except Exception as e:
+            logger.error(f"Error getting video from Supabase: {str(e)}")
+            video_data = None
+            
+        # Check Pinecone indexing
+        vector_indexer = MultiFileVectorIndexer()
+        
+        # Try different filters to find the video
+        filters = [
+            {"document_id": video_id},
+            {"video_id": video_id}
+        ]
+        
+        pinecone_results = {}
+        
+        for i, filter_dict in enumerate(filters):
+            filter_name = f"filter_{i+1}"
+            try:
+                # Query without using an embedding
+                # This is just to find if the document exists in the index
+                stats = vector_indexer.index.describe_index_stats()
+                
+                # Create a dummy query vector with the right dimension
+                dimension = stats.get('dimension', 1536)
+                dummy_vector = [0.0] * dimension
+                
+                results = vector_indexer.index.query(
+                    vector=dummy_vector,
+                    filter=filter_dict,
+                    top_k=5,
+                    include_metadata=True
+                )
+                
+                pinecone_results[filter_name] = {
+                    "filter": filter_dict,
+                    "count": len(results.get('matches', [])),
+                    "sample": results.get('matches', [])[:2]  # First two matches
+                }
+            except Exception as e:
+                logger.error(f"Error checking Pinecone with filter {filter_dict}: {str(e)}")
+                pinecone_results[filter_name] = {
+                    "filter": filter_dict,
+                    "error": str(e)
+                }
+        
+        # Get index stats
+        try:
+            index_stats = vector_indexer.index.describe_index_stats()
+        except Exception as e:
+            logger.error(f"Error getting index stats: {str(e)}")
+            index_stats = {"error": str(e)}
+            
+        return {
+            "status": "success",
+            "video_id": video_id,
+            "supabase_data": video_data,
+            "pinecone_results": pinecone_results,
+            "index_stats": index_stats,
+            "suggestions": [
+                "If the video exists in Supabase but not in Pinecone, try reprocessing with /integrated/upload-youtube-videos",
+                "If filters return different results, there might be inconsistent metadata between document_id and video_id fields",
+                "Check the logs for embedding and indexing errors during processing"
+            ]
+        }
+    
+    except Exception as e:
+        logger.error(f"Error in debug endpoint: {str(e)}", exc_info=True)
+        return {
+            "status": "error",
+            "message": f"An error occurred: {str(e)}"
+        }
+
+class ReprocessVideoRequest(BaseModel):
+    video_id: str
+    space_id: str
+
+@app.post("/debug/reprocess-youtube-video")
+async def reprocess_youtube_video(request: ReprocessVideoRequest):
+    """
+    Reprocess a YouTube video that failed to index properly
+    """
+    try:
+        # Get video data from Supabase
+        youtube_processor = YouTubeTranscriptProcessor()
+        
+        # Get video data
+        try:
+            supabase_result = youtube_processor.supabase.table('yts').select('*').eq('id', request.video_id).execute()
+            
+            if not supabase_result.data:
+                return {
+                    "status": "error",
+                    "message": f"Video with ID {request.video_id} not found in Supabase"
+                }
+                
+            video_data = supabase_result.data[0]
+            video_url = video_data.get('yt_url')
+            
+            if not video_url:
+                return {
+                    "status": "error",
+                    "message": f"Video URL not found for video ID {request.video_id}"
+                }
+                
+            logger.info(f"Found video {request.video_id} with URL {video_url}")
+            
+        except Exception as e:
+            logger.error(f"Error getting video from Supabase: {str(e)}")
+            return {
+                "status": "error",
+                "message": f"Error retrieving video data: {str(e)}"
+            }
+        
+        # Create a document from the video data
+        extracted_text = video_data.get('extracted_text')
+        if not extracted_text:
+            return {
+                "status": "error",
+                "message": "No extracted text found for this video"
+            }
+            
+        # Get YouTube ID from URL
+        youtube_id = youtube_processor._extract_video_id(video_url)
+        if not youtube_id:
+            return {
+                "status": "error",
+                "message": f"Could not extract YouTube ID from URL: {video_url}"
+            }
+            
+        # Create thumbnail URL
+        thumbnail = f"https://img.youtube.com/vi/{youtube_id}/maxresdefault.jpg"
+        
+        # Create title
+        video_title = video_data.get('title', f"YouTube Video: {youtube_id}")
+        
+        # Create a Document object
+        doc = Document(
+            page_content=extracted_text,
+            metadata={
+                'source_url': video_url,
+                'document_id': request.video_id,
+                'video_id': request.video_id,
+                'youtube_id': youtube_id,
+                'space_id': request.space_id,
+                'content_type': 'youtube_transcript',
+                'title': video_title,
+                'source': 'youtube',
+                'source_type': 'youtube_video',
+                'thumbnail': thumbnail,
+                'file_type': 'youtube'
+            }
+        )
+        
+        # Process the document (chunk and index)
+        chunks = chunker.chunk_documents([doc])
+        
+        if not chunks:
+            return {
+                "status": "error",
+                "message": "Failed to create chunks from video transcript"
+            }
+            
+        # Log first chunk metadata for debugging
+        if chunks and len(chunks) > 0:
+            logger.info(f"First chunk metadata: {chunks[0].metadata}")
+        
+        # Index the chunks
+        indexing_result = vector_indexer.embed_and_index_chunks(chunks)
+        
+        return {
+            "status": "success",
+            "message": f"Successfully reprocessed video {request.video_id}",
+            "video_url": video_url,
+            "chunks_created": len(chunks),
+            "indexing_result": indexing_result
+        }
+        
+    except Exception as e:
+        logger.error(f"Error reprocessing video: {str(e)}", exc_info=True)
+        return {
+            "status": "error",
+            "message": f"An error occurred: {str(e)}"
+        }
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8081)
+    uvicorn.run(app, host="0.0.0.0", port=8080)

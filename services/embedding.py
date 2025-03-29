@@ -103,6 +103,11 @@ class MultiFileVectorIndexer:
             'indexed_docs': set()  # Keep track of document IDs that were indexed
         }
         
+        # Log chunk metadata for debugging
+        for i, chunk in enumerate(chunks[:2]):  # Log first two chunks
+            logger.info(f"Chunk {i} metadata: {chunk.metadata}")
+            logger.info(f"Chunk {i} content preview: {chunk.page_content[:100]}...")
+        
         # Batch embedding generation
         for i in range(0, len(chunks), batch_size):
             batch_chunks = chunks[i:i+batch_size]
@@ -141,8 +146,14 @@ class MultiFileVectorIndexer:
                     
                     # Create a unique vector ID that includes document_id for filtering
                     document_id = chunk.metadata.get('document_id')
+                    video_id = chunk.metadata.get('video_id')
                     space_id = chunk.metadata.get('space_id')
                     
+                    # Make sure we have a valid document_id
+                    if not document_id and video_id:
+                        document_id = video_id
+                        logger.info(f"Using video_id {video_id} as document_id")
+                        
                     # If we have both IDs, use a prefix system for the vector ID
                     if document_id and space_id:
                         vector_id = f"doc_{document_id}_{len(vectors)}"
@@ -150,20 +161,38 @@ class MultiFileVectorIndexer:
                     else:
                         # Fallback to legacy ID approach
                         vector_id = f"chunk_{i}_{len(vectors)}"
+                        logger.warning(f"Missing document_id or space_id in chunk metadata: {chunk.metadata}")
+                    
+                    # Get source type for filtering
+                    source_type = chunk.metadata.get('source_type', 'unknown')
                     
                     # Log vector details for debugging
-                    logger.info(f"Creating vector with ID: {vector_id}, document_id: {document_id}, space_id: {space_id}")
+                    logger.info(f"Creating vector with ID: {vector_id}, document_id: {document_id}, space_id: {space_id}, source_type: {source_type}")
+                    
+                    # Build metadata with all necessary fields for retrieval
+                    metadata = {
+                        'text': chunk.page_content,
+                        'source_file': chunk.metadata.get('source_file', 'unknown'),
+                        'document_id': document_id,
+                        'space_id': space_id,
+                        'original_source': chunk.metadata.get('source', 'unknown'),
+                        'source_type': source_type
+                    }
+                    
+                    # Add YouTube-specific fields if present
+                    if source_type == 'youtube_video':
+                        metadata.update({
+                            'video_id': video_id,
+                            'youtube_id': chunk.metadata.get('youtube_id'),
+                            'thumbnail': chunk.metadata.get('thumbnail'),
+                            'title': chunk.metadata.get('title', 'YouTube Video'),
+                            'source_url': chunk.metadata.get('source_url')
+                        })
                     
                     vectors.append({
                         'id': vector_id,
                         'values': embedding,
-                        'metadata': {
-                            'text': chunk.page_content,
-                            'source_file': chunk.metadata.get('source_file', 'unknown'),
-                            'document_id': document_id,
-                            'space_id': space_id,
-                            'original_source': chunk.metadata.get('source', 'unknown')
-                        }
+                        'metadata': metadata
                     })
                 
                 # Upsert to Pinecone
