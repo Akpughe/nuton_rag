@@ -10,10 +10,10 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class MultiFileVectorIndexer:
-    def __init__(self, dimension=1536, model="text-embedding-ada-002"):  # default to ada-002 to match query
-        # Log initialization
+    def __init__(self, dimension=1536, model="text-embedding-ada-002"):
         logger.info(f"Initializing MultiFileVectorIndexer with dimension={dimension}, model={model}")
         
+        # Validate environment variables
         self.api_key = os.getenv('OPENAI_API_KEY')
         if not self.api_key:
             logger.error("OPENAI_API_KEY not found in environment variables")
@@ -21,6 +21,7 @@ class MultiFileVectorIndexer:
             
         self.openai_client = OpenAI(api_key=self.api_key)
         
+        # Validate Pinecone credentials
         pinecone_api_key = os.getenv('PINECONE_API_KEY')
         pinecone_index_name = os.getenv('PINECONE_INDEX_NAME')
         
@@ -33,22 +34,20 @@ class MultiFileVectorIndexer:
         
         try:
             self.index = pc.Index(pinecone_index_name)
-            # Log successful connection
-            logger.info(f"Successfully connected to Pinecone index: {pinecone_index_name}")
-            # Log index stats
+            
+            # Get index stats and validate dimensions
             stats = self.index.describe_index_stats()
             logger.info(f"Index stats: {stats}")
             
-            # Check if the index is empty
+            # Validate index is not empty
             if stats.get('total_vector_count', 0) == 0:
                 logger.warning("The Pinecone index is empty. This might indicate initialization issues.")
             
-            # Store the actual dimension from Pinecone
+            # Ensure dimension matches Pinecone's expectation
             pinecone_dim = stats.get('dimension')
             if pinecone_dim and pinecone_dim != dimension:
                 logger.warning(f"Dimension mismatch: Indexer configured for {dimension} but Pinecone uses {pinecone_dim}")
                 self.dimension = pinecone_dim
-                logger.info(f"Updated dimension to match Pinecone: {self.dimension}")
             else:
                 self.dimension = dimension
                 
@@ -66,49 +65,43 @@ class MultiFileVectorIndexer:
         if current_dim == target_dim:
             return embedding
         elif current_dim > target_dim:
-            # Truncate
             logger.warning(f"Truncating embedding from {current_dim} to {target_dim}")
             return embedding[:target_dim]
         else:
-            # Pad with zeros
             logger.warning(f"Zero-padding embedding from {current_dim} to {target_dim}")
-            padding = [0.0] * (target_dim - current_dim)
-            return embedding + padding
+            return embedding + [0.0] * (target_dim - current_dim)
     
     def embed_and_index_chunks(self, chunks: List[Document], batch_size: int = 100) -> Dict[str, Any]:
         """
         Batch process embeddings and index in Pinecone
         Uses document_id from metadata as vector ID when available
         """
+        if not chunks:
+            logger.warning("No chunks provided for embedding and indexing")
+            return {"total_chunks": 0, "indexed_chunks": 0, "failed_chunks": 0, "indexed_docs": set()}
+            
         logger.info(f"Starting embedding and indexing of {len(chunks)} chunks with batch size {batch_size}")
         
-        # Check the actual dimension of the Pinecone index
+        # Validate Pinecone dimension
         try:
             index_stats = self.index.describe_index_stats()
             pinecone_dim = index_stats.get('dimension')
-            logger.info(f"Pinecone index dimension: {pinecone_dim}")
             
             if pinecone_dim and pinecone_dim != self.dimension:
                 logger.warning(f"Dimension mismatch: configured={self.dimension}, Pinecone index={pinecone_dim}")
                 self.dimension = pinecone_dim
-                logger.info(f"Updated dimension to match Pinecone index: {self.dimension}")
         except Exception as e:
             logger.error(f"Error checking Pinecone dimension: {str(e)}")
         
-        # Track successful and failed chunks
+        # Initialize results tracking
         indexing_results = {
             'total_chunks': len(chunks),
             'indexed_chunks': 0,
             'failed_chunks': 0,
-            'indexed_docs': set()  # Keep track of document IDs that were indexed
+            'indexed_docs': set()
         }
         
-        # Log chunk metadata for debugging
-        for i, chunk in enumerate(chunks[:2]):  # Log first two chunks
-            logger.info(f"Chunk {i} metadata: {chunk.metadata}")
-            logger.info(f"Chunk {i} content preview: {chunk.page_content[:100]}...")
-        
-        # Batch embedding generation
+        # Process chunks in batches
         for i in range(0, len(chunks), batch_size):
             batch_chunks = chunks[i:i+batch_size]
             batch_num = i // batch_size + 1
@@ -117,12 +110,6 @@ class MultiFileVectorIndexer:
             logger.info(f"Processing batch {batch_num}/{total_batches} with {len(batch_chunks)} chunks")
             
             try:
-                # Log the first few characters of each chunk for debugging
-                for j, chunk in enumerate(batch_chunks[:3]):
-                    truncated_content = chunk.page_content[:100] + "..." if len(chunk.page_content) > 100 else chunk.page_content
-                    logger.info(f"Chunk {i+j} preview: {truncated_content}")
-                    logger.info(f"Chunk {i+j} metadata: {chunk.metadata}")
-                
                 # Generate embeddings
                 logger.info(f"Generating embeddings with model {self.model}")
                 embeddings_response = self.openai_client.embeddings.create(
@@ -135,41 +122,32 @@ class MultiFileVectorIndexer:
                 # Prepare vectors for Pinecone
                 vectors = []
                 for chunk, embedding_data in zip(batch_chunks, embeddings_response.data):
-                    # Extract the embedding
+                    # Extract and adjust embedding if needed
                     embedding = embedding_data.embedding
-                    
-                    # Check if we need to adjust the embedding dimension
-                    embedding_dim = len(embedding)
-                    if embedding_dim != self.dimension:
-                        # Use the padding helper method
+                    if len(embedding) != self.dimension:
                         embedding = self.pad_embedding(embedding, self.dimension)
                     
-                    # Create a unique vector ID that includes document_id for filtering
+                    # Get IDs from metadata
                     document_id = chunk.metadata.get('document_id')
                     video_id = chunk.metadata.get('video_id')
                     space_id = chunk.metadata.get('space_id')
                     
-                    # Make sure we have a valid document_id
+                    # Use video_id as document_id if needed
                     if not document_id and video_id:
                         document_id = video_id
-                        logger.info(f"Using video_id {video_id} as document_id")
-                        
-                    # If we have both IDs, use a prefix system for the vector ID
+                    
+                    # Create vector ID
                     if document_id and space_id:
                         vector_id = f"doc_{document_id}_{len(vectors)}"
                         indexing_results['indexed_docs'].add(document_id)
                     else:
-                        # Fallback to legacy ID approach
                         vector_id = f"chunk_{i}_{len(vectors)}"
                         logger.warning(f"Missing document_id or space_id in chunk metadata: {chunk.metadata}")
                     
                     # Get source type for filtering
                     source_type = chunk.metadata.get('source_type', 'unknown')
                     
-                    # Log vector details for debugging
-                    logger.info(f"Creating vector with ID: {vector_id}, document_id: {document_id}, space_id: {space_id}, source_type: {source_type}")
-                    
-                    # Build metadata with all necessary fields for retrieval
+                    # Build metadata
                     metadata = {
                         'text': chunk.page_content,
                         'source_file': chunk.metadata.get('source_file', 'unknown'),
@@ -196,17 +174,13 @@ class MultiFileVectorIndexer:
                     })
                 
                 # Upsert to Pinecone
-                logger.info(f"Upserting {len(vectors)} vectors to Pinecone")
-                upsert_response = self.index.upsert(vectors)
-                logger.info(f"Upsert response: {upsert_response}")
+                if vectors:
+                    logger.info(f"Upserting {len(vectors)} vectors to Pinecone")
+                    upsert_response = self.index.upsert(vectors)
+                    logger.info(f"Upsert response: {upsert_response}")
+                    
+                    indexing_results['indexed_chunks'] += len(vectors)
                 
-                # Verify data was inserted
-                index_stats_after = self.index.describe_index_stats()
-                logger.info(f"Index stats after upsert: {index_stats_after}")
-                
-                indexing_results['indexed_chunks'] += len(vectors)
-                logger.info(f"Successfully indexed {len(vectors)} vectors in batch {batch_num}")
-            
             except Exception as e:
                 logger.error(f"Error processing batch {batch_num}: {str(e)}")
                 indexing_results['failed_chunks'] += len(batch_chunks)
