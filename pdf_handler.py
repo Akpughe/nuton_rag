@@ -4,7 +4,7 @@ from datetime import datetime
 import PyPDF2
 from fastapi import HTTPException
 import httpx
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 import chromadb
 import logging
 import os
