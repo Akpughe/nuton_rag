@@ -182,9 +182,9 @@ class YouTubeTranscriptProcessor:
                 video_db_id = result.data[0]['id']
                 
                 # Store YouTube ID in the record
-                self.supabase.table('yts').update({
-                    'youtube_id': video_id
-                }).eq('id', video_db_id).execute()
+                # self.supabase.table('yts').update({
+                #     'youtube_id': video_id
+                # }).eq('id', video_db_id).execute()
             except Exception as db_error:
                 logger.error(f"Database error for video {video_id}: {db_error}")
                 return {
@@ -267,13 +267,13 @@ class YouTubeTranscriptProcessor:
 
     def _transcript_to_text(self, transcript: List[Dict[str, Any]]) -> str:
         """
-        Convert YouTube transcript format to plain text.
+        Convert YouTube transcript format to plain text while preserving timestamps.
         
         Args:
             transcript: List of transcript entries from YouTube API
             
         Returns:
-            Plain text representation of the transcript
+            Plain text representation of the transcript with timestamps
         """
         if not transcript:
             return ""
@@ -282,10 +282,21 @@ class YouTubeTranscriptProcessor:
             # Sort transcript by start time to ensure proper ordering
             sorted_transcript = sorted(transcript, key=lambda x: x.get('start', 0))
             
-            # Join all text segments with appropriate spacing
-            full_text = " ".join([entry.get('text', '').strip() for entry in sorted_transcript if entry.get('text')])
+            # Format each entry with timestamp and text
+            formatted_entries = []
+            for entry in sorted_transcript:
+                if entry.get('text'):
+                    # Convert timestamp to [MM:SS] format
+                    seconds = int(entry.get('start', 0))
+                    minutes = seconds // 60
+                    remaining_seconds = seconds % 60
+                    timestamp = f"[{minutes:02d}:{remaining_seconds:02d}]"
+                    
+                    # Combine timestamp with text
+                    formatted_entries.append(f"{timestamp} {entry.get('text').strip()}")
             
-            return full_text
+            # Join all segments with newlines for better readability
+            return "\n".join(formatted_entries)
         except Exception as e:
             logger.error(f"Error converting transcript to text: {e}")
             return " ".join([entry.get('text', '') for entry in transcript if entry.get('text')])
