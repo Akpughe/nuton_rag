@@ -103,7 +103,7 @@ class IntegratedRAGRequest(BaseModel):
 class IntegratedDocumentProcessRequest(BaseModel):
     space_id: str
     file_paths: Optional[List[str]] = None
-
+    file_urls: Optional[List[str]] = None
 class IntegratedProcessingResponse(BaseModel):
     status: str
     message: str
@@ -757,7 +757,8 @@ async def get_yt_transcript(request: YTTranscriptRequest):
 async def integrated_process_documents(
     request: Optional[IntegratedDocumentProcessRequest] = None,
     files: Optional[List[UploadFile]] = File(None),
-    space_id: Optional[str] = Form(None)
+    space_id: Optional[str] = Form(None),
+    file_urls: Optional[List[str]] = Form(None)
 ):
     temp_dir = None
     try:
@@ -771,7 +772,7 @@ async def integrated_process_documents(
                 )
             
             # Process files using paths
-            processing_result = document_processor.process_files(request.file_paths, request.space_id)
+            processing_result = document_processor.process_files(request.file_paths, request.space_id, request.file_urls)
         elif files:
             # Form data with file uploads
             if not space_id:
@@ -785,7 +786,16 @@ async def integrated_process_documents(
             
             # Save uploaded files to temp directory
             temp_paths = []
-            for file in files:
+            form_file_urls = []  # List to store file URLs from form data
+            
+            # Convert form-based file_urls to list if it's provided
+            if file_urls:
+                if isinstance(file_urls, str):
+                    form_file_urls = [file_urls]
+                else:
+                    form_file_urls = file_urls
+            
+            for i, file in enumerate(files):
                 # Handle binary filename
                 safe_filename = getattr(file, "filename", "unknown")
                 if isinstance(safe_filename, bytes):
@@ -798,6 +808,9 @@ async def integrated_process_documents(
                 safe_filename = PDFHandler.clean_filename(safe_filename)
                 temp_path = os.path.join(temp_dir, safe_filename)
                 
+                # Get the file URL if provided in the form, otherwise generate one
+                current_file_url = form_file_urls[i] if i < len(form_file_urls) else f"uploads/{safe_filename}"
+                
                 # Save file content
                 content = await file.read()
                 with open(temp_path, "wb") as f:
@@ -806,7 +819,7 @@ async def integrated_process_documents(
                 temp_paths.append(temp_path)
             
             # Process the saved files
-            processing_result = document_processor.process_files(temp_paths, space_id)
+            processing_result = document_processor.process_files(temp_paths, space_id, form_file_urls)
         else:
             return IntegratedProcessingResponse(
                 status="error",

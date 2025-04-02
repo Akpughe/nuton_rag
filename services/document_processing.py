@@ -1,5 +1,5 @@
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 from supabase import create_client
@@ -27,10 +27,15 @@ class MultiFileDocumentProcessor:
         supabase_key = os.getenv('SUPABASE_KEY_DEV')
         self.supabase = create_client(supabase_url, supabase_key)
 
-    def process_files(self, file_paths: List[str], space_id: str) -> Dict[str, Any]:
+    def process_files(self, file_paths: List[str], space_id: str, file_urls: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Process multiple files concurrently
         Returns a list of documents from all processed files with their database IDs
+        
+        Args:
+            file_paths: List of paths to files to process
+            space_id: ID of the space to associate files with
+            file_urls: Optional list of URLs corresponding to each file_path
         """
         all_documents = []
         document_ids = {}
@@ -43,10 +48,18 @@ class MultiFileDocumentProcessor:
                 'message': 'No files provided for processing'
             }
         
+        # Create a mapping of file paths to URLs
+        file_url_map = {}
+        if file_urls:
+            file_url_map = {
+                file_path: file_urls[i] if i < len(file_urls) else None
+                for i, file_path in enumerate(file_paths)
+            }
+        
         with ThreadPoolExecutor(max_workers=min(10, len(file_paths))) as executor:
             # Submit processing tasks for each file
             future_to_file = {
-                executor.submit(self.process_single_file, file_path, space_id): file_path 
+                executor.submit(self.process_single_file, file_path, space_id, file_url_map.get(file_path)): file_path 
                 for file_path in file_paths
             }
             
@@ -70,9 +83,14 @@ class MultiFileDocumentProcessor:
             'total_processed': len(document_ids)
         }
 
-    def process_single_file(self, file_path: str, space_id: str) -> Dict[str, Any]:
+    def process_single_file(self, file_path: str, space_id: str, file_url: Optional[str] = None) -> Dict[str, Any]:
         """
         Process a single file with fallback mechanisms and store in Supabase
+        
+        Args:
+            file_path: Path to the file to process
+            space_id: ID of the space to associate file with
+            file_url: Optional URL corresponding to the file
         """
         try:
             file_extension = file_path.split('.')[-1].lower()
@@ -120,13 +138,20 @@ class MultiFileDocumentProcessor:
                 if not full_text.strip():
                     raise ValueError("No valid text content extracted from file")
                 
-                # Insert into Supabase pdfs table - ensuring all fields are properly encoded
-                result = self.supabase.table('pdfs').insert({
+                # Prepare Supabase insertion data
+                supabase_data = {
                     'space_id': space_id,
                     'extracted_text': full_text,
                     'file_type': file_extension,
-                    'file_path': file_path
-                }).execute()
+                    # 'file_path': file_path  # Always include the file_path
+                }
+                
+                # Add file_url if available
+                if file_url:
+                    supabase_data['file_path'] = file_url  # Add file_url as a separate field
+                
+                # Insert into Supabase pdfs table - ensuring all fields are properly encoded
+                result = self.supabase.table('pdfs').insert(supabase_data).execute()
                 
                 document_id = result.data[0]['id']
                 
@@ -135,6 +160,9 @@ class MultiFileDocumentProcessor:
                     doc.metadata['source_file'] = file_name
                     doc.metadata['document_id'] = document_id
                     doc.metadata['space_id'] = space_id
+                    # Add file_url to metadata if available
+                    if file_url:
+                        doc.metadata['file_url'] = file_url
                 
                 return {
                     'documents': documents,
@@ -152,7 +180,7 @@ class MultiFileDocumentProcessor:
                             Document={'Bytes': document.read()}
                         )
                         # Process Textract response, extract text
-                        textract_result = self._parse_textract_response(textract_response, file_path, space_id)
+                        textract_result = self._parse_textract_response(textract_response, file_path, space_id, file_url)
                         
                         # Insert into Supabase
                         full_text = textract_result['documents'][0].page_content
@@ -164,13 +192,21 @@ class MultiFileDocumentProcessor:
                         # Filter to only printable characters
                         full_text = ''.join(char for char in full_text if char.isprintable() or char in ['\n', '\t'])
                         
-                        result = self.supabase.table('pdfs').insert({
+                        # Prepare Supabase data
+                        supabase_data = {
                             'name': file_name,
                             'content': full_text,
                             'space_id': space_id,
                             'file_type': file_extension,
-                            'extracted_text': full_text  # Add extracted text to its own column
-                        }).execute()
+                            'extracted_text': full_text,  # Add extracted text to its own column
+                            'file_path': file_path
+                        }
+                        
+                        # Add file_url if available
+                        if file_url:
+                            supabase_data['file_url'] = file_url
+                        
+                        result = self.supabase.table('pdfs').insert(supabase_data).execute()
                         
                         document_id = result.data[0]['id']
                         
@@ -178,6 +214,9 @@ class MultiFileDocumentProcessor:
                         for doc in textract_result['documents']:
                             doc.metadata['document_id'] = document_id
                             doc.metadata['space_id'] = space_id
+                            # Add file_url to metadata if available
+                            if file_url:
+                                doc.metadata['file_url'] = file_url
                         
                         return {
                             'documents': textract_result['documents'],
@@ -205,9 +244,15 @@ class MultiFileDocumentProcessor:
                 'message': error_msg
             }
 
-    def _parse_textract_response(self, response, file_path: str, space_id: str) -> Dict[str, Any]:
+    def _parse_textract_response(self, response, file_path: str, space_id: str, file_url: Optional[str] = None) -> Dict[str, Any]:
         """
         Convert Textract response to Langchain Documents
+        
+        Args:
+            response: Textract response
+            file_path: Path to the file
+            space_id: ID of the space to associate with
+            file_url: Optional URL corresponding to the file
         """
         # Extract text from Textract response
         text_blocks = [
@@ -237,14 +282,21 @@ class MultiFileDocumentProcessor:
         # Filter to only printable characters
         full_text = ''.join(char for char in full_text if char.isprintable() or char in ['\n', '\t', ' '])
         
+        # Prepare metadata
+        metadata = {
+            'source_file': source_file,
+            'extraction_method': 'textract',
+            'space_id': space_id
+        }
+        
+        # Add file_url to metadata if available
+        if file_url:
+            metadata['file_url'] = file_url
+        
         documents = [
             Document(
                 page_content=full_text,
-                metadata={
-                    'source_file': source_file,
-                    'extraction_method': 'textract',
-                    'space_id': space_id
-                }
+                metadata=metadata
             )
         ]
         
