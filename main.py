@@ -1088,8 +1088,9 @@ async def integrated_generate_quiz(request: IntegratedQuizRequest, background_ta
             try:
                 # Clear existing quiz data
                 rag_system.supabase.table('generated_content').update({
-                    'quiz': []
-                }).eq('space_id', request.space_id).execute()
+                    'quiz': [],
+                    'updated_at': datetime.now().isoformat()
+                }).or_(f"pdf_id.eq.{request.document_ids[0]},yt_id.eq.{request.document_ids[0]}").execute()
             except Exception as e:
                 logger.error(f"Error clearing existing quiz data: {e}")
 
@@ -1117,8 +1118,9 @@ async def integrated_generate_quiz(request: IntegratedQuizRequest, background_ta
                     if request.space_id:
                         try:
                             rag_system.supabase.table('generated_content').update({
-                                'quiz': accumulated_questions
-                            }).eq('space_id', request.space_id).execute()
+                                'quiz': accumulated_questions,
+                                'updated_at': datetime.now().isoformat()
+                            }).or_(f"pdf_id.eq.{request.document_ids[0]},yt_id.eq.{request.document_ids[0]}").execute()
                             logger.info(f"Updated Supabase with {len(accumulated_questions)} total questions")
                         except Exception as e:
                             logger.error(f"Error updating Supabase: {e}")
@@ -1163,8 +1165,9 @@ async def create_pinecone_flashcards(request: PineconeStudyRequest, background_t
             try:
                 # Clear existing flashcards data
                 rag_system.supabase.table('generated_content').update({
-                    'flashcards': []
-                }).eq('space_id', request.space_id).execute()
+                    'flashcards': [],
+                    'updated_at': datetime.now().isoformat()
+                }).or_(f"pdf_id.eq.{request.document_ids[0]},yt_id.eq.{request.document_ids[0]}").execute()
             except Exception as e:
                 logger.error(f"Error clearing existing flashcards data: {e}")
 
@@ -1188,8 +1191,9 @@ async def create_pinecone_flashcards(request: PineconeStudyRequest, background_t
                     if request.space_id:
                         try:
                             rag_system.supabase.table('generated_content').update({
-                                'flashcards': accumulated_flashcards
-                            }).eq('space_id', request.space_id).execute()
+                                'flashcards': accumulated_flashcards,
+                                'updated_at': datetime.now().isoformat()
+                            }).or_(f"pdf_id.eq.{request.document_ids[0]},yt_id.eq.{request.document_ids[0]}").execute()
                             logger.info(f"Updated Supabase with {len(accumulated_flashcards)} total flashcards")
                         except Exception as e:
                             logger.error(f"Error updating Supabase: {e}")
@@ -1412,7 +1416,7 @@ async def integrated_generate_flashcards(request: IntegratedFlashcardRequest, ba
                 # Clear existing flashcards data
                 rag_system.supabase.table('generated_content').update({
                     'flashcards': []
-                }).eq('space_id', request.space_id).execute()
+                }).or_(f"pdf_id.eq.{request.document_ids[0]},yt_id.eq.{request.document_ids[0]}").execute()
             except Exception as e:
                 logger.error(f"Error clearing existing flashcards data: {e}")
 
@@ -1439,8 +1443,9 @@ async def integrated_generate_flashcards(request: IntegratedFlashcardRequest, ba
                     if request.space_id:
                         try:
                             rag_system.supabase.table('generated_content').update({
-                                'flashcards': accumulated_flashcards
-                            }).eq('space_id', request.space_id).execute()
+                                'flashcards': accumulated_flashcards,
+                                'updated_at': datetime.now().isoformat()
+                            }).or_(f"pdf_id.eq.{request.document_ids[0]},yt_id.eq.{request.document_ids[0]}").execute()
                             logger.info(f"Updated Supabase with {len(accumulated_flashcards)} total flashcards")
                         except Exception as e:
                             logger.error(f"Error updating Supabase: {e}")

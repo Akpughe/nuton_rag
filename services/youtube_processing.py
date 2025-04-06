@@ -7,6 +7,7 @@ from youtube_transcript_api import YouTubeTranscriptApi
 from supabase import create_client
 import groq
 from langchain.docstore.document import Document
+from pytube import YouTube
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -108,6 +109,17 @@ class YouTubeTranscriptProcessor:
                     failed_urls.append(video_url)
                     logger.error(f"Error processing {video_url}: {e}")
         
+        # Generate and update space name based on processed videos
+        # if all_documents:
+        #     try:
+        #         # Extract texts from documents
+        #         texts = [doc.page_content for doc in all_documents]
+        #         name_result = self.generate_and_update_space_name(space_id, texts)
+        #         if name_result['status'] == 'error':
+        #             logger.warning(f"Failed to update space name: {name_result['message']}")
+        #     except Exception as e:
+        #         logger.warning(f"Error generating space name: {e}")
+        
         # Prepare result summary
         success = len(all_documents) > 0
         message = f"Processed {len(video_ids)}/{len(video_urls)} videos successfully"
@@ -150,7 +162,7 @@ class YouTubeTranscriptProcessor:
                 }
             
             # Get video thumbnail
-            thumbnail = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+            thumbnail = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
             
             # Try to get transcript with fallback translation
             transcript_result = self._get_transcript_with_fallback(video_id)
@@ -173,7 +185,8 @@ class YouTubeTranscriptProcessor:
                     'space_id': space_id,
                     'extracted_text': full_text,
                     'yt_url': video_url,
-                    'thumbnail': thumbnail
+                    'thumbnail': thumbnail,
+                    'file_name': video_title
                 }).execute()
                 
                 if not result.data:
@@ -354,7 +367,7 @@ class YouTubeTranscriptProcessor:
     
     def _extract_video_title(self, video_url: str, video_id: str) -> str:
         """
-        Extract or generate a title for the video.
+        Extract title for the video using pytube.
         
         Args:
             video_url: YouTube video URL
@@ -367,14 +380,75 @@ class YouTubeTranscriptProcessor:
         video_title = f"YouTube Video: {video_id}"
         
         try:
-            # Try to extract title from URL if available
-            if "title=" in video_url:
-                video_title = video_url.split("title=")[1].split("&")[0]
-                video_title = video_title.replace("+", " ")
-                
-            # In a production system, you would use YouTube API here
-            # This is a placeholder for the actual implementation
-        except Exception as title_error:
-            logger.warning(f"Error extracting video title: {title_error}")
+            # Use pytube to get video title
+            yt = YouTube(video_url)
+            video_title = yt.title
             
-        return video_title 
+        except Exception as title_error:
+            logger.warning(f"Error extracting video title using pytube: {title_error}")
+            
+        return video_title
+
+    def generate_and_update_space_name(self, space_id: str, texts: List[str], max_words: int = 5) -> Dict[str, Any]:
+        """
+        Generate a meaningful name for a space based on extracted texts and update the spaces table.
+        
+        Args:
+            space_id: ID of the space to update
+            texts: List of extracted texts from documents
+            max_words: Maximum number of words to include in the generated name
+            
+        Returns:
+            Dictionary with status and generated name
+        """
+        try:
+            # Combine all texts and get first 1000 words
+            combined_text = ' '.join(texts)
+            words = combined_text.split()[:1000]  # Get first 1000 words
+            combined_text = ' '.join(words)
+            
+            # Generate title using Groq
+            response = self.groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant that generates concise, meaningful titles based on content. Generate a title that captures the main topic or theme of the following content. The title should be 3-5 words long and be descriptive but concise."
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Generate a title for the following content:\n\n{combined_text}"
+                    }
+                ],
+                temperature=0.7,
+                max_tokens=50
+            )
+            
+            # Extract and clean the generated title
+            generated_name = response.choices[0].message.content.strip()
+            # Remove any quotes or special characters
+            generated_name = generated_name.strip('"\'')
+            
+            # If no meaningful title was generated, use a default name
+            if not generated_name:
+                generated_name = f"Space {space_id[:8]}"
+            
+            # Update the spaces table
+            self.supabase.table('spaces').update({
+                'name': generated_name
+            }).eq('id', space_id).execute()
+            
+            return {
+                'status': 'success',
+                'name': generated_name,
+                'message': f'Successfully updated space name to: {generated_name}'
+            }
+            
+        except Exception as e:
+            error_msg = f"Error generating and updating space name: {e}"
+            logger.error(error_msg)
+            return {
+                'status': 'error',
+                'name': None,
+                'message': error_msg
+            } 

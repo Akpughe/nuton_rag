@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 from supabase import create_client
+import groq
 
 from langchain_community.document_loaders import (
     PyPDFLoader as PDFLoader, 
@@ -74,6 +75,17 @@ class MultiFileDocumentProcessor:
                             document_ids[file_path] = result['document_id']
                 except Exception as e:
                     print(f"Error processing {file_path}: {e}")
+        
+        # Generate and update space name based on processed documents
+        # if all_documents:
+        #     try:
+        #         # Extract texts from documents
+        #         texts = [doc.page_content for doc in all_documents]
+        #         name_result = self.generate_and_update_space_name(space_id, texts)
+        #         if name_result['status'] == 'error':
+        #             print(f"Warning: Failed to update space name: {name_result['message']}")
+        #     except Exception as e:
+        #         print(f"Warning: Error generating space name: {e}")
         
         return {
             'documents': all_documents,
@@ -301,3 +313,74 @@ class MultiFileDocumentProcessor:
         ]
         
         return {'documents': documents}
+
+    def generate_and_update_space_name(self, space_id: str, texts: List[str], max_words: int = 5) -> Dict[str, Any]:
+        """
+        Generate a meaningful name for a space based on extracted texts and update the spaces table.
+        
+        Args:
+            space_id: ID of the space to update
+            texts: List of extracted texts from documents
+            max_words: Maximum number of words to include in the generated name
+            
+        Returns:
+            Dictionary with status and generated name
+        """
+        try:
+            # Combine all texts and get first 1000 words
+            combined_text = ' '.join(texts)
+            words = combined_text.split()[:1000]  # Get first 1000 words
+            combined_text = ' '.join(words)
+            
+            # Initialize Groq client
+            groq_api_key = os.getenv('GROQ_API_KEY')
+            if not groq_api_key:
+                raise ValueError("GROQ_API_KEY not found in environment variables")
+            
+            groq_client = groq.Client(api_key=groq_api_key)
+            
+            # Generate title using Groq
+            response = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant that generates concise, meaningful titles based on content. Generate a title that captures the main topic or theme of the following content. The title should be 3-5 words long and be descriptive but concise."
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Generate a title for the following content:\n\n{combined_text}"
+                    }
+                ],
+                temperature=0.7,
+                max_tokens=50
+            )
+            
+            # Extract and clean the generated title
+            generated_name = response.choices[0].message.content.strip()
+            # Remove any quotes or special characters
+            generated_name = generated_name.strip('"\'')
+            
+            # If no meaningful title was generated, use a default name
+            if not generated_name:
+                generated_name = f"Space {space_id[:8]}"
+            
+            # Update the spaces table
+            self.supabase.table('spaces').update({
+                'name': generated_name
+            }).eq('id', space_id).execute()
+            
+            return {
+                'status': 'success',
+                'name': generated_name,
+                'message': f'Successfully updated space name to: {generated_name}'
+            }
+            
+        except Exception as e:
+            error_msg = f"Error generating and updating space name: {e}"
+            print(error_msg)
+            return {
+                'status': 'error',
+                'name': None,
+                'message': error_msg
+            }

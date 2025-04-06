@@ -30,3 +30,4 @@ pinecone>=6.0.0
 youtube_transcript_api
 boto3>=1.28.0
 cohere>=4.37
+pytube
