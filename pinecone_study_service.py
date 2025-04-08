@@ -137,9 +137,9 @@ class PineconeStudyGenerator:
             
             # Define Groq models to try with fallback
             self.groq_models = [
-                "llama-3.3-70b-versatile",  # Fast model
+                "meta-llama/llama-4-scout-17b-16e-instruct",  # Fast model
                 "llama-3.1-8b-instant",  # Backup
-                "llama-3.3-70b-versatile"      # Second fallback
+                "meta-llama/llama-4-scout-17b-16e-instruct"      # Second fallback
             ]
         else:
             self.use_groq = False

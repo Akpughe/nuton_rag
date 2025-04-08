@@ -458,7 +458,7 @@ class RAGSystem:
             
             # Generate the response using Groq with appropriate token limit
             response = self.groq.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
                 messages=[
                     {"role": "system", "content": system_message},
                     {"role": "user", "content": user_message}

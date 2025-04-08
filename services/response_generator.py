@@ -31,10 +31,10 @@ class ResponseGenerator:
         
         # Define fallback models with hierarchy
         self.groq_models = [
-            "llama-3.3-70b-versatile",  # First choice
-            "llama-3.1-70b-versatile",  # First fallback 
-            "llama-3.1-8b-versatile",   # Second fallback (smaller model)
-            "mixtral-8x7b-32768"        # Third fallback
+            "meta-llama/llama-4-scout-17b-16e-instruct",  # First choice
+            "meta-llama/llama-4-scout-17b-16e-instruct",  # First fallback 
+            "meta-llama/llama-4-scout-17b-16e-instruct",   # Second fallback (smaller model)
+            "meta-llama/llama-4-scout-17b-16e-instruct"        # Third fallback
         ]
         
         logger.info("ResponseGenerator initialized with Groq and OpenAI fallback")

@@ -348,7 +348,7 @@ class YouTubeTranscriptProcessor:
                 
                 # Translate using Groq
                 response = self.groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",  # Using Llama model from Groq
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",  # Using Llama model from Groq
                     messages=[
                         {"role": "system", "content": "You are a translator. Translate the following text to English:"},
                         {"role": "user", "content": raw_text}
@@ -409,7 +409,7 @@ class YouTubeTranscriptProcessor:
             
             # Generate title using Groq
             response = self.groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
+                model="meta-llama/llama-4-scout-17b-16e-instruct",
                 messages=[
                     {
                         "role": "system",
