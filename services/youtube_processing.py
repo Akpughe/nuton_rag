@@ -3,6 +3,7 @@ from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
+import requests
 from youtube_transcript_api import YouTubeTranscriptApi
 from supabase import create_client
 import groq
@@ -37,6 +38,9 @@ class YouTubeTranscriptProcessor:
             logger.warning("GROQ_API_KEY not found in environment variables - translation may fail")
             
         self.groq_client = groq.Client(api_key=groq_api_key)
+        
+        # Get YouTube title API URL from environment
+        self.yt_api_url = os.getenv('YT_API_URL', 'https://pdf-ocr-staging-production.up.railway.app')
         logger.info("YouTubeTranscriptProcessor initialized")
 
     def process_videos(self, video_urls: List[str], space_id: str) -> Dict[str, Any]:
@@ -367,7 +371,7 @@ class YouTubeTranscriptProcessor:
     
     def _extract_video_title(self, video_url: str, video_id: str) -> str:
         """
-        Extract title for the video using pytube.
+        Extract title for the video using the YouTube title API.
         
         Args:
             video_url: YouTube video URL
@@ -376,18 +380,27 @@ class YouTubeTranscriptProcessor:
         Returns:
             Video title
         """
-        # Default title using video ID
-        video_title = f"YouTube Video: {video_id}"
-        
+        print('video_url here', video_url)
+        print('video_id here', video_id)
         try:
-            # Use pytube to get video title
-            yt = YouTube(video_url)
-            video_title = yt.title
-            
+            # Use API to get video title
+            response = requests.post(
+                f"{self.yt_api_url}/yt-video-title",
+                json={'url': video_url}
+            )
+            response.raise_for_status()
+            data = response.json()
+            print('data yt', data)
+            if data and 'title' in data:
+                return data['title']
+            else:
+                logger.warning(f"API did not return a title for video {video_id}")
+                return f"YouTube Video: {video_id}"
+              
         except Exception as title_error:
-            logger.warning(f"Error extracting video title using pytube: {title_error}")
-            
-        return video_title
+            logger.warning(f"Error getting video title from API: {title_error}")
+            # Default title using video ID if API fails
+            return f"YouTube Video: {video_id}"
 
     def generate_and_update_space_name(self, space_id: str, texts: List[str], max_words: int = 5) -> Dict[str, Any]:
         """
