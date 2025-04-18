@@ -108,6 +108,161 @@ class StreamingFlashcardResponse(BaseModel):
             validated.append(card)
         return validated
 
+def parse_text_flashcards(text_content: str) -> List[Dict[str, str]]:
+    """
+    Parse flashcards from a delimited text format into structured dictionaries
+    
+    Format:
+    ---
+    Question: What is X?
+    Answer: X is Y
+    Hint: Think about Z
+    Explanation: Additional details about X
+    ---
+    """
+    flashcards = []
+    # Split by the '---' delimiter, ignoring empty entries
+    segments = [s.strip() for s in text_content.split('---') if s.strip()]
+    
+    for segment in segments:
+        card = {"type": "detailed"}
+        
+        # Parse each line to extract fields
+        lines = segment.strip().split('\n')
+        for line in lines:
+            if not line.strip():
+                continue
+                
+            # Find the first colon which separates field name from content
+            colon_index = line.find(':')
+            if colon_index > 0:
+                field = line[:colon_index].strip().lower()
+                value = line[colon_index+1:].strip()
+                
+                # Map fields to our flashcard structure
+                if field == 'question':
+                    card['question'] = value
+                elif field == 'answer':
+                    card['answer'] = value
+                elif field == 'hint':
+                    card['hint'] = value
+                elif field == 'explanation':
+                    # Store explanation if we want to use it
+                    card['explanation'] = value
+        
+        # Only add cards with at least a question and answer
+        if 'question' in card and 'answer' in card:
+            # Add default hint if missing
+            if 'hint' not in card:
+                card['hint'] = "Think about the key concepts related to this topic."
+            flashcards.append(card)
+        else:
+            logger.warning(f"Skipping invalid flashcard missing question or answer")
+    
+    return flashcards
+
+def parse_text_questions(text_content: str) -> List[Dict]:
+    """
+    Parse quiz questions from a delimited text format into structured dictionaries
+    
+    Format:
+    ---
+    Question: What is the capital of France?
+    Type: mcq
+    Options:
+    A. London  
+    B. Berlin  
+    C. Paris  
+    D. Madrid  
+    Answer: C  
+    Explanation: Paris is the capital city of France.
+    ---
+    Question: Paris is the capital of France.
+    Type: true_false  
+    Answer: True  
+    Explanation: Paris is officially recognized as the capital of France.
+    ---
+    """
+    questions = []
+    # Split by the '---' delimiter, ignoring empty entries
+    segments = [s.strip() for s in text_content.split('---') if s.strip()]
+    
+    for segment in segments:
+        question = {}
+        
+        # Parse each line to extract fields
+        lines = segment.strip().split('\n')
+        
+        # Process options separately
+        in_options = False
+        options = {}
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            # Check if we're entering or leaving options section
+            if line.lower() == 'options:':
+                in_options = True
+                continue
+            
+            # If we're in options section, parse options
+            if in_options:
+                # If we find a line that doesn't look like an option, exit options mode
+                if not line[0].isalpha() or not line[1:2] in [')', '.', ':']:
+                    in_options = False
+                else:
+                    # Extract option letter and text
+                    option_letter = line[0]
+                    # Find the separator (., :, or ))
+                    separator_idx = max(line.find('.'), max(line.find(':'), line.find(')')))
+                    if separator_idx > 0:
+                        option_text = line[separator_idx+1:].strip()
+                        options[option_letter] = option_text
+                    continue
+            
+            # If we're not in options mode, parse other fields
+            colon_index = line.find(':')
+            if colon_index > 0:
+                field = line[:colon_index].strip().lower()
+                value = line[colon_index+1:].strip()
+                
+                # Map fields to our question structure
+                if field == 'question':
+                    question['question'] = value
+                elif field == 'type':
+                    question['type'] = value.lower()
+                elif field == 'answer':
+                    question['answer'] = value
+                elif field == 'explanation':
+                    question['explanation'] = value
+        
+        # Add options to the question if we found any
+        if options and len(options) > 0:
+            question['options'] = options
+        
+        # Validate question has required fields
+        if 'question' in question and 'answer' in question:
+            # Make sure type is set
+            if 'type' not in question:
+                if 'options' in question:
+                    question['type'] = 'mcq'
+                else:
+                    question['type'] = 'true_false'
+                    
+            # Normalize types
+            if question['type'].lower() in ['multiple choice', 'multiple-choice', 'multiplechoice']:
+                question['type'] = 'mcq'
+            elif question['type'].lower() in ['true/false', 'truefalse', 't/f', 'tf']:
+                question['type'] = 'true_false'
+            
+            questions.append(question)
+        else:
+            logger.warning(f"Skipping invalid question missing question or answer")
+    
+    return questions
+
 @lru_cache(maxsize=1000)
 def get_embedding_cached(text: str):
     """Cached version of embedding generation"""
@@ -334,7 +489,7 @@ class PineconeStudyGenerator:
                 
             logger.info(f"Batch {batch_num}: Generating {mcq_count} MCQ and {tf_count} True/False questions")
             
-            # Build a clearer and more structured prompt
+            # Build a clearer and more structured prompt for text-based questions
             prompt = f"""
             TASK: Generate exactly {current_batch} quiz questions based on the provided content.
             Difficulty level: {difficulty.upper()}
@@ -344,20 +499,43 @@ class PineconeStudyGenerator:
             - True/False questions: {tf_count}
             
             FORMATTING REQUIREMENTS:
+            - Format each question exactly like these examples, with fields on separate lines:
+            
+            ---
+            Question: What is the capital of France?
+            Type: mcq
+            Options:
+            A. London  
+            B. Berlin  
+            C. Paris  
+            D. Madrid  
+            Answer: C  
+            Explanation: Paris is the capital city of France, known for its landmarks like the Eiffel Tower and the Louvre.
+            ---
+            Question: Paris is the capital of France.
+            Type: true_false  
+            Answer: True  
+            Explanation: Paris is officially recognized as the capital of France and is also the country's largest city.
+            ---
+            
+            - Start and end each question with "---" on its own line
+            - Include the following fields for each question:
+              * Question: The actual question text
+              * Type: Either "mcq" or "true_false"
+              * Options: For MCQ questions only, list all options with letters A-D
+              * Answer: For MCQ, just the letter (A, B, C, D). For True/False, either "True" or "False"
+              * Explanation: Brief explanation of the correct answer
             
             1. For MULTIPLE-CHOICE questions ({mcq_count}):
-               - Each question MUST have the field "type": "mcq"
-               - Each question must have 4 options labeled A, B, C, and D
-               - Include ONLY ONE correct answer
-               - Indicate the correct answer with the field "answer": "A" (or B, C, D)
-               - Evenly distribute correct answers (don't make all answers "C")
+              - Include ONLY ONE correct answer
+              - Provide 4 options labeled A, B, C, and D
+              - Make sure options are realistic and not obviously wrong
+              - Evenly distribute correct answers (don't make all answers "C")
                
             2. For TRUE/FALSE questions ({tf_count}):
-               - Each question MUST have the field "type": "true_false"
-               - Format as a statement that is definitively true or false
-               - The answer should ONLY be "True" or "False" (not T/F, not Yes/No)
-               - The question field should be a complete statement, not a question
-               - Try to have a balance of true and false statements
+              - Format as a statement that is definitively true or false
+              - The question field should be a complete statement, not a question
+              - Try to have a balance of true and false statements
             
             CONTENT REQUIREMENTS:
             - Questions should be based ONLY on the content provided
@@ -365,32 +543,6 @@ class PineconeStudyGenerator:
             - Ensure variety across the questions to cover different aspects of the content
             - Make questions challenging and test deep understanding, not just memorization
             - Avoid ambiguous or opinion-based questions that could have multiple correct answers
-            
-            JSON STRUCTURE:
-            Return a properly formatted JSON with the following structure:
-            {{
-                "questions": [
-                    {{
-                        "question": "What is the capital of France?",
-                        "type": "mcq",
-                        "options": {{
-                            "A": "London",
-                            "B": "Berlin",
-                            "C": "Paris",
-                            "D": "Madrid"
-                        }},
-                        "answer": "C"
-                    }},
-                    {{
-                        "question": "Paris is the capital of France.",
-                        "type": "true_false",
-                        "answer": "True"
-                    }}
-                ]
-            }}
-            
-            Only include options for multiple-choice questions, not for true/false questions.
-            Make sure every question has the correct "type" field.
             
             Content:
             {content}
@@ -409,11 +561,10 @@ class PineconeStudyGenerator:
                                 messages=[
                                     {
                                         "role": "system", 
-                                        "content": "You are a specialized quiz creator. Your task is to generate questions in the exact format specified, following all the instructions precisely. Every question must include a 'type' field that specifies whether it's 'mcq' or 'true_false'."
+                                        "content": "You are a specialized quiz creator. Your task is to generate questions in the exact format specified, following all the instructions precisely."
                                     },
                                     {"role": "user", "content": prompt}
                                 ],
-                                response_format={"type": "json_object"},
                                 temperature=0.7,
                                 max_tokens=1500,
                                 stream=True
@@ -423,9 +574,9 @@ class PineconeStudyGenerator:
                             async for chunk in async_response:
                                 if chunk.choices[0].delta.content:
                                     response_text += chunk.choices[0].delta.content
-                            
+                        
                             # If we got a valid response, break out of the loop
-                            if response_text and '{"questions"' in response_text:
+                            if response_text and '---' in response_text:
                                 logger.info(f"Successfully generated questions with Groq model: {model}")
                                 break
                             else:
@@ -436,18 +587,18 @@ class PineconeStudyGenerator:
                             continue
                 
                 # Fall back to OpenAI if Groq failed or is not available
-                if not response_text or '{"questions"' not in response_text:
+                if not response_text or '---' not in response_text:
                     logger.info("Falling back to OpenAI for question generation")
                     async_response = await self.client.chat.completions.create(
                         model="gpt-4o-mini",  # Using a faster model
                         messages=[
                             {
                                 "role": "system", 
-                                "content": "You are a specialized quiz creator. Your task is to generate questions in the exact format specified, following all the instructions precisely. Every question must include a 'type' field that specifies whether it's 'mcq' or 'true_false'."
+                                "content": "You are a specialized quiz creator. Your task is to generate questions in the exact format specified, following all the instructions precisely."
                             },
                             {"role": "user", "content": prompt}
                         ],
-                        response_format={"type": "json_object"},
+                        temperature=0.7,
                         stream=True
                     )
                     
@@ -459,39 +610,41 @@ class PineconeStudyGenerator:
                         if chunk.choices[0].delta.content:
                             response_text += chunk.choices[0].delta.content
 
-                # Parse and validate the response
-                response_data = json.loads(response_text)
-                batch_questions = response_data.get("questions", [])
+                # Parse the text response into structured questions
+                parsed_questions = parse_text_questions(response_text)
                 
-                # Validate each question has the required type field
+                # Apply additional validation if needed
                 validated_questions = []
-                for q in batch_questions:
-                    if "type" not in q:
-                        # If type is missing, try to infer it
+                for q in parsed_questions:
+                    # Skip if we've reached our target count
+                    if len(validated_questions) >= current_batch:
+                        break
+                        
+                    # Verify that question types match what's expected
+                    if q["type"] not in ["mcq", "true_false"]:
                         if "options" in q:
                             q["type"] = "mcq"
                         else:
                             q["type"] = "true_false"
                     
+                    # Make sure MCQ questions have options
+                    if q["type"] == "mcq" and "options" not in q:
+                        logger.warning(f"Skipping invalid MCQ question without options: {q.get('question', 'Unknown')}")
+                        continue
+                    
                     # Make sure true_false questions don't have options
                     if q["type"] == "true_false" and "options" in q:
                         del q["options"]
                     
-                    # Verify MCQ questions have options and a valid answer
-                    if q["type"] == "mcq" and "options" not in q:
-                        # Skip invalid MCQ questions
-                        logger.warning(f"Skipping invalid MCQ question without options: {q.get('question', 'Unknown')}")
-                        continue
-                    
                     validated_questions.append(q)
                 
-                # Check if we have the right balance of question types
+                num_questions_generated = len(validated_questions)
+                questions_generated += num_questions_generated
+
+                # Check the distribution of question types in this batch
                 actual_mcq = sum(1 for q in validated_questions if q["type"] == "mcq")
                 actual_tf = sum(1 for q in validated_questions if q["type"] == "true_false")
-                
-                logger.info(f"Generated {actual_mcq} MCQ and {actual_tf} True/False questions (requested {mcq_count} MCQ, {tf_count} True/False)")
-                
-                questions_generated += len(validated_questions)
+                logger.info(f"Generated {actual_mcq} MCQ and {actual_tf} True/False questions")
 
                 response_data = StreamingQuizResponse(
                     questions=validated_questions,
@@ -564,7 +717,7 @@ class PineconeStudyGenerator:
             
             logger.info(f"Batch {batch_num}: Generating {current_batch} detailed flashcards")
             
-            # Build a simplified prompt only for detailed flashcards
+            # Build a simplified prompt for text-based flashcards
             prompt = f"""
             TASK: Generate exactly {current_batch} detailed flashcards based on the provided content.
             Difficulty level: {difficulty.upper()}
@@ -572,29 +725,26 @@ class PineconeStudyGenerator:
             IMPORTANT: ALL ANSWERS MUST BE CONCISE - MAXIMUM 1-2 SENTENCES. Keep flashcards brief and focused.
             
             FORMATTING REQUIREMENTS:
-            - Each flashcard must have a thought-provoking question in the "question" field
-            - Include a CONCISE answer (1 sentences max) in the "answer" field
-            - Include a brief hint (1 sentence) in the "hint" field that guides without giving away the answer
-            - Each flashcard must have the field "type": "detailed"
+            - Format each flashcard exactly like this example, with fields on separate lines:
+            ---
+            Question: What is the powerhouse of the cell?
+            Answer: Mitochondria
+            Hint: It's often associated with energy production.
+            Explanation: The mitochondria is responsible for producing ATP, the energy currency of the cell.
+            ---
+            
+            - Start and end each flashcard with "---" on its own line
+            - Include the following fields for each flashcard:
+              * Question: A thought-provoking question
+              * Answer: A CONCISE answer (1-2 sentences max)
+              * Hint: A brief clue that guides without giving away the answer
+              * Explanation: A short explanation that provides additional context (optional)
             
             CONTENT REQUIREMENTS:
             - Flashcards should be based ONLY on the content provided
             - Focus on key concepts, important facts, and significant details
             - BREVITY IS CRITICAL - keep all answers short and to the point
             - Avoid ambiguous answers or questions with multiple possible answers
-            
-            JSON STRUCTURE:
-            Return a properly formatted JSON with the following structure:
-            {{
-                "flashcards": [
-                    {{
-                        "question": "What is the relationship between energy and wavelength in electromagnetic radiation?",
-                        "answer": "Energy is inversely proportional to wavelength, so shorter wavelengths have higher energy.",
-                        "hint": "Think about the formula E=hc/λ in physics.",
-                        "type": "detailed"
-                    }}
-                ]
-            }}
             
             Content:
             {content}
@@ -617,7 +767,6 @@ class PineconeStudyGenerator:
                                     },
                                     {"role": "user", "content": prompt}
                                 ],
-                                response_format={"type": "json_object"},
                                 temperature=0.7,
                                 max_tokens=1500,
                                 stream=True
@@ -627,9 +776,9 @@ class PineconeStudyGenerator:
                             async for chunk in async_response:
                                 if chunk.choices[0].delta.content:
                                     response_text += chunk.choices[0].delta.content
-                            
+                        
                             # If we got a valid response, break out of the loop
-                            if response_text and '{"flashcards"' in response_text:
+                            if response_text and '---' in response_text:
                                 logger.info(f"Successfully generated flashcards with Groq model: {model}")
                                 break
                             else:
@@ -640,7 +789,7 @@ class PineconeStudyGenerator:
                             continue
                 
                 # Fall back to OpenAI if Groq failed or is not available
-                if not response_text or '{"flashcards"' not in response_text:
+                if not response_text or '---' not in response_text:
                     logger.info("Falling back to OpenAI for flashcard generation")
                     async_response = await self.client.chat.completions.create(
                         model="gpt-4o-mini",
@@ -651,7 +800,6 @@ class PineconeStudyGenerator:
                             },
                             {"role": "user", "content": prompt}
                         ],
-                        response_format={"type": "json_object"},
                         temperature=0.7,
                         max_tokens=1500,
                         stream=True
@@ -665,25 +813,16 @@ class PineconeStudyGenerator:
                         if chunk.choices[0].delta.content:
                             response_text += chunk.choices[0].delta.content
 
-                # Parse and validate the response
-                response_data = json.loads(response_text)
-                batch_flashcards = response_data.get("flashcards", [])
+                # Parse the text response into structured flashcards
+                parsed_flashcards = parse_text_flashcards(response_text)
                 
-                # Validate the flashcards - all should be detailed type
+                # Apply validation rules for consistency
                 validated_flashcards = []
-                for card in batch_flashcards:
-                    # Set type to detailed if not specified
-                    card["type"] = "detailed"
-                    
-                    # Make sure each flashcard has a hint
-                    if "hint" not in card:
-                        card["hint"] = "Think about the key concepts related to this topic."
-                    
-                    # Skip flashcards without question or answer
-                    if "question" not in card or "answer" not in card:
-                        logger.warning(f"Skipping invalid flashcard missing question or answer")
-                        continue
-                    
+                for card in parsed_flashcards:
+                    # Skip if we've reached our target count
+                    if len(validated_flashcards) >= current_batch:
+                        break
+                        
                     # Enforce answer length limits
                     if len(card["answer"].split()) > 30:
                         words = card["answer"].split()
@@ -703,8 +842,9 @@ class PineconeStudyGenerator:
                     
                     validated_flashcards.append(card)
                 
-                flashcards_generated += len(validated_flashcards)
-                logger.info(f"Generated {len(validated_flashcards)} detailed flashcards")
+                num_cards = len(validated_flashcards)
+                flashcards_generated += num_cards
+                logger.info(f"Generated {num_cards} detailed flashcards")
 
                 response_data = StreamingFlashcardResponse(
                     flashcards=validated_flashcards,
