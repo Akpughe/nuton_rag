@@ -27,7 +27,7 @@ asyncio>=3.4.3
 python-docx>=0.8.11
 rank_bm25>=0.2.2
 pinecone>=6.0.0
-youtube_transcript_api
+youtube_transcript_api>=0.6.2
 boto3>=1.28.0
 cohere>=4.37
 pytube

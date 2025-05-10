@@ -22,21 +22,20 @@ class YouTubeTranscriptProcessor:
     """
     
     def __init__(self):
-        """Initialize processor with API clients."""
+        """
+        Initialize the YouTube transcript processor with necessary configurations.
+        """
         # Initialize Supabase client
         supabase_url = os.getenv('SUPABASE_URL_DEV')
         supabase_key = os.getenv('SUPABASE_KEY_DEV')
-        
         if not supabase_url or not supabase_key:
-            logger.error("Missing Supabase credentials in environment variables")
-            raise ValueError("Supabase credentials are required")
-            
+            raise ValueError("Supabase configuration missing")
         self.supabase = create_client(supabase_url, supabase_key)
         
-        # Initialize Groq client for translation if needed
+        # Initialize Groq client
         groq_api_key = os.getenv('GROQ_API_KEY')
         if not groq_api_key:
-            logger.warning("GROQ_API_KEY not found in environment variables - translation may fail")
+            raise ValueError("GROQ API key missing")
             
         self.groq_client = groq.Client(api_key=groq_api_key)
         
@@ -44,13 +43,19 @@ class YouTubeTranscriptProcessor:
         self.yt_api_url = os.getenv('YT_API_URL', 'https://pdf-ocr-staging-production.up.railway.app')
         
         # Set up Webshare proxy for YouTubeTranscriptApi
-        proxy_config = WebshareProxyConfig(
-            proxy_username="bfmbilto",
-            proxy_password="m0j4g39bo8sy"
-        )
-        YouTubeTranscriptApi.proxies = [proxy_config]
+        proxy_username = "bfmbilto"
+        proxy_password = "m0j4g39bo8sy"
         
-        logger.info("YouTubeTranscriptProcessor initialized with proxy configuration")
+        if proxy_username and proxy_password:
+            proxy_config = WebshareProxyConfig(
+                proxy_username=proxy_username,
+                proxy_password=proxy_password
+            )
+            self.transcript_api = YouTubeTranscriptApi(proxy_config=proxy_config)
+            logger.info("YouTubeTranscriptProcessor initialized with proxy configuration")
+        else:
+            self.transcript_api = YouTubeTranscriptApi()
+            logger.info("YouTubeTranscriptProcessor initialized without proxy configuration")
 
     def process_videos(self, video_urls: List[str], space_id: str) -> Dict[str, Any]:
         """
@@ -339,7 +344,7 @@ class YouTubeTranscriptProcessor:
         """
         # Try to get English transcript first
         try:
-            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+            transcript = self.transcript_api.get_transcript(video_id, languages=['en'])
             full_text = self._transcript_to_text(transcript)
             return {'success': True, 'text': full_text}
         except Exception as en_error:
@@ -347,7 +352,7 @@ class YouTubeTranscriptProcessor:
             
             # Try to get transcript in any language and translate
             try:
-                transcript = YouTubeTranscriptApi.get_transcript(video_id)
+                transcript = self.transcript_api.get_transcript(video_id)
                 
                 # Check if we got a valid transcript
                 if not transcript:

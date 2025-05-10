@@ -25,7 +25,8 @@ import shutil
 from openai import OpenAI
 from youtube_transcript_api import YouTubeTranscriptApi
 import groq
-from youtube_transcript_api.proxy import WebshareProxyConfig
+from youtube_transcript_api.proxies import WebshareProxyConfig
+import sys
 
 
 from sub import QuizRequest, StreamingQuizResponse, OptimizedStudyGenerator
@@ -45,8 +46,16 @@ from services.response_generator import ResponseGenerator
 from services.legacy_rag import RAGSystem
 from services.youtube_processing import YouTubeTranscriptProcessor
 
+# Configure logging
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler('app.log')
+    ]
+)
 
 load_dotenv()
 
@@ -711,47 +720,57 @@ async def get_yt_transcript(request: YTTranscriptRequest):
         print(yt_id)
     else:
         raise HTTPException(status_code=400, detail="Invalid YouTube URL format")
+    
     try:
-        # Try to get English transcript first
-        transcript = YouTubeTranscriptApi.get_transcript(yt_id, languages=['en'])
-    except:
+        # Initialize YouTube processor
+        youtube_processor = YouTubeTranscriptProcessor()
+        
+        # Get video thumbnail
+        thumbnail = f"https://img.youtube.com/vi/{yt_id}/maxresdefault.jpg"
+        
         try:
-            # If English not available, get transcript in any language and translate
-            transcript = YouTubeTranscriptApi.get_transcript(yt_id)
-            
-            # Initialize Groq client
-            client = groq.Client(api_key=os.getenv('GROQ_API_KEY'))
-            
-            # Combine transcript text for translation
-            full_text = " ".join([line['text'] for line in transcript])
-            
-            # Translate using Groq
-            response = client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",  # Using Llama model from Groq
-                messages=[
-                    {"role": "system", "content": "You are a translator. Translate the following text to English:"},
-                    {"role": "user", "content": full_text}
-                ]
-            )
-            
-            translated_text = response.choices[0].message.content
-            
-            # Update transcript with translated text
-            words = translated_text.split()
-            words_per_line = len(words) // len(transcript)
-            
-            for i, line in enumerate(transcript):
-                start_idx = i * words_per_line
-                end_idx = start_idx + words_per_line
-                line['text'] = " ".join(words[start_idx:end_idx])
-                
+            # Try to get English transcript first
+            transcript = youtube_processor.transcript_api.get_transcript(yt_id, languages=['en'])
+            full_text = youtube_processor._transcript_to_text(transcript)
         except Exception as e:
-            raise HTTPException(status_code=404, detail=f"Could not get transcript: {str(e)}")
+            logger.error(f"Error getting English transcript: {e}")
+            try:
+                # If English not available, get transcript in any language and translate
+                transcript = youtube_processor.transcript_api.get_transcript(yt_id)
+                
+                # Extract raw text from transcript
+                raw_text = " ".join([line['text'] for line in transcript])
+                
+                # Translate using Groq
+                response = youtube_processor.groq_client.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    messages=[
+                        {"role": "system", "content": "You are a translator. Translate the following text to English:"},
+                        {"role": "user", "content": raw_text}
+                    ]
+                )
+                
+                full_text = response.choices[0].message.content
+            except Exception as translate_error:
+                logger.error(f"Failed to get and translate transcript: {translate_error}")
+                return {
+                    "status": "error",
+                    "message": f"Failed to get transcript for video: {str(e)}, {str(translate_error if 'translate_error' in locals() else '')}"
+                }
+        
+        return {
+            "status": "success",
+            "video_id": yt_id,
+            "thumbnail": thumbnail,
+            "transcript": full_text
+        }
     
-    for line in transcript:
-        print(f"{line['text']} ({line['start']}-{line['start'] + line['duration']}s)")
-    
-    return transcript
+    except Exception as e:
+        logger.error(f"Error extracting YouTube transcript: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"An error occurred during transcript extraction: {str(e)}"
+        }
 
 # New endpoint for integrated document processing
 @app.post("/integrated/process-documents", response_model=IntegratedProcessingResponse)
