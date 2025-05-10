@@ -957,7 +957,12 @@ async def integrated_query(request: IntegratedRAGRequest):
         contexts = []
         for result in rerank_results.results:
             context = result.document
-            contexts.append(context)
+            # Add metadata to each context
+            metadata = result.metadata if hasattr(result, 'metadata') else {}
+            contexts.append({
+                "text": context,
+                "metadata": metadata
+            })
         
         # Prepare source attribution
         sources = []
@@ -994,7 +999,7 @@ async def integrated_query(request: IntegratedRAGRequest):
         logging.info("Generating final response with contexts")
         response_text = response_generator.generate_response(
             request.query,
-            contexts,
+            [c["text"] for c in contexts],
             use_external_knowledge=request.use_external_knowledge
         )
         
@@ -1005,7 +1010,7 @@ async def integrated_query(request: IntegratedRAGRequest):
         return {
             "query": request.query,
             "response": response_text,
-            "contexts": contexts[:3],  # Return top 3 contexts for reference
+            "contexts": contexts[:3],  # Return top 3 contexts for reference, now with metadata
             "space_id": request.space_id,
             "document_ids": request.document_ids,
             "sources": unique_sources
@@ -1788,12 +1793,17 @@ async def test_youtube_query(space_id: str, video_id: str):
         contexts = []
         for result in rerank_results.results:
             context = result.document
-            contexts.append(context)
+            # Add metadata to each context
+            metadata = result.metadata if hasattr(result, 'metadata') else {}
+            contexts.append({
+                "text": context,
+                "metadata": metadata
+            })
             
         # Generate response
         response_text = response_generator.generate_response(
             test_query,
-            contexts,
+            [c["text"] for c in contexts],
             use_external_knowledge=False
         )
         
@@ -1801,8 +1811,10 @@ async def test_youtube_query(space_id: str, video_id: str):
             "status": "success",
             "query": test_query,
             "response": response_text,
-            "contexts": contexts[:3],
-            "result_count": len(rerank_results.results)
+            "contexts": contexts[:3],  # Return top 3 contexts for reference, now with metadata
+            "space_id": request.space_id,
+            "document_ids": request.document_ids,
+            "sources": []
         }
     
     except Exception as e:

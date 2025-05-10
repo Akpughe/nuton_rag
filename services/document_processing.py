@@ -129,22 +129,55 @@ class MultiFileDocumentProcessor:
             try:
                 # Primary: Langchain Loader
                 loader = self.loaders.get(file_extension)(file_path)
-                documents = loader.load()
+                page_level_documents = loader.load()
                 
+                processed_documents = []
+                if file_extension == 'pdf': # Apply line-level splitting only for PDFs for now
+                    for page_doc in page_level_documents:
+                        page_content_str = page_doc.page_content
+                        if isinstance(page_content_str, bytes):
+                            page_content_str = page_content_str.decode('utf-8', errors='replace')
+                        
+                        lines = page_content_str.splitlines()
+                        for line_idx, line_text in enumerate(lines):
+                            if line_text.strip(): # Process non-empty lines
+                                line_metadata = page_doc.metadata.copy() # Start with page-level metadata
+                                line_metadata['line_in_page'] = line_idx
+                                # 'page' metadata should already be in page_doc.metadata from PyPDFLoader
+                                
+                                # Filter to only printable characters for the line
+                                printable_line_text = ''.join(char for char in line_text if char.isprintable() or char in ['\n', '\t'])
+                                
+                                processed_documents.append(
+                                    Document(page_content=printable_line_text, metadata=line_metadata)
+                                )
+                    if not processed_documents: # Fallback if all lines were empty or pdf was empty
+                        # Add page-level docs if line splitting resulted in nothing (e.g. image-only pdf page)
+                        # We still need to clean their content
+                        for page_doc in page_level_documents:
+                             page_content_str = page_doc.page_content
+                             if isinstance(page_content_str, bytes):
+                                 page_content_str = page_content_str.decode('utf-8', errors='replace')
+                             printable_page_content = ''.join(char for char in page_content_str if char.isprintable() or char in ['\n', '\t'])
+                             page_doc.page_content = printable_page_content
+                        processed_documents.extend(page_level_documents)
+
+                else: # For non-PDFs, use page_level_documents directly after cleaning
+                    for doc in page_level_documents:
+                        page_content_str = doc.page_content
+                        if isinstance(page_content_str, bytes):
+                            page_content_str = page_content_str.decode('utf-8', errors='replace')
+                        printable_content = ''.join(char for char in page_content_str if char.isprintable() or char in ['\n', '\t'])
+                        doc.page_content = printable_content
+                    processed_documents.extend(page_level_documents)
+
+                documents = processed_documents # These are now more granular for PDFs
+
                 # Extract text content - safely handle any encoding issues
                 full_text = ""
-                for doc in documents:
-                    try:
-                        if isinstance(doc.page_content, bytes):
-                            page_content = doc.page_content.decode('utf-8', errors='replace')
-                        else:
-                            page_content = doc.page_content
-                        
-                        # Filter to only printable characters
-                        page_content = ''.join(char for char in page_content if char.isprintable() or char in ['\n', '\t'])
-                        full_text += page_content + "\n\n"
-                    except Exception as text_error:
-                        print(f"Error processing document text: {text_error}")
+                for doc in documents: # Iterate over potentially line-level documents
+                    # page_content is already filtered for printable characters
+                    full_text += doc.page_content + "\n\n" 
                 
                 # If full_text is empty after processing, raise error
                 if not full_text.strip():
@@ -168,7 +201,7 @@ class MultiFileDocumentProcessor:
                 document_id = result.data[0]['id']
                 
                 # Enrich metadata with source file information and IDs
-                for doc in documents:
+                for doc in documents: # Ensure this metadata is added to the granular documents
                     doc.metadata['source_file'] = file_name
                     doc.metadata['document_id'] = document_id
                     doc.metadata['space_id'] = space_id
@@ -177,7 +210,7 @@ class MultiFileDocumentProcessor:
                         doc.metadata['file_url'] = file_url
                 
                 return {
-                    'documents': documents,
+                    'documents': documents, # Return the granular documents
                     'document_id': document_id,
                     'status': 'success',
                     'message': f'Successfully processed {file_name}'
@@ -195,43 +228,46 @@ class MultiFileDocumentProcessor:
                         textract_result = self._parse_textract_response(textract_response, file_path, space_id, file_url)
                         
                         # Insert into Supabase
-                        full_text = textract_result['documents'][0].page_content
+                        # For Textract fallback, we might not have line-level granularity easily.
+                        # We'll use the full_text from Textract for the Supabase record,
+                        # but the 'documents' from _parse_textract_response are page-level.
+                        full_text_from_textract = textract_result['documents'][0].page_content
                         
                         # Ensure text is properly encoded
-                        if isinstance(full_text, bytes):
-                            full_text = full_text.decode('utf-8', errors='replace')
+                        if isinstance(full_text_from_textract, bytes):
+                            full_text_from_textract = full_text_from_textract.decode('utf-8', errors='replace')
                         
                         # Filter to only printable characters
-                        full_text = ''.join(char for char in full_text if char.isprintable() or char in ['\n', '\t'])
+                        full_text_from_textract = ''.join(char for char in full_text_from_textract if char.isprintable() or char in ['\n', '\t'])
                         
                         # Prepare Supabase data
                         supabase_data = {
                             'name': file_name,
-                            'content': full_text,
+                            # 'content': full_text_from_textract, # This was likely a typo, should be extracted_text
                             'space_id': space_id,
                             'file_type': file_extension,
-                            'extracted_text': full_text,  # Add extracted text to its own column
-                            'file_path': file_path
+                            'extracted_text': full_text_from_textract,
+                            'file_path': file_path # Original file path, or URL if provided earlier
                         }
                         
                         # Add file_url if available
                         if file_url:
-                            supabase_data['file_url'] = file_url
+                            supabase_data['file_path'] = file_url # if file_url is present, it's the primary identifier
                         
                         result = self.supabase.table('pdfs').insert(supabase_data).execute()
                         
                         document_id = result.data[0]['id']
                         
-                        # Update metadata
+                        # Update metadata for the Textract-derived documents
+                        # These are typically page-level, not line-level from Textract.
                         for doc in textract_result['documents']:
                             doc.metadata['document_id'] = document_id
                             doc.metadata['space_id'] = space_id
-                            # Add file_url to metadata if available
                             if file_url:
                                 doc.metadata['file_url'] = file_url
                         
                         return {
-                            'documents': textract_result['documents'],
+                            'documents': textract_result['documents'], # These are page-level documents
                             'document_id': document_id,
                             'status': 'success',
                             'message': f'Successfully processed {file_name} using Textract fallback'
