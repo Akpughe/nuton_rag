@@ -25,6 +25,7 @@ import shutil
 from openai import OpenAI
 from youtube_transcript_api import YouTubeTranscriptApi
 import groq
+from youtube_transcript_api.proxy import WebshareProxyConfig
 
 
 from sub import QuizRequest, StreamingQuizResponse, OptimizedStudyGenerator
@@ -1499,6 +1500,13 @@ async def extract_youtube_transcript(request: YouTubeTranscriptExtractRequest):
         
         # Get video thumbnail
         thumbnail = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
+        
+        # Set up Webshare proxy for YouTubeTranscriptApi
+        proxy_config = WebshareProxyConfig(
+            proxy_username="bfmbilto",
+            proxy_password="m0j4g39bo8sy"
+        )
+        YouTubeTranscriptApi.proxies = [proxy_config]
         
         try:
             # Try to get English transcript first

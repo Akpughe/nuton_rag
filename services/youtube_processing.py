@@ -5,6 +5,7 @@ import json
 import logging
 import requests
 from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api.proxies import WebshareProxyConfig
 from supabase import create_client
 import groq
 from langchain.docstore.document import Document
@@ -41,7 +42,15 @@ class YouTubeTranscriptProcessor:
         
         # Get YouTube title API URL from environment
         self.yt_api_url = os.getenv('YT_API_URL', 'https://pdf-ocr-staging-production.up.railway.app')
-        logger.info("YouTubeTranscriptProcessor initialized")
+        
+        # Set up Webshare proxy for YouTubeTranscriptApi
+        proxy_config = WebshareProxyConfig(
+            proxy_username="bfmbilto",
+            proxy_password="m0j4g39bo8sy"
+        )
+        YouTubeTranscriptApi.proxies = [proxy_config]
+        
+        logger.info("YouTubeTranscriptProcessor initialized with proxy configuration")
 
     def process_videos(self, video_urls: List[str], space_id: str) -> Dict[str, Any]:
         """
