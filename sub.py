@@ -39,6 +39,16 @@ class StreamingQuizResponse(BaseModel):
         """Convert the response to JSON string"""
         return json.dumps(self.model_dump())
 
+class StreamingFlashcardResponse(BaseModel):
+    flashcards: List[Dict[str, str]]
+    is_complete: bool
+    total_flashcards: int
+    current_batch: int
+
+    def to_json(self) -> str:
+        """Convert the response to JSON string"""
+        return json.dumps(self.model_dump())
+
 @lru_cache(maxsize=1000)
 def get_embedding_cached(text: str):
     """Cached version of embedding generation"""
@@ -57,6 +67,7 @@ class OptimizedStudyGenerator:
         chroma_host = os.getenv('CHROMA_HOST', os.getenv('CHROMA_DB_CONNECTION_STRING'))
         chroma_port = int(os.getenv('CHROMA_PORT', 8000))
         self.chroma_client = chromadb.HttpClient(host=chroma_host, port=chroma_port)
+
         # self.executor = ThreadPoolExecutor(max_workers=3)
         self.executor = executor
         self.client = AsyncOpenAI()  # Use 
@@ -132,7 +143,7 @@ class OptimizedStudyGenerator:
           - Indicate the **correct answer** clearly for each question.
           - The questions should test **deep understanding** of the text, focusing on key concepts, terms, or crucial details.
           - Ensure there are no redundant questions, and the questions span a variety of topics from the text.
-          - Ensure answers are evenly distributed among the options (A, B, C, D) instead of being repetitive (e.g., all “B” or “C”).
+          - Ensure answers are evenly distributed among the options (A, B, C, D) instead of being repetitive (e.g., all "B" or "C").
 
           
             Return in JSON format:
@@ -191,6 +202,77 @@ class OptimizedStudyGenerator:
                 logger.error(f"Error generating questions batch {batch_num}: {e}")
                 continue
 
+    async def generate_flashcards_stream(
+        self, content: str, num_flashcards: int, 
+        difficulty: str, batch_size: int
+    ) -> AsyncGenerator[str, None]:
+        """Generate flashcards in batches and yield JSON strings"""
+        flashcards_generated = 0
+        batch_num = 1
+
+        while flashcards_generated < num_flashcards:
+            current_batch = min(batch_size, num_flashcards - flashcards_generated)
+            
+            prompt = f"""
+            Based on the following content, generate {current_batch} flashcards at {difficulty} difficulty level.
+            Each flashcard should test understanding of key concepts and important information.
+
+            Requirements:
+            - Each flashcard must have a question, answer, and hint
+            - Questions should be clear and specific
+            - Answers should be comprehensive but concise
+            - Hints should guide the user without giving away the answer
+            - Focus on testing understanding rather than mere memorization
+            - Ensure variety in the types of questions asked
+            
+            Return in JSON format:
+            {{
+                "flashcards": [
+                    {{
+                        "question": "What is the significance of X?",
+                        "answer": "Comprehensive explanation of X's significance",
+                        "hint": "Think about the role of X in the broader context"
+                    }}
+                ]
+            }}
+            
+            Content:
+            {content}
+            """
+
+            try:
+                response = await self.client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "You are creating educational flashcards."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    response_format={"type": "json_object"},
+                    stream=True
+                )
+
+                response_text = ""
+                async for chunk in response:
+                    if chunk.choices[0].delta.content:
+                        response_text += chunk.choices[0].delta.content
+
+                batch_flashcards = json.loads(response_text).get("flashcards", [])
+                flashcards_generated += len(batch_flashcards)
+
+                response_data = StreamingFlashcardResponse(
+                    flashcards=batch_flashcards,
+                    is_complete=(flashcards_generated >= num_flashcards),
+                    total_flashcards=num_flashcards,
+                    current_batch=batch_num
+                )
+
+                yield response_data.to_json() + "\n"
+                batch_num += 1
+
+            except Exception as e:
+                logger.error(f"Error generating flashcards batch {batch_num}: {e}")
+                continue
+
 # FastAPI App
 app = FastAPI()
 study_generator = OptimizedStudyGenerator()
@@ -229,6 +311,41 @@ async def create_quiz_stream(request: QuizRequest):
 
     except Exception as e:
         logger.error(f"Error in create_quiz_stream: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/generate-flashcards")
+async def create_flashcards_stream(request: QuizRequest):
+    try:
+        start_time = time.time()
+        content, references = await study_generator.get_relevant_content_parallel(
+            request.pdf_ids,
+            request.yt_ids,
+            request.audio_ids
+        )
+        logger.info(f"Content retrieval time: {time.time() - start_time:.2f}s")
+
+        if not content:
+            raise HTTPException(status_code=404, detail="No content found")
+
+        async def stream():
+            async for batch in study_generator.generate_flashcards_stream(
+                content,
+                request.num_questions,
+                request.difficulty,
+                request.batch_size
+            ):
+                try:
+                    batch_data = json.loads(batch)
+                    logger.info(f"Streaming batch {batch_data.get('current_batch', 'unknown')}: {json.dumps(batch_data, indent=2)}")
+                except json.JSONDecodeError:
+                    logger.error("Failed to decode batch JSON")
+                
+                yield batch
+
+        return StreamingResponse(stream(), media_type="application/x-ndjson")
+
+    except Exception as e:
+        logger.error(f"Error in create_flashcards_stream: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
