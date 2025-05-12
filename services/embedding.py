@@ -147,6 +147,9 @@ class MultiFileVectorIndexer:
                     # Get source type for filtering
                     source_type = chunk.metadata.get('source_type', 'unknown')
                     
+                    # Log chunk metadata before building the payload for Pinecone
+                    logger.info(f"Processing chunk for vector_id approx {i}_{len(vectors)}. Metadata keys: {list(chunk.metadata.keys())}, Page value: {chunk.metadata.get('page')}, Line_in_page value: {chunk.metadata.get('line_in_page')}")
+
                     # Build metadata
                     metadata = {
                         'text': chunk.page_content,
@@ -154,8 +157,30 @@ class MultiFileVectorIndexer:
                         'document_id': document_id,
                         'space_id': space_id,
                         'original_source': chunk.metadata.get('source', 'unknown'),
-                        'source_type': source_type
+                        'source_type': source_type,
+                        'page': chunk.metadata.get('page'),
+                        'line_in_page': chunk.metadata.get('line_in_page')
                     }
+                    
+                    # Ensure 'page' is an int or a placeholder like -1
+                    if chunk.metadata.get('page') is None and source_type == 'document':
+                        metadata['page'] = -1 
+                    elif isinstance(chunk.metadata.get('page'), str): # Ensure it's not a string by mistake
+                        try:
+                            metadata['page'] = int(chunk.metadata.get('page'))
+                        except ValueError:
+                            metadata['page'] = -1 # Fallback for non-integer string page
+
+                    # Ensure 'line_in_page' is an int or a placeholder like -1, if it exists
+                    if 'line_in_page' in chunk.metadata and chunk.metadata.get('line_in_page') is None:
+                        metadata['line_in_page'] = -1
+                    elif 'line_in_page' in chunk.metadata and isinstance(chunk.metadata.get('line_in_page'), str):
+                        try:
+                            metadata['line_in_page'] = int(chunk.metadata.get('line_in_page'))
+                        except ValueError:
+                            metadata['line_in_page'] = -1 # Fallback
+                    elif 'line_in_page' not in chunk.metadata: # If not present at all, explicitly set to null/placeholder
+                        metadata['line_in_page'] = -1 # Or None, depending on how Pinecone handles nulls and your query needs
                     
                     # Add YouTube-specific fields if present
                     if source_type == 'youtube_video':
