@@ -164,7 +164,7 @@ class RetrievalEngine:
                     # Try the query with both filters
                     retrieval_results = self.pinecone_index.query(
                         vector=query_embedding, 
-                        top_k=self.top_k, 
+                        top_k=self.top_k * 2,  # Retrieve more results for better reranking  
                         include_metadata=True,
                         filter=filter_dict if filter_dict else None
                     )
@@ -238,7 +238,7 @@ class RetrievalEngine:
                     logger.error(f"Unfiltered query failed: {str(e)}")
                         
             # Format the results into our return structure
-            results = []
+            initial_results = []
             for i, match in enumerate(retrieval_results.get('matches', [])):
                 metadata = match.get('metadata', {})
                 document = metadata.get('text', '')
@@ -261,7 +261,7 @@ class RetrievalEngine:
                     document_id = video_id
                     logger.info(f"Using video_id as document_id for result: {video_id}")
                     
-                results.append(
+                initial_results.append(
                     RetrievalResult(
                         document=document,
                         document_id=document_id,
@@ -271,9 +271,95 @@ class RetrievalEngine:
                         index=i
                     )
                 )
-                
-            logger.info(f"Final result count after all filtering: {len(results)}")
-            return RetrievalResults(results=results, query=query)
+            
+            # Apply semantic reranking using Cohere if we have enough results
+            if len(initial_results) >= 2:
+                try:
+                    logger.info(f"Applying semantic reranking with Cohere on {len(initial_results)} results")
+                    
+                    # Extract texts for reranking
+                    texts = [result.document for result in initial_results]
+                    
+                    # Use Cohere rerank for semantic reranking
+                    rerank_results = self.cohere_client.rerank(
+                        query=query,
+                        documents=texts,
+                        top_n=min(len(texts), self.top_k),
+                        model="rerank-english-v3.0"
+                    )
+                    
+                    # Apply page context boost to keep chunks from same pages together
+                    reranked_with_boost = []
+                    seen_pages = set()
+                    page_frequencies = {}
+                    
+                    # First pass - count page occurrences to identify primary pages
+                    for reranked in rerank_results.results:
+                        orig_idx = reranked.index
+                        original_result = initial_results[orig_idx]
+                        page = original_result.metadata.get('page', -1)
+                        
+                        if page != -1:  # Only count valid pages
+                            page_frequencies[page] = page_frequencies.get(page, 0) + 1
+                    
+                    # Identify primary pages (ones with most relevant chunks)
+                    primary_pages = []
+                    if page_frequencies:
+                        # Sort pages by frequency, highest first
+                        sorted_pages = sorted(page_frequencies.items(), key=lambda x: x[1], reverse=True)
+                        # Take the top 1-2 pages as primary
+                        primary_pages = [p[0] for p in sorted_pages[:2]]
+                        logger.info(f"Identified primary pages for this query: {primary_pages}")
+                    
+                    # Second pass - apply boosting with primary page preference
+                    for reranked in rerank_results.results:
+                        orig_idx = reranked.index
+                        original_result = initial_results[orig_idx]
+                        page = original_result.metadata.get('page', -1)
+                        
+                        # Calculate boost factors
+                        primary_page_boost = 0.05 if page in primary_pages else 0
+                        continuity_boost = 0.02 if page in seen_pages else 0
+                        seen_pages.add(page)
+                        
+                        # Apply final boost
+                        total_boost = primary_page_boost + continuity_boost
+                        new_score = reranked.relevance_score + total_boost
+                        
+                        logger.info(f"Reranked doc {orig_idx} (page {page}): "
+                                   f"cohere={reranked.relevance_score}, "
+                                   f"boost={total_boost}, "
+                                   f"final={new_score}")
+                        
+                        # Create boosted result
+                        reranked_with_boost.append(
+                            RetrievalResult(
+                                document=original_result.document,
+                                document_id=original_result.document_id,
+                                space_id=original_result.space_id,
+                                relevance_score=new_score,
+                                metadata=original_result.metadata,
+                                index=original_result.index
+                            )
+                        )
+                    
+                    # Sort by adjusted score
+                    final_results = sorted(reranked_with_boost, key=lambda x: x.relevance_score, reverse=True)
+                    
+                    # Take the top_k results
+                    final_results = final_results[:self.top_k]
+                    logger.info(f"Reranking produced {len(final_results)} results with improved ordering")
+                    
+                    return RetrievalResults(results=final_results, query=query)
+                    
+                except Exception as rerank_err:
+                    logger.error(f"Error during semantic reranking: {str(rerank_err)}")
+                    logger.warning("Falling back to vector similarity ranking")
+                    # Fall back to initial results
+            
+            # If reranking wasn't applied or failed, use the initial results
+            logger.info(f"Final result count after all filtering: {len(initial_results)}")
+            return RetrievalResults(results=initial_results[:self.top_k], query=query)
                 
         except Exception as e:
             logger.error(f"Error querying Pinecone: {str(e)}")
