@@ -25,7 +25,6 @@ import shutil
 from openai import OpenAI
 from youtube_transcript_api import YouTubeTranscriptApi
 import groq
-from youtube_transcript_api.proxies import WebshareProxyConfig
 import sys
 
 
@@ -1525,22 +1524,15 @@ async def extract_youtube_transcript(request: YouTubeTranscriptExtractRequest):
         # Get video thumbnail
         thumbnail = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
         
-        # Set up Webshare proxy for YouTubeTranscriptApi
-        proxy_config = WebshareProxyConfig(
-            proxy_username="bfmbilto-rotate",
-            proxy_password="m0j4g39bo8sy"
-        )
-        YouTubeTranscriptApi.proxies = [proxy_config]
-        
         try:
-            # Try to get English transcript first
-            transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+            # Try to get English transcript first using the instance method (proxy-enabled)
+            transcript = youtube_processor.transcript_api.get_transcript(video_id, languages=['en'])
             full_text = youtube_processor._transcript_to_text(transcript)
         except Exception as e:
             logger.error(f"Error getting English transcript: {e}")
             try:
                 # If English not available, get transcript in any language and translate
-                transcript = YouTubeTranscriptApi.get_transcript(video_id)
+                transcript = youtube_processor.transcript_api.get_transcript(video_id)
                 
                 # Extract raw text from transcript
                 raw_text = " ".join([line['text'] for line in transcript])
