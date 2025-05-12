@@ -43,7 +43,7 @@ class YouTubeTranscriptProcessor:
         self.yt_api_url = os.getenv('YT_API_URL', 'https://pdf-ocr-staging-production.up.railway.app')
         
         # Set up Webshare proxy for YouTubeTranscriptApi
-        proxy_username = "bfmbilto"
+        proxy_username = "bfmbilto-rotate"
         proxy_password = "m0j4g39bo8sy"
         
         if proxy_username and proxy_password:
