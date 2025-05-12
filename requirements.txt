@@ -33,3 +33,4 @@ cohere>=4.37
 pytube
 pypdf
 unstructured
+requests>=2.31.0

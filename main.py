@@ -44,6 +44,8 @@ from services.reranking import RetrievalEngine
 from services.response_generator import ResponseGenerator
 from services.legacy_rag import RAGSystem
 from services.youtube_processing import YouTubeTranscriptProcessor
+# Import our new WetroCloud service
+from services.wetrocloud_youtube import WetroCloudYouTubeService
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -708,60 +710,32 @@ async def create_flashcards(space_id: str, request: QuizRequest):
 
 @app.get("/yt-transcript")
 async def get_yt_transcript(request: YTTranscriptRequest):
-    # Extract video ID from various YouTube URL formats
-    if "youtu.be/" in request.yt_link:
-        # Handle youtu.be format
-        yt_id = request.yt_link.split("youtu.be/")[1].split("?")[0]
-        print(yt_id)
-    elif "youtube.com/watch?v=" in request.yt_link:
-        # Handle youtube.com format
-        yt_id = request.yt_link.split("watch?v=")[1].split("&")[0]
-        print(yt_id)
-    else:
-        raise HTTPException(status_code=400, detail="Invalid YouTube URL format")
-    
     try:
-        # Initialize YouTube processor
-        youtube_processor = YouTubeTranscriptProcessor()
+        # Initialize WetroCloud YouTube service
+        wetrocloud_service = WetroCloudYouTubeService()
         
-        # Get video thumbnail
-        thumbnail = f"https://img.youtube.com/vi/{yt_id}/maxresdefault.jpg"
+        # Extract video ID for thumbnail
+        video_id = wetrocloud_service.extract_video_id(request.yt_link)
+        if not video_id:
+            raise HTTPException(status_code=400, detail="Invalid YouTube URL format")
         
-        try:
-            # Try to get English transcript first
-            transcript = youtube_processor.transcript_api.get_transcript(yt_id, languages=['en'])
-            full_text = youtube_processor._transcript_to_text(transcript)
-        except Exception as e:
-            logger.error(f"Error getting English transcript: {e}")
-            try:
-                # If English not available, get transcript in any language and translate
-                transcript = youtube_processor.transcript_api.get_transcript(yt_id)
-                
-                # Extract raw text from transcript
-                raw_text = " ".join([line['text'] for line in transcript])
-                
-                # Translate using Groq
-                response = youtube_processor.groq_client.chat.completions.create(
-                    model="meta-llama/llama-4-scout-17b-16e-instruct",
-                    messages=[
-                        {"role": "system", "content": "You are a translator. Translate the following text to English:"},
-                        {"role": "user", "content": raw_text}
-                    ]
-                )
-                
-                full_text = response.choices[0].message.content
-            except Exception as translate_error:
-                logger.error(f"Failed to get and translate transcript: {translate_error}")
-                return {
-                    "status": "error",
-                    "message": f"Failed to get transcript for video: {str(e)}, {str(translate_error if 'translate_error' in locals() else '')}"
-                }
+        # Get transcript using WetroCloud API
+        transcript_result = wetrocloud_service.get_transcript(request.yt_link)
+        
+        if not transcript_result.get('success'):
+            return {
+                "status": "error",
+                "message": transcript_result.get('message', "Failed to get transcript for video")
+            }
+        
+        # Get thumbnail URL
+        thumbnail = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
         
         return {
             "status": "success",
-            "video_id": yt_id,
+            "video_id": video_id,
             "thumbnail": thumbnail,
-            "transcript": full_text
+            "transcript": transcript_result['text']
         }
     
     except Exception as e:
@@ -1510,11 +1484,11 @@ async def extract_youtube_transcript(request: YouTubeTranscriptExtractRequest):
     Extract transcript from a YouTube video without processing or indexing
     """
     try:
-        # Initialize YouTube processor
-        youtube_processor = YouTubeTranscriptProcessor()
+        # Initialize WetroCloud YouTube service
+        wetrocloud_service = WetroCloudYouTubeService()
         
         # Extract video ID from URL
-        video_id = youtube_processor._extract_video_id(request.video_url)
+        video_id = wetrocloud_service.extract_video_id(request.video_url)
         if not video_id:
             return {
                 "status": "error",
@@ -1524,41 +1498,20 @@ async def extract_youtube_transcript(request: YouTubeTranscriptExtractRequest):
         # Get video thumbnail
         thumbnail = f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
         
-        try:
-            # Try to get English transcript first using the instance method (proxy-enabled)
-            transcript = youtube_processor.transcript_api.get_transcript(video_id, languages=['en'])
-            full_text = youtube_processor._transcript_to_text(transcript)
-        except Exception as e:
-            logger.error(f"Error getting English transcript: {e}")
-            try:
-                # If English not available, get transcript in any language and translate
-                transcript = youtube_processor.transcript_api.get_transcript(video_id)
-                
-                # Extract raw text from transcript
-                raw_text = " ".join([line['text'] for line in transcript])
-                
-                # Translate using Groq
-                response = youtube_processor.groq_client.chat.completions.create(
-                    model="meta-llama/llama-4-scout-17b-16e-instruct",
-                    messages=[
-                        {"role": "system", "content": "You are a translator. Translate the following text to English:"},
-                        {"role": "user", "content": raw_text}
-                    ]
-                )
-                
-                full_text = response.choices[0].message.content
-            except Exception as translate_error:
-                logger.error(f"Failed to get and translate transcript: {translate_error}")
-                return {
-                    "status": "error",
-                    "message": f"Failed to get transcript for video: {str(e)}, {str(translate_error if 'translate_error' in locals() else '')}"
-                }
+        # Get transcript using WetroCloud API
+        transcript_result = wetrocloud_service.get_transcript(request.video_url)
+        
+        if not transcript_result.get('success'):
+            return {
+                "status": "error",
+                "message": transcript_result.get('message', "Failed to get transcript for video")
+            }
         
         return {
             "status": "success",
             "video_id": video_id,
             "thumbnail": thumbnail,
-            "transcript": full_text
+            "transcript": transcript_result['text']
         }
     
     except Exception as e:

@@ -11,6 +11,9 @@ import groq
 from langchain.docstore.document import Document
 from pytube import YouTube
 
+# Import our new WetroCloud service
+from services.wetrocloud_youtube import WetroCloudYouTubeService
+
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -42,7 +45,7 @@ class YouTubeTranscriptProcessor:
         # Get YouTube title API URL from environment
         self.yt_api_url = os.getenv('YT_API_URL', 'https://pdf-ocr-staging-production.up.railway.app')
         
-        # Set up Webshare proxy for YouTubeTranscriptApi
+        # Set up Webshare proxy for YouTubeTranscriptApi (legacy support)
         proxy_username = "bfmbilto"
         proxy_password = "m0j4g39bo8sy"
         
@@ -57,6 +60,10 @@ class YouTubeTranscriptProcessor:
         else:
             self.transcript_api = YouTubeTranscriptApi()
             logger.info("YouTubeTranscriptProcessor initialized without proxy configuration")
+            
+        # Initialize WetroCloud YouTube service
+        self.wetrocloud_service = WetroCloudYouTubeService()
+        logger.info("WetroCloud YouTube service initialized")
 
     def process_videos(self, video_urls: List[str], space_id: str) -> Dict[str, Any]:
         """
@@ -159,6 +166,7 @@ class YouTubeTranscriptProcessor:
     def process_single_video(self, video_url: str, space_id: str) -> Dict[str, Any]:
         """
         Process a single YouTube video, extract transcript, and store in Supabase.
+        Now uses WetroCloud service for transcript extraction.
         
         Args:
             video_url: YouTube video URL
@@ -171,7 +179,7 @@ class YouTubeTranscriptProcessor:
         
         try:
             # Extract video ID from URL
-            video_id = self._extract_video_id(video_url)
+            video_id = self.wetrocloud_service.extract_video_id(video_url)
             if not video_id:
                 return {
                     'documents': [],
@@ -183,8 +191,8 @@ class YouTubeTranscriptProcessor:
             # Get video thumbnail
             thumbnail = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
             
-            # Try to get transcript with fallback translation
-            transcript_result = self._get_transcript_with_fallback(video_id)
+            # Get transcript using WetroCloud API
+            transcript_result = self.wetrocloud_service.get_transcript(video_url)
             if not transcript_result.get('success'):
                 return {
                     'documents': [],
@@ -196,7 +204,7 @@ class YouTubeTranscriptProcessor:
             full_text = transcript_result['text']
             
             # Extract basic video metadata
-            video_title = self._extract_video_title(video_url, video_id)
+            video_title = self.wetrocloud_service.get_video_title(video_url, self.yt_api_url)
             
             # Insert into Supabase yts table
             try:
@@ -264,8 +272,10 @@ class YouTubeTranscriptProcessor:
                 'message': f'Error processing YouTube video {video_url}: {str(e)}'
             }
 
+    # Keep the legacy methods for backward compatibility
     def _extract_video_id(self, video_url: str) -> Optional[str]:
         """
+        Legacy method for backward compatibility.
         Extract video ID from various YouTube URL formats.
         
         Args:
@@ -274,31 +284,11 @@ class YouTubeTranscriptProcessor:
         Returns:
             Video ID if found, None otherwise
         """
-        if not video_url:
-            return None
-            
-        try:
-            if "youtu.be/" in video_url:
-                # Handle youtu.be format
-                return video_url.split("youtu.be/")[1].split("?")[0].split("&")[0]
-            elif "youtube.com/watch?v=" in video_url:
-                # Handle youtube.com format
-                return video_url.split("watch?v=")[1].split("&")[0]
-            elif "youtube.com/v/" in video_url:
-                # Handle youtube.com/v/ format
-                return video_url.split("/v/")[1].split("?")[0].split("&")[0]
-            elif "youtube.com/embed/" in video_url:
-                # Handle embed format
-                return video_url.split("/embed/")[1].split("?")[0].split("&")[0]
-            else:
-                logger.warning(f"Unrecognized YouTube URL format: {video_url}")
-                return None
-        except Exception as e:
-            logger.error(f"Error extracting video ID from {video_url}: {e}")
-            return None
+        return self.wetrocloud_service.extract_video_id(video_url)
 
     def _transcript_to_text(self, transcript: List[Dict[str, Any]]) -> str:
         """
+        Legacy method for backward compatibility.
         Convert YouTube transcript format to plain text while preserving timestamps.
         
         Args:
@@ -335,6 +325,7 @@ class YouTubeTranscriptProcessor:
             
     def _get_transcript_with_fallback(self, video_id: str) -> Dict[str, Any]:
         """
+        Legacy method for backward compatibility.
         Get transcript with fallback to translation if needed.
         
         Args:
@@ -343,49 +334,24 @@ class YouTubeTranscriptProcessor:
         Returns:
             Dictionary with success status and transcript text
         """
-        # Try to get English transcript first
-        try:
-            transcript = self.transcript_api.get_transcript(video_id, languages=['en'])
-            full_text = self._transcript_to_text(transcript)
-            return {'success': True, 'text': full_text}
-        except Exception as en_error:
-            logger.warning(f"Error getting English transcript for {video_id}: {en_error}")
-            
-            # Try to get transcript in any language and translate
-            try:
-                transcript = self.transcript_api.get_transcript(video_id)
-                
-                # Check if we got a valid transcript
-                if not transcript:
-                    return {
-                        'success': False, 
-                        'message': f'No transcript available for video {video_id}'
-                    }
-                
-                # Extract raw text from transcript
-                raw_text = " ".join([line['text'] for line in transcript])
-                
-                # Translate using Groq
-                response = self.groq_client.chat.completions.create(
-                    model="meta-llama/llama-4-scout-17b-16e-instruct",  # Using Llama model from Groq
-                    messages=[
-                        {"role": "system", "content": "You are a translator. Translate the following text to English:"},
-                        {"role": "user", "content": raw_text}
-                    ]
-                )
-                
-                translated_text = response.choices[0].message.content
-                return {'success': True, 'text': translated_text}
-                
-            except Exception as translate_error:
-                logger.error(f"Failed to get and translate transcript for {video_id}: {translate_error}")
-                return {
-                    'success': False,
-                    'message': f'Transcript retrieval failed: {str(translate_error)}'
-                }
+        # Get the full video URL from ID
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        
+        # Use the WetroCloud service
+        transcript_result = self.wetrocloud_service.get_transcript(video_url)
+        
+        # Return in the format expected by other methods
+        if transcript_result.get('success'):
+            return {'success': True, 'text': transcript_result['text']}
+        else:
+            return {
+                'success': False, 
+                'message': transcript_result.get('message', f'Failed to get transcript for video {video_id}')
+            }
     
     def _extract_video_title(self, video_url: str, video_id: str) -> str:
         """
+        Legacy method for backward compatibility.
         Extract title for the video using the YouTube title API.
         
         Args:
@@ -395,27 +361,7 @@ class YouTubeTranscriptProcessor:
         Returns:
             Video title
         """
-        print('video_url here', video_url)
-        print('video_id here', video_id)
-        try:
-            # Use API to get video title
-            response = requests.post(
-                f"{self.yt_api_url}/yt-video-title",
-                json={'url': video_url}
-            )
-            response.raise_for_status()
-            data = response.json()
-            print('data yt', data)
-            if data and 'title' in data:
-                return data['title']
-            else:
-                logger.warning(f"API did not return a title for video {video_id}")
-                return f"YouTube Video: {video_id}"
-              
-        except Exception as title_error:
-            logger.warning(f"Error getting video title from API: {title_error}")
-            # Default title using video ID if API fails
-            return f"YouTube Video: {video_id}"
+        return self.wetrocloud_service.get_video_title(video_url, self.yt_api_url)
 
     def generate_and_update_space_name(self, space_id: str, texts: List[str], max_words: int = 5) -> Dict[str, Any]:
         """
