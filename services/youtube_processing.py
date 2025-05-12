@@ -49,7 +49,8 @@ class YouTubeTranscriptProcessor:
         if proxy_username and proxy_password:
             proxy_config = WebshareProxyConfig(
                 proxy_username=proxy_username,
-                proxy_password=proxy_password
+                proxy_password=proxy_password,
+                proxy_port=6540
             )
             self.transcript_api = YouTubeTranscriptApi(proxy_config=proxy_config)
             logger.info("YouTubeTranscriptProcessor initialized with proxy configuration")
