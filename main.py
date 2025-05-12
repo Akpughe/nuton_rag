@@ -1527,7 +1527,7 @@ async def extract_youtube_transcript(request: YouTubeTranscriptExtractRequest):
         
         # Set up Webshare proxy for YouTubeTranscriptApi
         proxy_config = WebshareProxyConfig(
-            proxy_username="bfmbilto",
+            proxy_username="bfmbilto-rotate",
             proxy_password="m0j4g39bo8sy"
         )
         YouTubeTranscriptApi.proxies = [proxy_config]
