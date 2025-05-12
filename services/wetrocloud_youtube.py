@@ -163,37 +163,70 @@ class WetroCloudYouTubeService:
             # Fallback to simple concatenation
             return " ".join([entry.get('text', '') for entry in transcript_entries if entry.get('text')])
     
-    def get_video_title(self, video_url: str, yt_api_url: str = None) -> str:
+    def get_video_title(self, video_url: str, video_id: Optional[str] = None) -> str:
         """
-        Get the title of a YouTube video.
+        Extract title for the video using the YouTube title API.
         
         Args:
             video_url: YouTube video URL
-            yt_api_url: Optional URL for title API fallback
+            video_id: YouTube video ID
             
         Returns:
-            Video title or default title with video ID
+            Video title
         """
-        video_id = self.extract_video_id(video_url)
-        if not video_id:
-            return "Unknown YouTube Video"
-        
+        print('video_url here', video_url)
+        print('video_id here', video_id)
         try:
-            # Try using existing title API if URL provided
-            if yt_api_url:
-                response = requests.post(
-                    f"{yt_api_url}/yt-video-title",
-                    json={'url': video_url}
-                )
-                response.raise_for_status()
-                data = response.json()
-                
-                if data and 'title' in data:
-                    return data['title']
-            
-            # Default title using video ID
-            return f"YouTube Video: {video_id}"
+            # Use API to get video title
+            response = requests.post(
+                f"{self.yt_api_url}/yt-video-title",
+                json={'url': video_url}
+            )
+            response.raise_for_status()
+            data = response.json()
+            print('data yt', data)
+            if data and 'title' in data:
+                return data['title']
+            else:
+                logger.warning(f"API did not return a title for video {video_id}")
+                return f"YouTube Video: {video_id}"
               
-        except Exception as e:
-            logger.warning(f"Error getting video title: {e}")
-            return f"YouTube Video: {video_id}" 
+        except Exception as title_error:
+            logger.warning(f"Error getting video title from API: {title_error}")
+            # Default title using video ID if API fails
+            return f"YouTube Video: {video_id}"
+        
+    # def get_video_title(self, video_url: str, yt_api_url: str = None) -> str:
+    #     """
+    #     Get the title of a YouTube video.
+        
+    #     Args:
+    #         video_url: YouTube video URL
+    #         yt_api_url: Optional URL for title API fallback
+            
+    #     Returns:
+    #         Video title or default title with video ID
+    #     """
+    #     video_id = self.extract_video_id(video_url)
+    #     if not video_id:
+    #         return "Unknown YouTube Video"
+        
+    #     try:
+    #         # Try using existing title API if URL provided
+    #         if yt_api_url:
+    #             response = requests.post(
+    #                 f"{yt_api_url}/yt-video-title",
+    #                 json={'url': video_url}
+    #             )
+    #             response.raise_for_status()
+    #             data = response.json()
+                
+    #             if data and 'title' in data:
+    #                 return data['title']
+            
+    #         # Default title using video ID
+    #         return f"YouTube Video: {video_id}"
+              
+    #     except Exception as e:
+    #         logger.warning(f"Error getting video title: {e}")
+    #         return f"YouTube Video: {video_id}" 

@@ -361,7 +361,7 @@ class YouTubeTranscriptProcessor:
         Returns:
             Video title
         """
-        return self.wetrocloud_service.get_video_title(video_url, self.yt_api_url)
+        return self.wetrocloud_service.get_video_title(video_url)
 
     def generate_and_update_space_name(self, space_id: str, texts: List[str], max_words: int = 5) -> Dict[str, Any]:
         """
