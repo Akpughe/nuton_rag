@@ -677,6 +677,7 @@ class PineconeStudyGenerator:
         """
         flashcards_generated = 0
         batch_num = 1
+        generated_flashcard_questions = set() # Keep track of generated questions
         
         # We only support detailed flashcards
         logger.info("Generating detailed flashcards only")
@@ -745,6 +746,7 @@ class PineconeStudyGenerator:
             - Focus on key concepts, important facts, and significant details
             - BREVITY IS CRITICAL - keep all answers short and to the point
             - Avoid ambiguous answers or questions with multiple possible answers
+            - Ensure all questions are unique and not repetitions of previously generated questions in this session.
             
             Content:
             {content}
@@ -822,6 +824,11 @@ class PineconeStudyGenerator:
                     # Skip if we've reached our target count
                     if len(validated_flashcards) >= current_batch:
                         break
+                    
+                    # Skip if this question has already been generated
+                    if card.get("question") in generated_flashcard_questions:
+                        logger.info(f"Skipping duplicate flashcard question: {card.get('question')}")
+                        continue
                         
                     # Enforce answer length limits
                     if len(card["answer"].split()) > 30:
@@ -841,6 +848,8 @@ class PineconeStudyGenerator:
                             card["hint"] += "."
                     
                     validated_flashcards.append(card)
+                    if card.get("question"):
+                        generated_flashcard_questions.add(card["question"])
                 
                 num_cards = len(validated_flashcards)
                 flashcards_generated += num_cards
