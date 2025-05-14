@@ -134,6 +134,17 @@ class MultiFileDocumentProcessor:
                 processed_documents = []
                 if file_extension == 'pdf': # Apply line-level splitting only for PDFs for now
                     for page_doc in page_level_documents:
+                        # Make a mutable copy of the original page's metadata
+                        current_page_metadata = page_doc.metadata.copy()
+                        
+                        # Convert 0-indexed 'page' from PyPDFLoader to 1-indexed 'page_display'
+                        raw_page_number = current_page_metadata.get('page')
+                        if isinstance(raw_page_number, int):
+                            current_page_metadata['page_display'] = raw_page_number + 1
+                        else:
+                            # If 'page' is not found or not an int, set a placeholder
+                            current_page_metadata['page_display'] = -1 # Indicates unknown or not applicable
+
                         page_content_str = page_doc.page_content
                         if isinstance(page_content_str, bytes):
                             page_content_str = page_content_str.decode('utf-8', errors='replace')
@@ -141,33 +152,45 @@ class MultiFileDocumentProcessor:
                         lines = page_content_str.splitlines()
                         for line_idx, line_text in enumerate(lines):
                             if line_text.strip(): # Process non-empty lines
-                                line_metadata = page_doc.metadata.copy() # Start with page-level metadata
+                                line_metadata = current_page_metadata.copy() # Inherits 'page' and 'page_display'
                                 line_metadata['line_in_page'] = line_idx
-                                # 'page' metadata should already be in page_doc.metadata from PyPDFLoader
+                                # 'page' metadata (0-indexed) is still there from PyPDFLoader
+                                # 'page_display' (1-indexed) is now also available
                                 
                                 # Filter to only printable characters for the line
-                                printable_line_text = ''.join(char for char in line_text if char.isprintable() or char in ['\n', '\t'])
+                                printable_line_text = ''.join(char for char in line_text if char.isprintable() or char in ['\\n', '\\t'])
                                 
                                 processed_documents.append(
                                     Document(page_content=printable_line_text, metadata=line_metadata)
                                 )
                     if not processed_documents: # Fallback if all lines were empty or pdf was empty
                         # Add page-level docs if line splitting resulted in nothing (e.g. image-only pdf page)
-                        # We still need to clean their content
+                        # We still need to clean their content and ensure 'page_display' is set
                         for page_doc in page_level_documents:
-                             page_content_str = page_doc.page_content
-                             if isinstance(page_content_str, bytes):
-                                 page_content_str = page_content_str.decode('utf-8', errors='replace')
-                             printable_page_content = ''.join(char for char in page_content_str if char.isprintable() or char in ['\n', '\t'])
-                             page_doc.page_content = printable_page_content
+                            # Ensure 'page_display' is set if not already (e.g. if this path is taken directly)
+                            if 'page_display' not in page_doc.metadata:
+                                raw_page_number = page_doc.metadata.get('page')
+                                if isinstance(raw_page_number, int):
+                                    page_doc.metadata['page_display'] = raw_page_number + 1
+                                else:
+                                    page_doc.metadata['page_display'] = -1
+
+                            page_content_str = page_doc.page_content
+                            if isinstance(page_content_str, bytes):
+                                page_content_str = page_content_str.decode('utf-8', errors='replace')
+                            printable_page_content = ''.join(char for char in page_content_str if char.isprintable() or char in ['\\n', '\\t'])
+                            page_doc.page_content = printable_page_content
                         processed_documents.extend(page_level_documents)
 
                 else: # For non-PDFs, use page_level_documents directly after cleaning
+                    # For non-PDFs, 'page' metadata might not exist or be 0-indexed.
+                    # We can leave them as is or decide on a convention if needed.
+                    # For now, just ensure content cleaning.
                     for doc in page_level_documents:
                         page_content_str = doc.page_content
                         if isinstance(page_content_str, bytes):
                             page_content_str = page_content_str.decode('utf-8', errors='replace')
-                        printable_content = ''.join(char for char in page_content_str if char.isprintable() or char in ['\n', '\t'])
+                        printable_content = ''.join(char for char in page_content_str if char.isprintable() or char in ['\\n', '\\t'])
                         doc.page_content = printable_content
                     processed_documents.extend(page_level_documents)
 
@@ -238,7 +261,7 @@ class MultiFileDocumentProcessor:
                             full_text_from_textract = full_text_from_textract.decode('utf-8', errors='replace')
                         
                         # Filter to only printable characters
-                        full_text_from_textract = ''.join(char for char in full_text_from_textract if char.isprintable() or char in ['\n', '\t'])
+                        full_text_from_textract = ''.join(char for char in full_text_from_textract if char.isprintable() or char in ['\\n', '\\t'])
                         
                         # Prepare Supabase data
                         supabase_data = {
@@ -328,7 +351,7 @@ class MultiFileDocumentProcessor:
             full_text = full_text.decode('utf-8', errors='replace')
         
         # Filter to only printable characters
-        full_text = ''.join(char for char in full_text if char.isprintable() or char in ['\n', '\t', ' '])
+        full_text = ''.join(char for char in full_text if char.isprintable() or char in ['\\n', '\\t', ' '])
         
         # Prepare metadata
         metadata = {
