@@ -1,3 +1,46 @@
 to run
 python3 -m venv venv  
  uvicorn main:app
+
+- Use WetroCloud to extract (optional)
+- Use Chonkie to implement chunking of the Document (Create a new file to handle this for Docs)
+  - Use the Recursive Chunker: https://docs.chonkie.ai/api-reference/recursive-chunker
+- Index and Upsert to Pinecone
+  - Docs to Index on Pinecone: https://docs.pinecone.io/guides/index-data/create-an-index
+  - Docs to Upsert on Pinecone: https://docs.pinecone.io/guides/index-data/upsert-data
+- Embedding using Chonkie
+
+  - Docs for embedding with Chonkie: https://docs.chonkie.ai/api-reference/embeddings-refinery
+  - Use: text-embedding-ada-002 as the embedding model
+
+- Retrieval from Pinecone:
+
+  - Use Hybrid Search in Pinecone
+    - Doc for Hybrid Search: https://docs.pinecone.io/guides/search/hybrid-search
+    - Also filter for metadata like the document_id: https://docs.pinecone.io/guides/search/filter-by-metadata
+  - Use Groq as the Initial with Llama 4 and OpenAI as a fallback
+
+- Also ensure to implement reranking:
+  Doc for reranking: https://docs.pinecone.io/guides/search/rerank-results
+
+- Ensure to optimize Pinecone for relevance
+  - Guide here: https://docs.pinecone.io/guides/search/rerank-results
+
+Process:
+Ingesting and Chunking -> Embedding -> Indexing and Upserting to Pinecone () -> Retrieval and Generation
+
+Ingesting and Chunking - Chonkie handles this, ensure to check the documentations
+Embedding - Chonkie can handle this too, check the documentation
+Indexing and Upserting to Pinecone
+Retrieval and Generation: Hybrid search using Pinecone, Generation using Groq (Llama 4)
+
+Optimize for speed, accuracy and quality
+
+Note:I did not add a document Ingestion process for documents because Chonkie handles the part then also chunks and embeds the data.
+
+Your RAG system works as follows:
+
+- Ingestion: Documents (PDF, Word, PPTX) and YouTube videos are processed to extract text and metadata, then stored in Supabase.
+- Chunking: The extracted text is split into semantic chunks, each retaining detailed metadata.
+- Embedding & Indexing: Each chunk is converted into a vector embedding and stored in Pinecone for fast similarity search.
+- Retrieval & Generation: At query time, relevant chunks are retrieved from Pinecone and passed to an LLM (Groq or OpenAI) to generate a context-aware answer.
