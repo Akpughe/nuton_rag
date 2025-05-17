@@ -21,7 +21,8 @@ logging.basicConfig(level=logging.INFO)
 
 
 def chunk_document(
-    file_path: str,
+    file_path: Optional[str] = None,
+    text: Optional[str] = None,
     chunk_size: int = 512,
     overlap_tokens: int = 80,
     tokenizer: str = "gpt2",
@@ -31,37 +32,66 @@ def chunk_document(
     return_type: str = "chunks"
 ) -> List[Dict[str, Any]]:
     """
-    Chunk a document using Chonkie's recursive chunker API (multipart/form-data, file upload).
+    Chunk a document using Chonkie's recursive chunker API.
+    Can process either a file upload or direct text input.
+    
     Args:
-        file_path: Path to the file to chunk.
+        file_path: Path to the file to chunk. Optional if text is provided.
+        text: Text to chunk directly. Optional if file_path is provided.
         chunk_size: Target chunk size in tokens.
         overlap_tokens: Number of tokens to overlap between chunks.
         tokenizer: Tokenizer to use (e.g., 'gpt2').
-        recipe: Chunking recipe (default: 'default').
+        recipe: Chunking recipe (default: 'markdown').
         lang: Language code (default: 'en').
         min_characters_per_chunk: Minimum characters per chunk (default: 12).
         return_type: Output type (default: 'chunks').
     Returns:
         List of chunk dicts with 'text', 'start', 'end', and 'metadata'.
     Raises:
-        Exception if the API call fails.
+        Exception if the API call fails or if neither file_path nor text is provided.
     """
-    logging.info(f"Chunking document: {file_path}")
+    if not file_path and not text:
+        error_msg = "Either file_path or text must be provided"
+        logging.error(error_msg)
+        raise ValueError(error_msg)
+    
     url = f"{CHONKIE_BASE_URL}/v1/chunk/recursive"
-    with open(file_path, "rb") as f:
-        files = {"file": (os.path.basename(file_path), f)}
-        data = {
-            "tokenizer_or_token_counter": tokenizer,
-            "chunk_size": str(chunk_size),
-            "overlap_tokens": str(overlap_tokens),
-            "recipe": recipe,
-            "lang": lang,
-            "min_characters_per_chunk": str(min_characters_per_chunk),
-            "return_type": return_type
-        }
-        headers = HEADERS.copy()
-        headers.pop("Content-Type", None)  # Let requests set the boundary
-        resp = requests.post(url, files=files, data=data, headers=headers, timeout=120)
+    
+    # Common parameters for both methods
+    common_params = {
+        "tokenizer_or_token_counter": tokenizer,
+        "chunk_size": str(chunk_size),
+        "overlap_tokens": str(overlap_tokens),
+        "recipe": recipe,
+        "lang": lang,
+        "min_characters_per_chunk": str(min_characters_per_chunk),
+        "return_type": return_type
+    }
+    
+    if text is not None:
+        # Process via direct text input (JSON request)
+        logging.info("Chunking document from direct text input")
+        
+        # Add text to the JSON payload
+        json_payload = common_params.copy()
+        json_payload["text"] = text
+        
+        # Use the original headers with Content-Type: application/json
+        resp = requests.post(url, json=json_payload, headers=HEADERS)
+    else:
+        # Process via file upload (multipart/form-data)
+        logging.info(f"Chunking document from file: {file_path}")
+        
+        with open(file_path, "rb") as f:
+            files = {"file": (os.path.basename(file_path), f)}
+            
+            # Remove Content-Type so requests can set the correct multipart boundary
+            headers = HEADERS.copy()
+            headers.pop("Content-Type", None)
+            
+            resp = requests.post(url, files=files, data=common_params, headers=headers)
+    
+    # Handle response
     if resp.status_code != 200:
         logging.error(f"Chonkie chunking failed: {resp.status_code} {resp.text}")
         raise Exception(f"Chonkie chunking failed: {resp.status_code} {resp.text}")
