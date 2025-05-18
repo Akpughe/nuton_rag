@@ -9,7 +9,7 @@ load_dotenv()
 
 # Environment variables
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "docs")
+PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "nuton-index")
 
 # Index names
 DENSE_INDEX = f"{PINECONE_INDEX_NAME}-dense"
@@ -181,6 +181,7 @@ def hybrid_search(
         filter=filter_dict,
         include_metadata=True
     )
+    # print('dense_results', dense_results)
     
     # Query sparse if available
     sparse_results = None
