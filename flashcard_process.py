@@ -9,7 +9,7 @@ from chonkie_client import embed_query, embed_query_v2
 from pinecone_client import hybrid_search
 from pinecone_client import rerank_results
 import openai_client
-from supabase_client import update_generated_content
+from supabase_client import update_generated_content, get_generated_content_id, insert_flashcard_set
 
 def generate_flashcards(
     document_id: str,
@@ -35,10 +35,10 @@ def generate_flashcards(
     """
     logging.info(f"Generating flashcards for document {document_id}, space_id: {space_id}")
     
-    # Initialize status in database
+    # Initialize status in database with empty set
     update_generated_content(
         document_id,
-        {"flashcards": [], "status": "processing", "updated_at": datetime.now().isoformat()}
+        {"flashcards": [{"set_id": 1, "cards": []}], "status": "processing", "updated_at": datetime.now().isoformat()}
     )
     
     try:
@@ -94,7 +94,8 @@ def generate_flashcards(
         
         # Create a shared state for tracking accumulated flashcards and database updates
         shared_state = {
-            "accumulated_flashcards": [],
+            "accumulated_cards": [],
+            "set_id": 1,
             "update_threshold": 5,  # Update DB every 5 flashcards
             "last_update_count": 0,
             "document_id": document_id,
@@ -108,15 +109,47 @@ def generate_flashcards(
         )
         
         # Final update to the database with all flashcards (after deduplication)
+        # Use the new format
         update_generated_content(
             document_id,
-            {"flashcards": flashcards, "status": "completed", "updated_at": datetime.now().isoformat()}
+            {
+                "flashcards": [
+                    {
+                        "set_id": shared_state["set_id"],
+                        "cards": flashcards
+                    }
+                ], 
+                "status": "completed", 
+                "updated_at": datetime.now().isoformat()
+            }
         )
+        
+        # Now insert the complete set to flashcard_sets
+        try:
+            # Get content_id for this document
+            content_id = get_generated_content_id(document_id)
+            
+            # Insert the complete set
+            logging.info(f"Inserting complete flashcard set with {len(flashcards)} cards")
+            insert_flashcard_set(content_id, flashcards, shared_state["set_id"])
+        except Exception as e:
+            logging.error(f"Error storing complete flashcard set: {e}")
         
         elapsed_time = (datetime.now() - start_time).total_seconds()
         logging.info(f"Flashcard generation completed in {elapsed_time:.2f} seconds. Generated {len(flashcards)} flashcards.")
         
-        return {"flashcards": flashcards, "status": "success", "elapsed_seconds": elapsed_time, "total_flashcards": len(flashcards), "num_questions": num_questions}
+        return {
+            "flashcards": [
+                {
+                    "set_id": shared_state["set_id"],
+                    "cards": flashcards
+                }
+            ], 
+            "status": "success", 
+            "elapsed_seconds": elapsed_time, 
+            "total_flashcards": len(flashcards), 
+            "num_questions": num_questions
+        }
         
     except Exception as e:
         logging.exception(f"Error generating flashcards: {e}")
@@ -244,9 +277,9 @@ def process_batch(
         
         # If we have shared state, update the accumulated flashcards and possibly the DB
         if shared_state:
-            # Add to accumulated flashcards
-            shared_state["accumulated_flashcards"].extend(cards)
-            current_count = len(shared_state["accumulated_flashcards"])
+            # Add to accumulated cards
+            shared_state["accumulated_cards"].extend(cards)
+            current_count = len(shared_state["accumulated_cards"])
             
             # Check if we should update the database
             cards_since_last_update = current_count - shared_state.get("last_update_count", 0)
@@ -258,11 +291,16 @@ def process_batch(
                     # Update the database with the current accumulated flashcards
                     logging.info(f"Incremental DB update: {current_count} flashcards accumulated so far")
                     
-                    # Update the database (in progress status)
+                    # Update the generated_content table with new format (in progress status)
                     update_generated_content(
                         shared_state["document_id"],
                         {
-                            "flashcards": shared_state["accumulated_flashcards"],
+                            "flashcards": [
+                                {
+                                    "set_id": shared_state["set_id"],
+                                    "cards": shared_state["accumulated_cards"]
+                                }
+                            ],
                             "status": "processing", 
                             "updated_at": datetime.now().isoformat()
                         }
@@ -573,6 +611,7 @@ def update_error_status(document_id: str, error_message: str) -> None:
     update_generated_content(
         document_id,
         {
+            "flashcards": [{"set_id": 1, "cards": []}],
             "status": "error", 
             "error_message": error_message, 
             "updated_at": datetime.now().isoformat()

@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Any
+from typing import Dict, Any, List
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from datetime import datetime
@@ -41,6 +41,13 @@ def insert_yts_record(metadata: Dict[str, Any]) -> str:
         raise Exception(f"Supabase insert failed or id not returned: {response}")
     return str(response.data[0]["id"])
 
+# get id of generated_content by pdf_id or yt_id
+def get_generated_content_id(document_id: str) -> str:
+    response = supabase.table('generated_content').select('id').or_(f"pdf_id.eq.{document_id},yt_id.eq.{document_id}").execute()
+    if not response.data or "id" not in response.data[0]:
+        raise Exception(f"Supabase get failed or id not returned: {response}")
+    return str(response.data[0]["id"])
+
 def update_generated_content(document_id: str, content: Dict[str, Any]) -> None:
     print('document_id', document_id)
     print('content', content)
@@ -51,51 +58,52 @@ def update_generated_content(document_id: str, content: Dict[str, Any]) -> None:
     }).or_(f"pdf_id.eq.{document_id},yt_id.eq.{document_id}").execute()
 
     print('added to supabase')
-            
 
-
-# def update_generated_content(document_id: str, content: Dict[str, Any]) -> None:
-#     """
-#     Update the generated_content table with content like flashcards.
-#     If entry doesn't exist, it will be created.
+def insert_flashcard_set(content_id: str, flashcards: List[Dict[str, Any]], set_number: int) -> str:
+    """
+    Insert or update a batch of flashcards in the 'flashcard_sets' table.
+    If a record with the same content_id and set_number exists, it will update the flashcards.
+    Otherwise, it will insert a new record.
     
-#     Args:
-#         document_id: The document ID (from either pdfs or yts table)
-#         content: Dictionary of content to update (e.g., flashcards, status, etc.)
+    Args:
+        content_id: UUID of the generated_content record
+        flashcards: List of flashcard objects to insert
+        set_number: Batch number for this set of flashcards
         
-#     Raises:
-#         Exception if the update fails
-#     """
-#     try:
-#         # Check if entry exists
-#         check = supabase.table("generated_content") \
-#             .select("id") \
-#             .or_(f"pdf_id.eq.{document_id},yt_id.eq.{document_id}") \
-#             .execute()
+    Returns:
+        The id of the inserted/updated flashcard set as a string
         
-#         if check.data and len(check.data) > 0:
-#             # Update existing entry
-#             response = supabase.table("generated_content") \
-#                 .update(content) \
-#                 .or_(f"pdf_id.eq.{document_id},yt_id.eq.{document_id}") \
-#                 .execute()
-#         else:
-#             # Create new entry
-#             # Determine if this is a PDF or YouTube document
-#             pdf_check = supabase.table("pdfs").select("id").eq("id", document_id).execute()
+    Raises:
+        Exception if operation fails or id is not returned
+    """
+    # First check if a record with this content_id and set_number already exists
+    check_response = supabase.table("flashcard_sets").select("id").eq("content_id", content_id).eq("set_number", set_number).execute()
+    
+    if check_response.data and len(check_response.data) > 0:
+        # Record exists, update it
+        existing_id = check_response.data[0]["id"]
+        print(f"Updating existing flashcard set {existing_id} (content_id: {content_id}, set: {set_number})")
+        
+        response = supabase.table("flashcard_sets").update({
+            "flashcards": flashcards,
+        }).eq("id", existing_id).execute()
+        
+        if not response.data or len(response.data) == 0:
+            raise Exception(f"Flashcard set update failed: {response}")
             
-#             if pdf_check.data and len(pdf_check.data) > 0:
-#                 # It's a PDF document
-#                 new_entry = {"pdf_id": document_id, **content}
-#             else:
-#                 # Assume it's a YouTube document
-#                 new_entry = {"yt_id": document_id, **content}
-                
-#             response = supabase.table("generated_content").insert(new_entry).execute()
+        return existing_id
+    else:
+        # No existing record, insert a new one
+        print(f"Creating new flashcard set (content_id: {content_id}, set: {set_number})")
+        response = supabase.table("flashcard_sets").insert({
+            "content_id": content_id,
+            "flashcards": flashcards,
+            "set_number": set_number
+        }).execute()
         
-#         # Check if the operation was successful
-#         if not response.data:
-#             raise Exception(f"No data returned from Supabase operation")
+        if not response.data or "id" not in response.data[0]:
+            raise Exception(f"Flashcard set insertion failed: {response}")
             
-#     except Exception as e:
-#         raise Exception(f"Failed to update generated content: {str(e)}") 
+        return str(response.data[0]["id"])
+
+# update flashcard
