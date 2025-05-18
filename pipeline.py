@@ -12,7 +12,7 @@ from supabase_client import insert_pdf_record, insert_yts_record
 from groq_client import generate_answer
 import openai_client
 from services.wetrocloud_youtube import WetroCloudYouTubeService
-from flashcard_process import generate_flashcards
+from flashcard_process import generate_flashcards, regenerate_flashcards
 from pydantic import BaseModel
 from typing import Optional, List
 
@@ -529,6 +529,35 @@ async def generate_flashcards_endpoint(
     
     try:
         result = generate_flashcards(
+            document_id=request.document_id,
+            space_id=request.space_id,
+            num_questions=request.num_questions,
+            acl_tags=request.acl_tags
+        )
+        
+        return JSONResponse(result)
+    except Exception as e:
+        logging.exception(f"Error in generate_flashcards_endpoint: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500) 
+    
+
+@app.post("/regenerate_flashcards")
+async def regenerate_flashcards_endpoint(
+    request: FlashcardRequest
+) -> JSONResponse:
+    """
+    Endpoint to generate flashcards from a document.
+    
+    Args:
+        request: FlashcardRequest with document_id, space_id, etc.
+        
+    Returns:
+        JSON response with flashcards or error message.
+    """
+    logging.info(f"Re-Generate flashcards endpoint called for document: {request.document_id}")
+    
+    try:
+        result = regenerate_flashcards(
             document_id=request.document_id,
             space_id=request.space_id,
             num_questions=request.num_questions,

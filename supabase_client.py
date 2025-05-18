@@ -3,6 +3,7 @@ from typing import Dict, Any, List
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from datetime import datetime
+import logging
 
 load_dotenv()
 
@@ -44,13 +45,16 @@ def insert_yts_record(metadata: Dict[str, Any]) -> str:
 # get id of generated_content by pdf_id or yt_id
 def get_generated_content_id(document_id: str) -> str:
     response = supabase.table('generated_content').select('id').or_(f"pdf_id.eq.{document_id},yt_id.eq.{document_id}").execute()
-    if not response.data or "id" not in response.data[0]:
+    print('response', response)
+    if not response.data or len(response.data) == 0:
+        raise Exception(f"Supabase get failed or no content found for document: {document_id}")
+    if "id" not in response.data[0]:
         raise Exception(f"Supabase get failed or id not returned: {response}")
     return str(response.data[0]["id"])
 
 def update_generated_content(document_id: str, content: Dict[str, Any]) -> None:
-    print('document_id', document_id)
-    print('content', content)
+    # print('document_id', document_id)
+    # print('content', content)
 
     supabase.table('generated_content').update({
         'flashcards': content['flashcards'],
@@ -105,5 +109,30 @@ def insert_flashcard_set(content_id: str, flashcards: List[Dict[str, Any]], set_
             raise Exception(f"Flashcard set insertion failed: {response}")
             
         return str(response.data[0]["id"])
+
+def get_existing_flashcards(content_id: str) -> List[Dict[str, Any]]:
+    """
+    Retrieves existing flashcards for a given content_id.
+    
+    Args:
+        content_id: The content ID to retrieve flashcards for.
+        
+    Returns:
+        List of flashcard sets with their cards.
+    """
+    try:
+        # First get the generated_content entry to retrieve existing flashcards
+        response = supabase.table("generated_content").select("flashcards").eq("id", content_id).execute()
+        if not response.data or len(response.data) == 0:
+            return []
+            
+        # Extract flashcards from the response
+        content_data = response.data[0]
+        existing_flashcards = content_data.get("flashcards", [])
+        
+        return existing_flashcards
+    except Exception as e:
+        logging.error(f"Error retrieving existing flashcards: {e}")
+        return []
 
 # update flashcard

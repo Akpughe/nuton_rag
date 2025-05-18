@@ -9,7 +9,7 @@ from chonkie_client import embed_query, embed_query_v2
 from pinecone_client import hybrid_search
 from pinecone_client import rerank_results
 import openai_client
-from supabase_client import update_generated_content, get_generated_content_id, insert_flashcard_set
+from supabase_client import update_generated_content, get_generated_content_id, insert_flashcard_set, get_existing_flashcards
 
 def generate_flashcards(
     document_id: str,
@@ -264,6 +264,9 @@ def process_batch(
     progress_info = f"[Processing batch {batch_number} of {total_batches}]"
     logging.info(f"Generating flashcards for batch {batch_number}/{total_batches}")
     
+    # Check if we need to avoid duplicates
+    existing_flashcards = shared_state.get("existing_flashcards", []) if shared_state else []
+    
     # Generate flashcards for this batch using streaming
     batch_flashcards = []
     
@@ -273,12 +276,29 @@ def process_batch(
         if not cards:
             return
             
-        batch_flashcards.extend(cards)
+        # Filter out duplicates if needed
+        if existing_flashcards:
+            unique_cards = []
+            for card in cards:
+                # Skip if this card is too similar to any existing card
+                if not is_duplicate_of_existing(card, existing_flashcards):
+                    unique_cards.append(card)
+            
+            # Only add unique cards
+            batch_flashcards.extend(unique_cards)
+        else:
+            batch_flashcards.extend(cards)
         
         # If we have shared state, update the accumulated flashcards and possibly the DB
         if shared_state:
-            # Add to accumulated cards
-            shared_state["accumulated_cards"].extend(cards)
+            # Add to accumulated cards (either filtered or all)
+            if existing_flashcards:
+                # We've already filtered the cards above
+                cards_to_add = batch_flashcards[-len(unique_cards if 'unique_cards' in locals() else cards):]
+                shared_state["accumulated_cards"].extend(cards_to_add)
+            else:
+                shared_state["accumulated_cards"].extend(cards)
+                
             current_count = len(shared_state["accumulated_cards"])
             
             # Check if we should update the database
@@ -291,16 +311,33 @@ def process_batch(
                     # Update the database with the current accumulated flashcards
                     logging.info(f"Incremental DB update: {current_count} flashcards accumulated so far")
                     
+                    # Get existing flashcards data
+                    document_id = shared_state["document_id"]
+                    content_id = get_generated_content_id(document_id)
+                    existing_flashcards_data = get_existing_flashcards(content_id)
+                    
+                    # Create the updated flashcards structure
+                    if existing_flashcards_data:
+                        # Get sets before the current one
+                        previous_sets = [s for s in existing_flashcards_data if s.get("set_id", 0) < shared_state["set_id"]]
+                        
+                        # Add the current in-progress set
+                        flashcards_structure = previous_sets + [{
+                            "set_id": shared_state["set_id"],
+                            "cards": shared_state["accumulated_cards"]
+                        }]
+                    else:
+                        # If no existing sets, just create one
+                        flashcards_structure = [{
+                            "set_id": shared_state["set_id"],
+                            "cards": shared_state["accumulated_cards"]
+                        }]
+                    
                     # Update the generated_content table with new format (in progress status)
                     update_generated_content(
                         shared_state["document_id"],
                         {
-                            "flashcards": [
-                                {
-                                    "set_id": shared_state["set_id"],
-                                    "cards": shared_state["accumulated_cards"]
-                                }
-                            ],
+                            "flashcards": flashcards_structure,
                             "status": "processing", 
                             "updated_at": datetime.now().isoformat()
                         }
@@ -315,7 +352,12 @@ def process_batch(
     # Generate flashcards using the streaming API
     from openai import Stream
     
-    system_prompt = f"You are an AI flashcard generator specialized in creating precise, high-quality flashcards for specific sections of content. Generate EXACTLY {cards_per_batch} unique flashcards from the provided content section."
+    # Add additional instruction if we have existing flashcards
+    duplicate_avoidance_prompt = ""
+    if existing_flashcards:
+        duplicate_avoidance_prompt = f"\n\nIMPORTANT: Generate COMPLETELY DIFFERENT flashcards from the previous set. Avoid creating cards that cover the same concepts or facts already covered in the {len(existing_flashcards)} existing flashcards."
+    
+    system_prompt = f"You are an AI flashcard generator specialized in creating precise, high-quality flashcards for specific sections of content. Generate EXACTLY {cards_per_batch} unique flashcards from the provided content section.{duplicate_avoidance_prompt}"
     
     # Define the flashcard generation prompt
     FLASHCARD_PROMPT = f"""
@@ -330,6 +372,7 @@ OBJECTIVES:
 	•	Ensure variety in cognitive depth (recall, understanding, application).
 	•	Every flashcard must cover a distinct idea within THIS SPECIFIC CONTENT SECTION.
 	•	Focus on quality and specificity - create cards that precisely capture the content of this section.
+{duplicate_avoidance_prompt}
 
 ⸻
 
@@ -424,6 +467,10 @@ INPUT MATERIAL:
     
     # Final parsing of the complete response to ensure we catch everything
     all_cards = openai_client.parse_flashcards(response_text)
+    
+    # Filter out duplicates of existing flashcards if needed
+    if existing_flashcards:
+        all_cards = [card for card in all_cards if not is_duplicate_of_existing(card, existing_flashcards)]
     
     logging.info(f"Generated {len(all_cards)} flashcards from batch {batch_number}")
     return all_cards
@@ -616,4 +663,213 @@ def update_error_status(document_id: str, error_message: str) -> None:
             "error_message": error_message, 
             "updated_at": datetime.now().isoformat()
         }
-    ) 
+    )
+
+
+def is_duplicate_of_existing(card: Dict[str, str], existing_cards: List[Dict[str, str]]) -> bool:
+    """
+    Check if a card is too similar to any existing card.
+    
+    Args:
+        card: The flashcard to check.
+        existing_cards: List of existing flashcards to compare against.
+        
+    Returns:
+        True if the card is a duplicate, False otherwise.
+    """
+    if not card or not existing_cards:
+        return False
+        
+    question = card.get("question", "")
+    answer = card.get("answer", "")
+    
+    if not question or not answer:
+        return False
+        
+    # Simplify for comparison
+    simple_question = simplify_text(question)
+    simple_answer = simplify_text(answer)
+    
+    question_words = set(simple_question.split())
+    answer_words = set(simple_answer.split())
+    
+    # Check against all existing cards
+    for existing in existing_cards:
+        existing_question = simplify_text(existing.get("question", ""))
+        existing_answer = simplify_text(existing.get("answer", ""))
+        
+        existing_q_words = set(existing_question.split())
+        existing_a_words = set(existing_answer.split())
+        
+        # Check for high similarity in either question or answer
+        question_similarity = jaccard_similarity(question_words, existing_q_words)
+        answer_similarity = jaccard_similarity(answer_words, existing_a_words)
+        
+        # If either question or answer is very similar, consider it a duplicate
+        if question_similarity > 0.7 or answer_similarity > 0.7:
+            return True
+    
+    return False
+
+
+def regenerate_flashcards(
+    document_id: str,
+    space_id: Optional[str] = None,
+    num_questions: Optional[int] = None,
+    acl_tags: Optional[List[str]] = None,
+    rerank_top_n: int = 50,
+    use_openai_embeddings: bool = True
+) -> Dict[str, Any]:
+    """
+    Generates additional flashcards from a document, avoiding duplicates from previous sets.
+    
+    Args:
+        document_id: Filter results to this document ID.
+        space_id: Filter results to this space ID.
+        num_questions: Optional number of additional flashcards to generate.
+        acl_tags: Optional list of ACL tags to filter by.
+        rerank_top_n: Number of results to rerank.
+        use_openai_embeddings: Whether to use OpenAI directly for embeddings.
+    
+    Returns:
+        Dict with new flashcards and status.
+    """
+    logging.info(f"Regenerating flashcards for document {document_id}, space_id: {space_id}")
+    
+    # Get content_id for this document
+    content_id = get_generated_content_id(document_id)
+    
+    # Get existing flashcards and determine the next set number
+    existing_flashcards_data = get_existing_flashcards(content_id)
+    
+    existing_flashcards = []
+    next_set_number = 1
+    
+    if existing_flashcards_data:
+        # Extract all flashcards to check for duplicates
+        for set_data in existing_flashcards_data:
+            existing_flashcards.extend(set_data.get("cards", []))
+            
+            # Update next_set_number if needed
+            if set_data.get("set_id", 0) >= next_set_number:
+                next_set_number = set_data.get("set_id", 0) + 1
+    
+    logging.info(f"Found {len(existing_flashcards)} existing flashcards. Next set number: {next_set_number}")
+    
+    # Initialize status in database with empty set for the new set_id
+    current_flashcards = existing_flashcards_data if existing_flashcards_data else []
+    current_flashcards.append({"set_id": next_set_number, "cards": []})
+    
+    update_generated_content(
+        document_id,
+        {"flashcards": current_flashcards, "status": "processing", "updated_at": datetime.now().isoformat()}
+    )
+    
+    try:
+        start_time = datetime.now()
+        
+        # Create a query to gather content for flashcards
+        query = "Extract comprehensive information from this document including all key concepts, facts, definitions, examples, relationships between topics, methodologies, processes, theories, historical context, practical applications, edge cases, and underlying principles. Cover all sections and subtopics thoroughly to ensure complete coverage of the material for high-quality and diverse flashcard generation."
+        
+        # Embed query using OpenAI directly
+        query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query(query)
+        
+        # Check for embedding errors
+        if isinstance(query_embedded, dict) and "message" in query_embedded and "status" in query_embedded:
+            error_msg = f"Query embedding failed: {query_embedded['message']}"
+            logging.error(error_msg)
+            update_error_status(document_id, error_msg)
+            return {"flashcards": [], "status": "error", "message": error_msg}
+        
+        query_emb = query_embedded["embedding"]
+        query_sparse = query_embedded.get("sparse")
+        
+        # Search using hybrid search to gather relevant content
+        hits = hybrid_search(
+            query_emb=query_emb,
+            query_sparse=query_sparse,
+            top_k=rerank_top_n,
+            doc_id=document_id,
+            space_id=space_id,
+            acl_tags=acl_tags
+        )
+        
+        if not hits:
+            error_msg = "No relevant content found."
+            update_error_status(document_id, error_msg)
+            return {"flashcards": [], "status": "error", "message": error_msg}
+        
+        # Rerank results to get most relevant content
+        reranked = rerank_results(query, hits, top_n=rerank_top_n)
+        
+        # Prepare context for flashcard generation
+        context_chunks = []
+        for item in reranked:
+            if "metadata" in item and "text" in item["metadata"]:
+                context_chunks.append(item["metadata"]["text"])
+        
+        if not context_chunks:
+            error_msg = "No text content found in search results."
+            update_error_status(document_id, error_msg)
+            return {"flashcards": [], "status": "error", "message": error_msg}
+        
+        # Generate flashcards chunk by chunk (parallel processing)
+        logging.info(f"Processing {len(context_chunks)} chunks for additional flashcard generation")
+        
+        # Create a shared state for tracking accumulated flashcards and database updates
+        shared_state = {
+            "accumulated_cards": [],
+            "set_id": next_set_number,
+            "update_threshold": 5,  # Update DB every 5 flashcards
+            "last_update_count": 0,
+            "document_id": document_id,
+            "last_update_time": datetime.now(),
+            "existing_flashcards": existing_flashcards  # Pass existing flashcards to avoid duplicates
+        }
+        
+        # Generate new flashcards, avoiding duplicates with existing ones
+        new_flashcards = generate_flashcards_from_chunks_parallel(
+            context_chunks, 
+            num_questions=num_questions,
+            shared_state=shared_state
+        )
+        
+        # Final update to the database with all flashcards (after deduplication)
+        # Keep existing sets and append the new set
+        final_flashcards = existing_flashcards_data if existing_flashcards_data else []
+        final_flashcards.append({
+            "set_id": next_set_number,
+            "cards": new_flashcards
+        })
+        
+        update_generated_content(
+            document_id,
+            {
+                "flashcards": final_flashcards, 
+                "status": "completed", 
+                "updated_at": datetime.now().isoformat()
+            }
+        )
+        
+        # Insert the new set to flashcard_sets
+        try:
+            logging.info(f"Inserting new flashcard set #{next_set_number} with {len(new_flashcards)} cards")
+            insert_flashcard_set(content_id, new_flashcards, next_set_number)
+        except Exception as e:
+            logging.error(f"Error storing new flashcard set: {e}")
+        
+        elapsed_time = (datetime.now() - start_time).total_seconds()
+        logging.info(f"Additional flashcard generation completed in {elapsed_time:.2f} seconds. Generated {len(new_flashcards)} new flashcards.")
+        
+        return {
+            "flashcards": final_flashcards,
+            "status": "success", 
+            "elapsed_seconds": elapsed_time, 
+            "total_flashcards": len(new_flashcards), 
+            "num_questions": num_questions
+        }
+        
+    except Exception as e:
+        logging.exception(f"Error generating additional flashcards: {e}")
+        update_error_status(document_id, str(e))
+        return {"flashcards": [], "status": "error", "message": str(e)} 
