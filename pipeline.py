@@ -12,6 +12,10 @@ from supabase_client import insert_pdf_record, insert_yts_record
 from groq_client import generate_answer
 import openai_client
 from services.wetrocloud_youtube import WetroCloudYouTubeService
+from flashcard_process import generate_flashcards
+from pydantic import BaseModel
+from typing import Optional, List
+
 
 app = FastAPI()
 
@@ -19,6 +23,13 @@ UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO)
+
+
+class FlashcardRequest(BaseModel):
+    document_id: str
+    space_id: Optional[str] = None
+    num_questions: Optional[int] = None
+    acl_tags: Optional[List[str]] = None
 
 
 def flatten_chunks(chunks):
@@ -222,7 +233,7 @@ def answer_query(
     system_prompt: str = "You are a helpful assistant. Use only the provided context to answer.",
     groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
     openai_model: str = "gpt-4o",
-    use_openai_embeddings: bool = False
+    use_openai_embeddings: bool = True
 ) -> Dict[str, Any]:
     """
     Answers a user query using hybrid search, rerank, and LLM generation.
@@ -256,7 +267,7 @@ def answer_query(
     query_emb = query_embedded["embedding"]
     query_sparse = query_embedded.get("sparse")
 
-    # print('query_emb', query_emb)
+    # print('query_emb', query_emb) 
     # print('query_sparse', query_sparse)
     
     # Search using hybrid search
@@ -498,4 +509,33 @@ async def process_youtube_endpoint(
         return JSONResponse({"document_id": document_id})
     except Exception as e:
         logging.exception(f"Error in process_youtube_endpoint: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/generate_flashcards")
+async def generate_flashcards_endpoint(
+    request: FlashcardRequest
+) -> JSONResponse:
+    """
+    Endpoint to generate flashcards from a document.
+    
+    Args:
+        request: FlashcardRequest with document_id, space_id, etc.
+        
+    Returns:
+        JSON response with flashcards or error message.
+    """
+    logging.info(f"Generate flashcards endpoint called for document: {request.document_id}")
+    
+    try:
+        result = generate_flashcards(
+            document_id=request.document_id,
+            space_id=request.space_id,
+            num_questions=request.num_questions,
+            acl_tags=request.acl_tags
+        )
+        
+        return JSONResponse(result)
+    except Exception as e:
+        logging.exception(f"Error in generate_flashcards_endpoint: {e}")
         return JSONResponse({"error": str(e)}, status_code=500) 
