@@ -91,12 +91,23 @@ def generate_flashcards(
         
         # Generate flashcards chunk by chunk (parallel processing)
         logging.info(f"Processing {len(context_chunks)} chunks for flashcard generation")
+        
+        # Create a shared state for tracking accumulated flashcards and database updates
+        shared_state = {
+            "accumulated_flashcards": [],
+            "update_threshold": 5,  # Update DB every 5 flashcards
+            "last_update_count": 0,
+            "document_id": document_id,
+            "last_update_time": datetime.now()
+        }
+        
         flashcards = generate_flashcards_from_chunks_parallel(
             context_chunks, 
-            num_questions=num_questions
+            num_questions=num_questions,
+            shared_state=shared_state
         )
         
-        # Update database with generated flashcards
+        # Final update to the database with all flashcards (after deduplication)
         update_generated_content(
             document_id,
             {"flashcards": flashcards, "status": "completed", "updated_at": datetime.now().isoformat()}
@@ -105,7 +116,7 @@ def generate_flashcards(
         elapsed_time = (datetime.now() - start_time).total_seconds()
         logging.info(f"Flashcard generation completed in {elapsed_time:.2f} seconds. Generated {len(flashcards)} flashcards.")
         
-        return {"flashcards": flashcards, "status": "success", "elapsed_seconds": elapsed_time}
+        return {"flashcards": flashcards, "status": "success", "elapsed_seconds": elapsed_time, "total_flashcards": len(flashcards), "num_questions": num_questions}
         
     except Exception as e:
         logging.exception(f"Error generating flashcards: {e}")
@@ -113,13 +124,18 @@ def generate_flashcards(
         return {"flashcards": [], "status": "error", "message": str(e)}
 
 
-def generate_flashcards_from_chunks_parallel(context_chunks: List[str], num_questions: Optional[int] = None) -> List[Dict[str, str]]:
+def generate_flashcards_from_chunks_parallel(
+    context_chunks: List[str], 
+    num_questions: Optional[int] = None,
+    shared_state: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, str]]:
     """
     Process chunks in parallel to generate flashcards more efficiently.
     
     Args:
         context_chunks: List of text chunks to process.
         num_questions: Optional target number of flashcards to generate.
+        shared_state: Optional shared state for incremental DB updates.
         
     Returns:
         List of flashcard objects with question, answer, hint, and explanation.
@@ -165,7 +181,7 @@ def generate_flashcards_from_chunks_parallel(context_chunks: List[str], num_ques
     # Process batches in parallel using ThreadPoolExecutor
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(batches))) as executor:
         # Create a partial function with the constant parameters
-        process_batch_fn = partial(process_batch)
+        process_batch_fn = partial(process_batch, shared_state=shared_state)
         
         # Map the function to all batches
         batch_results = list(executor.map(
@@ -190,7 +206,11 @@ def generate_flashcards_from_chunks_parallel(context_chunks: List[str], num_ques
     return deduplicated_flashcards
 
 
-def process_batch(batch_data: Dict[str, Any], total_batches: int) -> List[Dict[str, Any]]:
+def process_batch(
+    batch_data: Dict[str, Any], 
+    total_batches: int,
+    shared_state: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, Any]]:
     """
     Process a single batch of content to generate flashcards.
     Designed to be run in parallel.
@@ -198,6 +218,7 @@ def process_batch(batch_data: Dict[str, Any], total_batches: int) -> List[Dict[s
     Args:
         batch_data: Dictionary containing batch information.
         total_batches: Total number of batches for progress tracking.
+        shared_state: Optional shared state for incremental DB updates.
         
     Returns:
         List of flashcard objects for this batch.
@@ -210,29 +231,54 @@ def process_batch(batch_data: Dict[str, Any], total_batches: int) -> List[Dict[s
     progress_info = f"[Processing batch {batch_number} of {total_batches}]"
     logging.info(f"Generating flashcards for batch {batch_number}/{total_batches}")
     
-    # Generate flashcards for this batch
-    batch_flashcards = generate_flashcards_for_batch(
-        context, 
-        cards_per_batch=cards_per_batch,
-        progress_info=progress_info
-    )
+    # Generate flashcards for this batch using streaming
+    batch_flashcards = []
     
-    logging.info(f"Generated {len(batch_flashcards)} flashcards from batch {batch_number}")
-    return batch_flashcards
-
-
-def generate_flashcards_for_batch(context: str, cards_per_batch: int, progress_info: str) -> List[Dict[str, str]]:
-    """
-    Generate flashcards for a specific batch of content.
-    
-    Args:
-        context: The text content for this batch.
-        cards_per_batch: Number of flashcards to target for this batch.
-        progress_info: Progress information to include in the prompt.
+    def card_callback(cards):
+        """Callback function to process cards as they're generated and update the database."""
+        nonlocal batch_flashcards
+        if not cards:
+            return
+            
+        batch_flashcards.extend(cards)
         
-    Returns:
-        List of flashcard objects for this batch.
-    """
+        # If we have shared state, update the accumulated flashcards and possibly the DB
+        if shared_state:
+            # Add to accumulated flashcards
+            shared_state["accumulated_flashcards"].extend(cards)
+            current_count = len(shared_state["accumulated_flashcards"])
+            
+            # Check if we should update the database
+            cards_since_last_update = current_count - shared_state.get("last_update_count", 0)
+            time_since_last_update = (datetime.now() - shared_state.get("last_update_time", datetime.min)).total_seconds()
+            
+            # Update DB if we have enough new cards or enough time has passed
+            if (cards_since_last_update >= shared_state["update_threshold"] or time_since_last_update > 10):
+                try:
+                    # Update the database with the current accumulated flashcards
+                    logging.info(f"Incremental DB update: {current_count} flashcards accumulated so far")
+                    
+                    # Update the database (in progress status)
+                    update_generated_content(
+                        shared_state["document_id"],
+                        {
+                            "flashcards": shared_state["accumulated_flashcards"],
+                            "status": "processing", 
+                            "updated_at": datetime.now().isoformat()
+                        }
+                    )
+                    
+                    # Update tracking info
+                    shared_state["last_update_count"] = current_count
+                    shared_state["last_update_time"] = datetime.now()
+                except Exception as e:
+                    logging.error(f"Error during incremental database update: {e}")
+    
+    # Generate flashcards using the streaming API
+    from openai import Stream
+    
+    system_prompt = f"You are an AI flashcard generator specialized in creating precise, high-quality flashcards for specific sections of content. Generate EXACTLY {cards_per_batch} unique flashcards from the provided content section."
+    
     # Define the flashcard generation prompt
     FLASHCARD_PROMPT = f"""
 :books: ADVANCED FLASHCARD GENERATOR — OPTIMIZED FOR STUDY RETENTION {progress_info}
@@ -287,15 +333,115 @@ INPUT MATERIAL:
 
 ⸻
 """
-    system_prompt = f"You are an AI flashcard generator specialized in creating precise, high-quality flashcards for specific sections of content. Generate EXACTLY {cards_per_batch} unique flashcards from the provided content section."
+    # Process streaming response to detect complete flashcards
+    response_text = ""
+    accumulated_card_text = ""
+    card_count = 0
+    pending_batch = []
     
-    # Use OpenAI to generate flashcards for this batch
-    flashcards = openai_client.generate_flashcards(
-        context, 
-        system_prompt=system_prompt,
-        user_prompt=FLASHCARD_PROMPT,
-        model="gpt-4o"
+    # Start the streaming generation
+    response = openai_client.client.chat.completions.create(
+        model="gpt-4o",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": FLASHCARD_PROMPT}
+        ],
+        temperature=0.8,
+        max_tokens=8000,
+        stream=True
     )
+    
+    for chunk in response:
+        if chunk.choices[0].delta.content:
+            delta = chunk.choices[0].delta.content
+            response_text += delta
+            accumulated_card_text += delta
+            
+            # Look for completed flashcards - they end with "---"
+            if "---" in delta:
+                # Extract flashcards from accumulated text
+                cards = parse_streaming_content(accumulated_card_text)
+                if cards:
+                    card_count += len(cards)
+                    pending_batch.extend(cards)
+                    
+                    # Call callback every 3-5 cards
+                    if len(pending_batch) >= 5:
+                        card_callback(pending_batch)
+                        pending_batch = []
+                    
+                    # Reset accumulated text but keep any content after the last "---"
+                    parts = accumulated_card_text.split("---")
+                    accumulated_card_text = "" if len(parts) <= 1 else f"---{parts[-1]}"
+    
+    # Process any remaining cards in the final batch
+    if accumulated_card_text:
+        final_cards = parse_streaming_content(accumulated_card_text)
+        if final_cards:
+            pending_batch.extend(final_cards)
+    
+    # Send any remaining pending cards
+    if pending_batch:
+        card_callback(pending_batch)
+    
+    # Final parsing of the complete response to ensure we catch everything
+    all_cards = openai_client.parse_flashcards(response_text)
+    
+    logging.info(f"Generated {len(all_cards)} flashcards from batch {batch_number}")
+    return all_cards
+
+
+def parse_streaming_content(text: str) -> List[Dict[str, str]]:
+    """
+    Parse streaming content to extract complete flashcards.
+    
+    Args:
+        text: The accumulated text from streaming.
+        
+    Returns:
+        List of complete flashcard objects.
+    """
+    # Split by the "---" marker
+    parts = text.split("---")
+    
+    # Skip the first part (it's usually empty or intro text)
+    parts = parts[1:] if len(parts) > 1 else []
+    
+    flashcards = []
+    
+    for i in range(len(parts) - 1):  # Skip the last part as it might be incomplete
+        card_text = parts[i].strip()
+        if not card_text:
+            continue
+            
+        card = {}
+        
+        # Check for required fields
+        has_question = "Question:" in card_text
+        has_answer = "Answer:" in card_text
+        has_hint = "Hint:" in card_text
+        has_explanation = "Explanation:" in card_text
+        
+        if has_question and has_answer and has_hint and has_explanation:
+            # Extract fields
+            lines = card_text.split("\n")
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                if line.startswith("Question:"):
+                    card["question"] = line.replace("Question:", "", 1).strip()
+                elif line.startswith("Answer:"):
+                    card["answer"] = line.replace("Answer:", "", 1).strip()
+                elif line.startswith("Hint:"):
+                    card["hint"] = line.replace("Hint:", "", 1).strip()
+                elif line.startswith("Explanation:"):
+                    card["explanation"] = line.replace("Explanation:", "", 1).strip()
+            
+            # Only add complete cards
+            if all(k in card for k in ["question", "answer", "hint", "explanation"]):
+                flashcards.append(card)
     
     return flashcards
 

@@ -90,14 +90,25 @@ def generate_flashcards(
             model=model,
             messages=messages,
             temperature=0.8,  # Increased for more creative and diverse flashcards
-            max_tokens=8000   # Doubled to allow for many more flashcards
+            max_tokens=8000,   # Doubled to allow for many more flashcards
+            stream=True
         )
-        
+        # print('response', response)
+
+        response_text = ""
+
+        for chunk in response:
+            if chunk.choices[0].delta.content:
+                response_text += chunk.choices[0].delta.content
+
+
         # Extract the response content
-        response_text = response.choices[0].message.content
+        # response_text = response.choices[0].message.content
+
         
         # Parse the response text into flashcard objects
         flashcards = parse_flashcards(response_text)
+        print('flashcards', flashcards)
         
         return flashcards
         
