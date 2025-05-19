@@ -3,6 +3,8 @@ from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 import logging
 from pinecone import Pinecone
+import concurrent.futures
+from functools import lru_cache
 
 # Load environment variables
 load_dotenv()
@@ -141,30 +143,11 @@ def upsert_vectors(
             if sparse_vectors:
                 sparse_index.upsert(vectors=sparse_vectors)
 
-def hybrid_search(
-    query_emb: List[float],
-    query_sparse: Optional[Dict[str, Any]] = None,
-    top_k: int = 10,
-    doc_id: Optional[str] = None,
-    space_id: Optional[str] = None,
-    acl_tags: Optional[List[str]] = None
-) -> List[Dict[str, Any]]:
+@lru_cache(maxsize=100)
+def get_filter_dict(doc_id: Optional[str] = None, space_id: Optional[str] = None, acl_tags: Optional[List[str]] = None) -> Dict[str, Any]:
     """
-    Perform hybrid search in Pinecone (dense + sparse), filter by doc_id and ACL tags.
-    Args:
-        query_emb: Dense query embedding.
-        query_sparse: Sparse query representation (BM25/ColBERT), or None.
-        top_k: Number of results to retrieve from each index.
-        doc_id: Filter by document id.
-        space_id: Filter results to this space ID.
-        acl_tags: List of ACL tags to filter by.
-    Returns:
-        List of merged, deduped hits (dicts with id, score, metadata).
+    Create and cache filter dictionaries to avoid recreation for frequent query patterns.
     """
-    dense_index = pc.Index(DENSE_INDEX)
-    sparse_index = pc.Index(SPARSE_INDEX)
-    
-    # Build filter
     filter_dict = {}
     if doc_id:
         filter_dict["document_id"] = {"$eq": doc_id}
@@ -172,27 +155,73 @@ def hybrid_search(
         filter_dict["space_id"] = {"$eq": space_id}
     if acl_tags:
         filter_dict["acl_tags"] = {"$in": acl_tags}
+    return filter_dict
+
+def hybrid_search_parallel(
+    query_emb: List[float],
+    query_sparse: Optional[Dict[str, Any]] = None,
+    top_k: int = 20,  # Increase default to ensure enough for reranking
+    doc_id: Optional[str] = None,
+    space_id: Optional[str] = None,
+    acl_tags: Optional[List[str]] = None,
+    include_full_text: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    Perform parallel hybrid search in Pinecone (dense + sparse), filter by doc_id and ACL tags.
+    Uses concurrent execution to reduce latency.
     
-    # Query dense
-    logger.info(f"Querying dense index with filter: {filter_dict}")
-    dense_results = dense_index.query(
-        vector=query_emb, 
-        top_k=top_k, 
-        filter=filter_dict,
-        include_metadata=True
-    )
-    # print('dense_results', dense_results)
+    Args:
+        query_emb: Dense query embedding.
+        query_sparse: Sparse query representation (BM25/ColBERT), or None.
+        top_k: Number of results to retrieve from each index.
+        doc_id: Filter by document id.
+        space_id: Filter results to this space ID.
+        acl_tags: List of ACL tags to filter by.
+        include_full_text: Whether to include full text in metadata or just summaries.
+        
+    Returns:
+        List of merged, deduped hits (dicts with id, score, metadata).
+    """
+    dense_index = pc.Index(DENSE_INDEX)
+    sparse_index = pc.Index(SPARSE_INDEX)
     
-    # Query sparse if available
+    # Build and cache filter
+    filter_dict = get_filter_dict(doc_id, space_id, acl_tags)
+    
+    # Determine which metadata fields to include
+    metadata_fields = ["document_id", "space_id", "source_file"]
+    if include_full_text:
+        metadata_fields.append("text")
+    
+    dense_results = None
     sparse_results = None
-    if query_sparse:
-        logger.info("Querying sparse index")
-        sparse_results = sparse_index.query(
-            vector=query_sparse, 
-            top_k=top_k, 
+    
+    # Execute searches in parallel using ThreadPoolExecutor
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        # Submit dense search task
+        dense_future = executor.submit(
+            dense_index.query,
+            vector=query_emb,
+            top_k=top_k,
             filter=filter_dict,
             include_metadata=True
         )
+        
+        # Submit sparse search task if sparse embeddings provided
+        sparse_future = None
+        if query_sparse:
+            sparse_future = executor.submit(
+                sparse_index.query,
+                vector=query_sparse,
+                top_k=top_k,
+                filter=filter_dict,
+                include_metadata=True
+            )
+        
+        # Retrieve results
+        dense_results = dense_future.result()
+        if sparse_future:
+            sparse_results = sparse_future.result()
     
     # Merge and dedupe by id, keep highest score
     all_hits = {}
@@ -216,8 +245,31 @@ def hybrid_search(
                     "metadata": match.metadata
                 }
     
-    logger.info(f"Returning {len(all_hits)} total deduplicated hits")
+    logger.info(f"Parallel search returning {len(all_hits)} total deduplicated hits")
     return list(all_hits.values())
+
+# Keep the original hybrid_search function for backward compatibility
+def hybrid_search(
+    query_emb: List[float],
+    query_sparse: Optional[Dict[str, Any]] = None,
+    top_k: int = 10,
+    doc_id: Optional[str] = None,
+    space_id: Optional[str] = None,
+    acl_tags: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Original sequential hybrid search implementation.
+    Now a wrapper around hybrid_search_parallel for backward compatibility.
+    """
+    return hybrid_search_parallel(
+        query_emb=query_emb,
+        query_sparse=query_sparse,
+        top_k=top_k,
+        doc_id=doc_id,
+        space_id=space_id,
+        acl_tags=acl_tags,
+        include_full_text=True
+    )
 
 def rerank_results(
     query: str,

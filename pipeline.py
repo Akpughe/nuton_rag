@@ -6,9 +6,11 @@ import shutil
 import logging
 import tempfile
 import json
+import time
+from functools import lru_cache
 
 from chonkie_client import chunk_document, embed_chunks, embed_chunks_v2, embed_query, embed_query_v2
-from pinecone_client import upsert_vectors, hybrid_search, rerank_results
+from pinecone_client import upsert_vectors, hybrid_search, hybrid_search_parallel, rerank_results
 from supabase_client import insert_pdf_record, insert_yts_record
 from groq_client import generate_answer
 import openai_client
@@ -237,20 +239,34 @@ def process_document_with_openai(
         raise
 
 
+# Add caching for query embeddings
+@lru_cache(maxsize=100)
+def get_query_embedding(query: str, use_openai: bool = True):
+    """Cache query embeddings to avoid recalculating for repeated queries."""
+    start_time = time.time()
+    if use_openai:
+        result = embed_query_v2(query)
+    else:
+        result = embed_query(query)
+    logging.info(f"Query embedding took {time.time() - start_time:.2f}s")
+    return result
+
+
 def answer_query(
     query: str,
     document_id: Optional[str] = None,
     space_id: Optional[str] = None,
     acl_tags: Optional[List[str]] = None,
-    rerank_top_n: int = 15,
+    rerank_top_n: int = 10,  # Reduced from 15 to 10 for better performance
     system_prompt: str = "You are a helpful assistant. Use only the provided context to answer.",
     groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
     openai_model: str = "gpt-4o",
     use_openai_embeddings: bool = True,
-    search_by_space_only: bool = False
+    search_by_space_only: bool = False,
+    max_context_chunks: int = 5  # Limit context size for better performance
 ) -> Dict[str, Any]:
     """
-    Answers a user query using hybrid search, rerank, and LLM generation.
+    Optimized function to answer a user query using hybrid search, rerank, and LLM generation.
     Returns dict with answer and citations.
     
     Args:
@@ -264,14 +280,13 @@ def answer_query(
         openai_model: Model to use with OpenAI (fallback).
         use_openai_embeddings: Whether to use OpenAI directly for embeddings.
         search_by_space_only: If True, search based on space_id only, ignoring document_id.
+        max_context_chunks: Maximum number of chunks to include in context for the LLM.
     """
+    start_time = time.time()
     logging.info(f"Answering query: '{query}' for document {document_id if not search_by_space_only else 'None'} in space {space_id}")
     
-    # Embed query using either Chonkie API or OpenAI directly
-    if use_openai_embeddings:
-        query_embedded = embed_query_v2(query)
-    else:
-        query_embedded = embed_query(query)
+    # Use cached embeddings for the query
+    query_embedded = get_query_embedding(query, use_openai_embeddings)
     
     # Check for embedding errors
     if "message" in query_embedded and "status" in query_embedded:
@@ -281,42 +296,44 @@ def answer_query(
     
     query_emb = query_embedded["embedding"]
     query_sparse = query_embedded.get("sparse")
-
-    # print('query_emb', query_emb) 
-    # print('query_sparse', query_sparse)
     
     # Set document_id to None if search_by_space_only is True
     doc_id_param = None if search_by_space_only else document_id
     
-    # Search using hybrid search
-    hits = hybrid_search(
+    # Use parallel hybrid search with optimized top_k
+    search_start = time.time()
+    hits = hybrid_search_parallel(
         query_emb=query_emb,
         query_sparse=query_sparse,
-        top_k=rerank_top_n,
+        top_k=max(20, rerank_top_n * 2),  # Ensure we have enough results for reranking
         doc_id=doc_id_param,
         space_id=space_id,
-        acl_tags=acl_tags
+        acl_tags=acl_tags,
+        include_full_text=True  # Need full text for reranking
     )
-    # print('hits', hits)
+    logging.info(f"Search took {time.time() - search_start:.2f}s")
     
     if not hits:
         return {"answer": "No relevant context found.", "citations": []}
     
-    # Log hit sources if source_file is available
-    for hit in hits[:3]:
-        source = hit.get("metadata", {}).get("source_file", "unknown")
-        logging.info(f"Top hit from source: {source}")
-    
+    # Rerank results (faster with optimized parameters)
+    rerank_start = time.time()
     reranked = rerank_results(query, hits, top_n=rerank_top_n)
-
-    # print('reranked', reranked)
+    logging.info(f"Reranking took {time.time() - rerank_start:.2f}s")
     
+    # Limit context to the top max_context_chunks chunks to reduce LLM input size
+    limited_context = reranked[:max_context_chunks]
+    
+    # Generate answer with limited context
+    llm_start = time.time()
     try:
-        print('generating answer with groq')
-        answer, citations = generate_answer(query, reranked, system_prompt, model=groq_model)
+        answer, citations = generate_answer(query, limited_context, system_prompt, model=groq_model)
     except Exception as e:
         logging.warning(f"Groq generation failed, falling back to OpenAI: {e}")
-        answer, citations = openai_client.generate_answer(query, reranked, system_prompt, model=openai_model)
+        answer, citations = openai_client.generate_answer(query, limited_context, system_prompt, model=openai_model)
+    
+    logging.info(f"LLM generation took {time.time() - llm_start:.2f}s")
+    logging.info(f"Total query processing took {time.time() - start_time:.2f}s")
     
     return {"answer": answer, "citations": citations}
 
@@ -536,13 +553,34 @@ async def answer_query_endpoint(
     space_id: Optional[str] = Form(None),
     acl_tags: Optional[str] = Form(None),  # Comma-separated
     use_openai_embeddings: bool = Form(False),
-    search_by_space_only: bool = Form(False)
+    search_by_space_only: bool = Form(False),
+    rerank_top_n: Optional[int] = Form(10),
+    max_context_chunks: Optional[int] = Form(5),
+    fast_mode: bool = Form(False)  # New parameter for faster but potentially lower quality results
 ) -> JSONResponse:
     """
-    Endpoint to answer a query using the RAG pipeline.
+    Optimized endpoint to answer a query using the RAG pipeline.
     Returns the answer and citations.
+    
+    Args:
+        query: User's question
+        document_id: Document ID to search within
+        space_id: Optional space ID to filter by
+        acl_tags: Optional comma-separated ACL tags to filter by
+        use_openai_embeddings: Whether to use OpenAI directly for embeddings
+        search_by_space_only: If True, search by space_id only, ignoring document_id
+        rerank_top_n: Number of results to rerank (default: 10)
+        max_context_chunks: Maximum number of chunks to include in context (default: 5)
+        fast_mode: If True, uses optimized settings for faster response time
     """
+    start_time = time.time()
     acl_list = [tag.strip() for tag in acl_tags.split(",")] if acl_tags else None
+    
+    # If fast_mode is enabled, adjust parameters for faster response
+    if fast_mode:
+        rerank_top_n = min(rerank_top_n, 5)  # Limit reranking in fast mode
+        max_context_chunks = min(max_context_chunks, 3)  # Use fewer chunks in context
+    
     try:
         result = answer_query(
             query, 
@@ -550,8 +588,11 @@ async def answer_query_endpoint(
             space_id=space_id, 
             acl_tags=acl_list, 
             use_openai_embeddings=use_openai_embeddings,
-            search_by_space_only=search_by_space_only
+            search_by_space_only=search_by_space_only,
+            rerank_top_n=rerank_top_n,
+            max_context_chunks=max_context_chunks
         )
+        result["time_ms"] = int((time.time() - start_time) * 1000)  # Add time taken in ms
         return JSONResponse(result)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
