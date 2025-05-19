@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any, Optional
 import os
 import shutil
@@ -18,9 +19,19 @@ from services.wetrocloud_youtube import WetroCloudYouTubeService
 from flashcard_process import generate_flashcards, regenerate_flashcards
 from pydantic import BaseModel
 from typing import Optional, List
+from quiz_process import generate_quiz
 
 
 app = FastAPI()
+
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # List of allowed origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -33,6 +44,19 @@ class FlashcardRequest(BaseModel):
     space_id: Optional[str] = None
     num_questions: Optional[int] = None
     acl_tags: Optional[List[str]] = None
+
+
+class QuizRequest(BaseModel):
+    document_id: str
+    space_id: Optional[str] = None
+    question_type: str = "both"
+    num_questions: int = 30
+    acl_tags: Optional[str] = None
+    rerank_top_n: int = 50
+    use_openai_embeddings: bool = True
+    set_id: int = 1
+    title: Optional[str] = None
+    description: Optional[str] = None
 
 
 def flatten_chunks(chunks):
@@ -552,7 +576,7 @@ async def answer_query_endpoint(
     document_id: str = Form(...),
     space_id: Optional[str] = Form(None),
     acl_tags: Optional[str] = Form(None),  # Comma-separated
-    use_openai_embeddings: bool = Form(False),
+    use_openai_embeddings: bool = Form(True),
     search_by_space_only: bool = Form(False),
     rerank_top_n: Optional[int] = Form(10),
     max_context_chunks: Optional[int] = Form(5),
@@ -715,4 +739,48 @@ async def regenerate_flashcards_endpoint(
         return JSONResponse(result)
     except Exception as e:
         logging.exception(f"Error in generate_flashcards_endpoint: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500) 
+
+
+@app.post("/generate_quiz")
+async def generate_quiz_endpoint(
+    request: QuizRequest
+) -> JSONResponse:
+    """
+    Endpoint to generate a quiz from a document.
+    Args:
+        request: QuizRequest containing parameters:
+            - document_id: The document to generate the quiz from.
+            - space_id: Optional space ID.
+            - question_type: Type of questions to generate ("mcq", "true_false", or "both").
+            - num_questions: Total number of questions to generate.
+            - acl_tags: Optional comma-separated ACL tags.
+            - rerank_top_n: Number of results to rerank.
+            - use_openai_embeddings: Whether to use OpenAI for embeddings.
+            - set_id: Quiz set number.
+            - title: Optional quiz title.
+            - description: Optional quiz description.
+    Returns:
+        JSON response with quiz or error message.
+    """
+    # Validate question_type
+    if request.question_type not in ["mcq", "true_false", "both"]:
+        return JSONResponse({"error": "question_type must be one of 'mcq', 'true_false', or 'both'"}, status_code=400)
+        
+    acl_list = [tag.strip() for tag in request.acl_tags.split(",")] if request.acl_tags else None
+    try:
+        result = generate_quiz(
+            document_id=request.document_id,
+            space_id=request.space_id,
+            question_type=request.question_type,
+            num_questions=request.num_questions,
+            acl_tags=acl_list,
+            rerank_top_n=request.rerank_top_n,
+            use_openai_embeddings=request.use_openai_embeddings,
+            set_id=request.set_id,
+            title=request.title,
+            description=request.description
+        )
+        return JSONResponse(result)
+    except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500) 
