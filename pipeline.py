@@ -5,6 +5,7 @@ import os
 import shutil
 import logging
 import tempfile
+import json
 
 from chonkie_client import chunk_document, embed_chunks, embed_chunks_v2, embed_query, embed_query_v2
 from pinecone_client import upsert_vectors, hybrid_search, rerank_results
@@ -95,25 +96,31 @@ def process_document(
     print('metadata', metadata)
     space_id = metadata.get("space_id")
     extracted_text = "No text extracted yet"
+    
+    # Use the file_path from metadata if provided, otherwise use the local file path
+    db_file_path = metadata.get("file_path", file_path)
+    
     pdfs_row = {
         "space_id": space_id,
-        "file_path": file_path,
+        "file_path": db_file_path,  # This can now be a URL
         "extracted_text": extracted_text,
         "file_type": file_type,
-        "file_name": file_name
+        "file_name": metadata.get("filename", file_name)
     }
     # 4. Insert into Supabase and get document_id
     document_id = insert_pdf_record(pdfs_row)
     # 5. Upsert to Pinecone
     try:
         print('upserting vectors')
-        logging.info(f"Upserting with source file: {file_name}")
+        # Use filename from metadata if provided, otherwise use file_name from path
+        source_filename = metadata.get("filename", file_name)
+        logging.info(f"Upserting with source file: {source_filename}")
         upsert_vectors(
             doc_id=document_id, 
             space_id=space_id, 
             embeddings=embeddings, 
             chunks=chunks,
-            source_file=file_name
+            source_file=source_filename
         )
     except Exception as e:
         logging.error(f"Error in upsert_vectors: {e}")
@@ -190,12 +197,16 @@ def process_document_with_openai(
         logging.info(f"Using space_id: {space_id}")
         
         extracted_text = "No text extracted yet"
+        
+        # Use the file_path from metadata if provided, otherwise use the local file path
+        db_file_path = metadata.get("file_path", file_path)
+        
         pdfs_row = {
             "space_id": space_id,
-            "file_path": file_path,
+            "file_path": db_file_path,  # This can now be a URL
             "extracted_text": extracted_text,
             "file_type": file_type,
-            "file_name": file_name
+            "file_name": metadata.get("filename", file_name)
         }
         
         # 4. Insert into Supabase and get document_id
@@ -204,13 +215,15 @@ def process_document_with_openai(
         
         # 5. Upsert to Pinecone
         try:
-            logging.info(f"Upserting {len(embeddings)} vectors to Pinecone with source file: {file_name}")
+            # Use filename from metadata if provided, otherwise use file_name from path
+            source_filename = metadata.get("filename", file_name)
+            logging.info(f"Upserting {len(embeddings)} vectors to Pinecone with source file: {source_filename}")
             upsert_vectors(
                 doc_id=document_id, 
                 space_id=space_id, 
                 embeddings=embeddings, 
                 chunks=chunks,
-                source_file=file_name
+                source_file=source_filename
             )
             logging.info(f"Successfully upserted vectors to Pinecone for document: {document_id}")
         except ValueError as e:
@@ -226,14 +239,15 @@ def process_document_with_openai(
 
 def answer_query(
     query: str,
-    document_id: str,
+    document_id: Optional[str] = None,
     space_id: Optional[str] = None,
     acl_tags: Optional[List[str]] = None,
     rerank_top_n: int = 15,
     system_prompt: str = "You are a helpful assistant. Use only the provided context to answer.",
     groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
     openai_model: str = "gpt-4o",
-    use_openai_embeddings: bool = True
+    use_openai_embeddings: bool = True,
+    search_by_space_only: bool = False
 ) -> Dict[str, Any]:
     """
     Answers a user query using hybrid search, rerank, and LLM generation.
@@ -249,8 +263,9 @@ def answer_query(
         groq_model: Model to use with Groq.
         openai_model: Model to use with OpenAI (fallback).
         use_openai_embeddings: Whether to use OpenAI directly for embeddings.
+        search_by_space_only: If True, search based on space_id only, ignoring document_id.
     """
-    logging.info(f"Answering query: '{query}' for document {document_id}")
+    logging.info(f"Answering query: '{query}' for document {document_id if not search_by_space_only else 'None'} in space {space_id}")
     
     # Embed query using either Chonkie API or OpenAI directly
     if use_openai_embeddings:
@@ -270,12 +285,15 @@ def answer_query(
     # print('query_emb', query_emb) 
     # print('query_sparse', query_sparse)
     
+    # Set document_id to None if search_by_space_only is True
+    doc_id_param = None if search_by_space_only else document_id
+    
     # Search using hybrid search
     hits = hybrid_search(
         query_emb=query_emb,
         query_sparse=query_sparse,
         top_k=rerank_top_n,
-        doc_id=document_id,
+        doc_id=doc_id_param,
         space_id=space_id,
         acl_tags=acl_tags
     )
@@ -433,34 +451,82 @@ def process_youtube(
 
 @app.post("/process_document")
 async def process_document_endpoint(
-    file: UploadFile = File(...),
-    filename: str = Form(...),
+    files: List[UploadFile] = File(...),
+    file_urls: str = Form(...),  # JSON string of URLs corresponding to each file
     space_id: str = Form(...),
     use_openai: bool = Form(False)
 ) -> JSONResponse:
     """
-    Endpoint to process a document: chunk, embed, index, and store metadata.
-    Can use either Chonkie API or OpenAI directly for embeddings.
-    Returns the document_id.
+    Endpoint to process multiple documents: chunk, embed, index, and store metadata.
+    Each file can have a corresponding URL that will be stored in the file_path column.
+    
+    Args:
+        files: List of files to process
+        file_urls: JSON string containing URLs corresponding to each file
+        space_id: Space ID to associate with all documents
+        use_openai: Whether to use OpenAI for embeddings
+        
+    Returns:
+        List of document_ids for processed files
     """
-    logging.info(f"Process document endpoint called with: {filename}, space_id: {space_id}, use_openai: {use_openai}")
+    logging.info(f"Process document endpoint called with {len(files)} files, space_id: {space_id}, use_openai: {use_openai}")
     
-    file_path = os.path.join(UPLOAD_DIR, file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
-    
-    metadata = {"filename": filename, "space_id": space_id}
-    
+    # Parse the file_urls JSON string
     try:
-        if use_openai:
-            document_id = process_document_with_openai(file_path, metadata)
-        else:
-            document_id = process_document(file_path, metadata)
+        urls = json.loads(file_urls)
+        if not isinstance(urls, list):
+            return JSONResponse({"error": "file_urls must be a JSON array"}, status_code=400)
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "Invalid JSON in file_urls"}, status_code=400)
+    
+    # Validate that we have the same number of files and URLs
+    if len(files) != len(urls):
+        return JSONResponse(
+            {"error": f"Number of files ({len(files)}) does not match number of URLs ({len(urls)})"},
+            status_code=400
+        )
+    
+    document_ids = []
+    errors = []
+    
+    # Process each file with its corresponding URL
+    for i, (file, url) in enumerate(zip(files, urls)):
+        try:
+            # Save the uploaded file temporarily
+            temp_file_path = os.path.join(UPLOAD_DIR, file.filename)
+            with open(temp_file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
             
-        return JSONResponse({"document_id": document_id})
-    except Exception as e:
-        logging.exception(f"Error in process_document_endpoint: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+            # Prepare metadata with the URL as file_path
+            metadata = {
+                "filename": file.filename,
+                "space_id": space_id,
+                "file_path": url  # Store the URL in the file_path field
+            }
+            
+            # Process the document using the appropriate function
+            if use_openai:
+                document_id = process_document_with_openai(temp_file_path, metadata)
+            else:
+                document_id = process_document(temp_file_path, metadata)
+                
+            document_ids.append({"file": file.filename, "document_id": document_id, "url": url})
+            
+            # Clean up the temporary file
+            os.remove(temp_file_path)
+            
+        except Exception as e:
+            logging.exception(f"Error processing file {file.filename}: {e}")
+            errors.append({"file": file.filename, "error": str(e)})
+    
+    # Return results
+    if document_ids:
+        result = {"document_ids": document_ids}
+        if errors:
+            result["errors"] = errors
+        return JSONResponse(result)
+    else:
+        return JSONResponse({"error": "All files failed to process", "details": errors}, status_code=500)
 
 
 @app.post("/answer_query")
@@ -469,7 +535,8 @@ async def answer_query_endpoint(
     document_id: str = Form(...),
     space_id: Optional[str] = Form(None),
     acl_tags: Optional[str] = Form(None),  # Comma-separated
-    use_openai_embeddings: bool = Form(False)
+    use_openai_embeddings: bool = Form(False),
+    search_by_space_only: bool = Form(False)
 ) -> JSONResponse:
     """
     Endpoint to answer a query using the RAG pipeline.
@@ -477,7 +544,14 @@ async def answer_query_endpoint(
     """
     acl_list = [tag.strip() for tag in acl_tags.split(",")] if acl_tags else None
     try:
-        result = answer_query(query, document_id, space_id=space_id, acl_tags=acl_list, use_openai_embeddings=use_openai_embeddings)
+        result = answer_query(
+            query, 
+            document_id, 
+            space_id=space_id, 
+            acl_tags=acl_list, 
+            use_openai_embeddings=use_openai_embeddings,
+            search_by_space_only=search_by_space_only
+        )
         return JSONResponse(result)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
@@ -485,31 +559,64 @@ async def answer_query_endpoint(
 
 @app.post("/process_youtube")
 async def process_youtube_endpoint(
-    youtube_url: str = Form(...),
+    youtube_urls: str = Form(...),  # JSON string array of YouTube URLs
     space_id: str = Form(...),
     embedding_model: str = Form("text-embedding-ada-002"),
     chunk_size: int = Form(512),
     overlap_tokens: int = Form(80)
 ) -> JSONResponse:
     """
-    Endpoint to process a YouTube video: extract transcript, chunk, embed, and index.
-    Returns the document_id.
-    """
-    logging.info(f"Process YouTube endpoint called with URL: {youtube_url}, space_id: {space_id}")
+    Endpoint to process multiple YouTube videos: extract transcripts, chunk, embed, and index.
+    Returns the document_ids for all processed videos.
     
-    try:
-        document_id = process_youtube(
-            youtube_url=youtube_url,
-            space_id=space_id,
-            embedding_model=embedding_model,
-            chunk_size=chunk_size,
-            overlap_tokens=overlap_tokens
-        )
+    Args:
+        youtube_urls: JSON string array of YouTube URLs to process
+        space_id: Space ID to associate with all videos
+        embedding_model: Model to use for embeddings
+        chunk_size: Size of chunks in tokens
+        overlap_tokens: Number of tokens to overlap between chunks
         
-        return JSONResponse({"document_id": document_id})
-    except Exception as e:
-        logging.exception(f"Error in process_youtube_endpoint: {e}")
-        return JSONResponse({"error": str(e)}, status_code=500)
+    Returns:
+        List of document_ids with their corresponding YouTube URLs
+    """
+    logging.info(f"Process YouTube endpoint called with multiple URLs, space_id: {space_id}")
+    
+    # Parse the youtube_urls JSON string
+    try:
+        urls = json.loads(youtube_urls)
+        if not isinstance(urls, list):
+            return JSONResponse({"error": "youtube_urls must be a JSON array"}, status_code=400)
+    except json.JSONDecodeError:
+        return JSONResponse({"error": "Invalid JSON in youtube_urls"}, status_code=400)
+    
+    document_ids = []
+    errors = []
+    
+    # Process each YouTube URL
+    for url in urls:
+        try:
+            document_id = process_youtube(
+                youtube_url=url,
+                space_id=space_id,
+                embedding_model=embedding_model,
+                chunk_size=chunk_size,
+                overlap_tokens=overlap_tokens
+            )
+            
+            document_ids.append({"youtube_url": url, "document_id": document_id})
+            
+        except Exception as e:
+            logging.exception(f"Error processing YouTube URL {url}: {e}")
+            errors.append({"youtube_url": url, "error": str(e)})
+    
+    # Return results
+    if document_ids:
+        result = {"document_ids": document_ids}
+        if errors:
+            result["errors"] = errors
+        return JSONResponse(result)
+    else:
+        return JSONResponse({"error": "All YouTube URLs failed to process", "details": errors}, status_code=500)
 
 
 @app.post("/generate_flashcards")
