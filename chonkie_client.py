@@ -65,7 +65,8 @@ def chunk_document(
         "recipe": recipe,
         "lang": lang,
         "min_characters_per_chunk": str(min_characters_per_chunk),
-        "return_type": return_type
+        "return_type": return_type,
+        "page_numbers": True
     }
     
     if text is not None:

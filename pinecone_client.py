@@ -82,7 +82,8 @@ def upsert_vectors(
             metadata = {
                 "document_id": doc_id,
                 "space_id": space_id,
-                "text": chunk_text[:3000]  # Limit text length for Pinecone metadata size limits
+                "text": chunk_text[:3000],  # Limit text length for Pinecone metadata size limits
+                "page_number": chunk.get("pages", None)
             }
             
             # Add source_file if provided
