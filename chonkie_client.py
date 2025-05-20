@@ -66,8 +66,10 @@ def chunk_document(
         "lang": lang,
         "min_characters_per_chunk": str(min_characters_per_chunk),
         "return_type": return_type,
-        "page_numbers": True
     }
+    
+    if file_path and file_path.lower().endswith('.pdf'):
+        common_params["page_numbers"] = True
     
     if text is not None:
         # Process via direct text input (JSON request)
@@ -91,6 +93,7 @@ def chunk_document(
             headers.pop("Content-Type", None)
             
             resp = requests.post(url, files=files, data=common_params, headers=headers)
+            print('resp', resp.json(), resp.status_code, resp.text)
     
     # Handle response
     if resp.status_code != 200:
