@@ -489,6 +489,10 @@ def process_youtube(
             os.remove(file_path)
             logging.info(f"Removed transcript file: {file_path}")
 
+@app.get("/")
+async def root():
+    return {"greeting": "Hello!", "message": "Welcome to Nuton RAG Pipeline!"}
+
 
 @app.post("/process_document")
 async def process_document_endpoint(
