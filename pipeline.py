@@ -499,7 +499,7 @@ async def process_document_endpoint(
     files: List[UploadFile] = File(...),
     file_urls: str = Form(...),  # JSON string of URLs corresponding to each file
     space_id: str = Form(...),
-    use_openai: bool = Form(False)
+    use_openai: bool = Form(True)
 ) -> JSONResponse:
     """
     Endpoint to process multiple documents: chunk, embed, index, and store metadata.
