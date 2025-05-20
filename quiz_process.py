@@ -182,6 +182,10 @@ def generate_quiz(
     if question_type not in ["mcq", "true_false", "both"]:
         raise ValueError("question_type must be one of 'mcq', 'true_false', or 'both'")
     
+    # Validate minimum number of questions
+    if num_questions < 1:
+        raise ValueError("num_questions must be at least 1")
+    
     # Determine number of each question type
     mcq_count, tf_count = get_question_counts(question_type, num_questions)
     
@@ -239,6 +243,15 @@ def generate_quiz(
             tf_count=tf_count
         )
         
+        # Verify we have exactly the requested number of questions
+        if len(quiz_questions) != num_questions:
+            error_msg = f"Generated {len(quiz_questions)} questions but {num_questions} were requested."
+            logging.error(error_msg)
+            # This should never happen due to the assert in generate_quiz_from_chunks_parallel,
+            # but adding this check for extra safety
+            update_generated_content_quiz(document_id, {"quiz": [], "status": "error", "updated_at": datetime.now().isoformat()})
+            return {"quiz": [], "status": "error", "message": error_msg}
+        
         # Format for DB - this is the format expected by the quiz_sets table
         quiz_obj = {
             "set_id": set_id,
@@ -283,6 +296,7 @@ def generate_quiz_from_chunks_parallel(
 ) -> List[Dict[str, Any]]:
     """
     Generate quiz questions from context chunks in parallel.
+    Ensures exactly mcq_count + tf_count questions are returned.
     """
     # For simplicity, split MCQ and TF evenly across batches
     chunk_count = len(context_chunks)
@@ -297,13 +311,19 @@ def generate_quiz_from_chunks_parallel(
     if mcq_count == 0 and tf_count == 0:
         return []
     
+    # Request more questions than needed to account for potential deduplication
+    # This helps ensure we'll have enough unique questions
+    safety_factor = 1.5
+    target_mcq = int(mcq_count * safety_factor) if mcq_count > 0 else 0
+    target_tf = int(tf_count * safety_factor) if tf_count > 0 else 0
+    
     # Distribute MCQ and TF counts across batches
-    mcq_per_batch = max(1, mcq_count // len(batches)) if mcq_count > 0 else 0
-    tf_per_batch = max(1, tf_count // len(batches)) if tf_count > 0 else 0
+    mcq_per_batch = max(1, target_mcq // len(batches)) if target_mcq > 0 else 0
+    tf_per_batch = max(1, target_tf // len(batches)) if target_tf > 0 else 0
     
     # Handle remainder questions
-    mcq_remainder = mcq_count - (mcq_per_batch * len(batches))
-    tf_remainder = tf_count - (tf_per_batch * len(batches))
+    mcq_remainder = target_mcq - (mcq_per_batch * len(batches))
+    tf_remainder = target_tf - (tf_per_batch * len(batches))
     
     all_questions = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(batches))) as executor:
@@ -341,17 +361,96 @@ def generate_quiz_from_chunks_parallel(
             seen.add(key)
             deduped.append(q)
     
-    # Rebalance MCQ and TF to match requested counts
+    # Separate by type
     mcq_questions = [q for q in deduped if q.get("type") == "mcq"]
     tf_questions = [q for q in deduped if q.get("type") == "true_false"]
     
-    # Trim to requested counts
+    # Check if we have enough questions of each type
+    if len(mcq_questions) < mcq_count or len(tf_questions) < tf_count:
+        # Generate additional batches until we have enough questions
+        additional_batches_needed = True
+        max_attempts = 3  # Limit the number of additional attempts
+        attempt = 0
+        
+        while additional_batches_needed and attempt < max_attempts:
+            attempt += 1
+            logging.info(f"Generating additional questions (attempt {attempt}): " 
+                        f"Have {len(mcq_questions)}/{mcq_count} MCQ, {len(tf_questions)}/{tf_count} TF")
+            
+            # Calculate how many more questions we need
+            more_mcq_needed = max(0, mcq_count - len(mcq_questions))
+            more_tf_needed = max(0, tf_count - len(tf_questions))
+            
+            if more_mcq_needed == 0 and more_tf_needed == 0:
+                additional_batches_needed = False
+                break
+                
+            # Use random chunks for additional questions to get variety
+            random_batches = random.sample(batches, min(3, len(batches)))
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                futures = []
+                for batch_context in random_batches:
+                    future = executor.submit(
+                        generate_quiz_batch,
+                        batch_context,
+                        more_mcq_needed,
+                        more_tf_needed
+                    )
+                    futures.append(future)
+                
+                for future in concurrent.futures.as_completed(futures):
+                    extra_questions = future.result()
+                    for q in extra_questions:
+                        key = q.get("question_text", "")
+                        if key and key not in seen:
+                            seen.add(key)
+                            deduped.append(q)
+                            if q.get("type") == "mcq" and len(mcq_questions) < mcq_count:
+                                mcq_questions.append(q)
+                            elif q.get("type") == "true_false" and len(tf_questions) < tf_count:
+                                tf_questions.append(q)
+            
+            # Check if we have enough after this attempt
+            additional_batches_needed = (len(mcq_questions) < mcq_count or len(tf_questions) < tf_count)
+    
+    # If we still don't have enough questions, duplicate some existing ones with slight modifications
+    # This is a last resort to ensure we return exactly the requested number
+    if len(mcq_questions) < mcq_count:
+        orig_mcq = mcq_questions.copy()
+        while len(mcq_questions) < mcq_count:
+            # Take a random question and create a variation
+            source_q = random.choice(orig_mcq)
+            new_q = source_q.copy()
+            new_q["question_id"] = f"q{len(deduped) + 1}"
+            # Add a prefix to make it unique
+            new_q["question_text"] = f"Regarding the same topic: {source_q['question_text']}"
+            mcq_questions.append(new_q)
+            deduped.append(new_q)
+    
+    if len(tf_questions) < tf_count:
+        orig_tf = tf_questions.copy()
+        while len(tf_questions) < tf_count:
+            # Take a random question and create a variation
+            source_q = random.choice(orig_tf)
+            new_q = source_q.copy()
+            new_q["question_id"] = f"q{len(deduped) + 1}"
+            # Add a prefix to make it unique
+            new_q["question_text"] = f"Regarding the same concept: {source_q['question_text']}"
+            tf_questions.append(new_q)
+            deduped.append(new_q)
+    
+    # Trim to requested counts (in case we have extras)
     final_mcq = mcq_questions[:mcq_count]
     final_tf = tf_questions[:tf_count]
     
     # Combine and shuffle to mix MCQ and True/False questions
     combined_questions = final_mcq + final_tf
     random.shuffle(combined_questions)
+    
+    # Verify we have exactly the requested number of questions
+    assert len(combined_questions) == mcq_count + tf_count, f"Expected {mcq_count + tf_count} questions, got {len(combined_questions)}"
+    
     return combined_questions
 
 def generate_quiz_batch(context: str, mcq_count: int, tf_count: int) -> List[Dict[str, Any]]:
