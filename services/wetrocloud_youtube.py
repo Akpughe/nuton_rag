@@ -86,7 +86,9 @@ class WetroCloudYouTubeService:
                 
                 if data.get('success', False):
                     # Extract transcript entries
-                    transcript_entries = data.get('response', [])
+                    # print('data', data)
+                    transcript_entries = data.get('response', {}).get('data', [])
+
                     
                     # Convert to text
                     full_text = self.transcript_to_text(transcript_entries)
@@ -147,8 +149,8 @@ class WetroCloudYouTubeService:
             formatted_entries = []
             for entry in sorted_entries:
                 if entry.get('text'):
-                    # Convert timestamp to [MM:SS] format
-                    seconds = int(entry.get('start', 0))
+                    # Convert timestamp to [MM:SS] format - handle floating point values
+                    seconds = int(float(entry.get('start', 0)))
                     minutes = seconds // 60
                     remaining_seconds = seconds % 60
                     timestamp = f"[{minutes:02d}:{remaining_seconds:02d}]"
