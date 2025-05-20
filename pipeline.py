@@ -102,7 +102,7 @@ def process_document(
         min_characters_per_chunk=min_characters_per_chunk
     )
     chunks = flatten_chunks(chunks)
-    print(chunks)
+    # print(chunks)
     logging.info(f"Chunks type: {type(chunks)}, example: {chunks[:1]}")
     
     # 2. Embed chunks
@@ -119,7 +119,7 @@ def process_document(
     # 3. Prepare fields for pdfs table
     file_name = os.path.basename(file_path)
     file_type = os.path.splitext(file_path)[1][1:] or "unknown"
-    print('metadata', metadata)
+    # print('metadata', metadata)
     space_id = metadata.get("space_id")
     extracted_text = "No text extracted yet"
     
@@ -186,7 +186,7 @@ def process_document_with_openai(
             min_characters_per_chunk=min_characters_per_chunk
         )
         chunks = flatten_chunks(chunks)
-        print('chunks', chunks)
+        # print('chunks', chunks)
         
         if not chunks:
             logging.error(f"No chunks generated from document: {file_path}")
@@ -402,7 +402,7 @@ def process_youtube(
         raise ValueError(error_msg)
     
     transcript_text = transcript_result['text']
-    print('transcript_text', transcript_text)
+    # print('transcript_text', transcript_text)
     
     # Get video metadata
     yt_api_url = os.getenv('YT_API_URL', 'https://pdf-ocr-staging-production.up.railway.app')

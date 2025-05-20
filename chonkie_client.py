@@ -98,7 +98,7 @@ def chunk_document(
         raise Exception(f"Chonkie chunking failed: {resp.status_code} {resp.text}")
     
     data = resp.json()
-    logging.info(f"chunk_document data type: {type(data)}")
+    # logging.info(f"chunk_document data type: {type(data)}")
     
     # Safely handle different response formats
     if isinstance(data, dict) and "chunks" in data:
@@ -154,7 +154,7 @@ def embed_chunks(
         # print('payload', payload)
         resp = requests.post(url, json=payload, headers=HEADERS)
         logging.info(f"embed_chunks response: {resp.status_code}")
-        print('resp', resp.text)
+        # print('resp', resp.text)
         if resp.status_code != 200:
             error_msg = f"Chonkie embedding failed: {resp.status_code} {resp.text}"
             logging.error(error_msg)
@@ -162,7 +162,7 @@ def embed_chunks(
             # This allows the pipeline to detect and handle the error
             return [{"message": error_msg, "status": resp.status_code}]
         batch_result = resp.json()
-        print('batch_result', batch_result)
+        # print('batch_result', batch_result)
         # Check if the result itself contains an error message
         if isinstance(batch_result, dict) and ("error" in batch_result or "message" in batch_result):
             error_msg = batch_result.get("error", batch_result.get("message", "Unknown API error"))

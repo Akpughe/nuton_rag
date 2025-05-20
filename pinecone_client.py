@@ -57,8 +57,8 @@ def upsert_vectors(
             logger.error(error_msg)
             raise ValueError(error_msg)
     
-    logger.info(f"Type of chunks: {type(chunks)}; Example: {chunks[:1]}")
-    logger.info(f"Type of embeddings: {type(embeddings)}; Example: {embeddings[:1]}")
+    # logger.info(f"Type of chunks: {type(chunks)}; Example: {chunks[:1]}")
+    # logger.info(f"Type of embeddings: {type(embeddings)}; Example: {embeddings[:1]}")
     
     # Initialize indexes with new SDK format
     dense_index = pc.Index(DENSE_INDEX)
