@@ -75,6 +75,209 @@ Request body:
 Response:
 Streaming response of batches of flashcards.
 
+## API Endpoints (pipeline.py)
+
+### 1. Process Document
+
+**POST** `/process_document`
+
+Process and index one or more uploaded documents (PDFs, etc.) with optional OpenAI embeddings.
+
+**Parameters:**
+
+- `files` (List[UploadFile], required): One or more files to upload.
+- `file_urls` (str, required): JSON string array of URLs corresponding to each file (for storage reference).
+- `space_id` (str, required): Space ID to associate with all documents.
+- `use_openai` (bool, optional): Whether to use OpenAI for embeddings (default: False).
+
+**Example Request (multipart/form-data):**
+
+```
+files: [file1.pdf, file2.pdf]
+file_urls: ["https://example.com/file1.pdf", "https://example.com/file2.pdf"]
+space_id: myspace123
+use_openai: true
+```
+
+**Response:**
+
+```
+{
+  "document_ids": [
+    {"file": "file1.pdf", "document_id": "abc123", "url": "https://example.com/file1.pdf"},
+    {"file": "file2.pdf", "document_id": "def456", "url": "https://example.com/file2.pdf"}
+  ],
+  "errors": [
+    {"file": "file2.pdf", "error": "Failed to process..."}
+  ]
+}
+```
+
+---
+
+### 2. Answer Query
+
+**POST** `/answer_query`
+
+Answer a user query using the RAG pipeline (hybrid search, rerank, LLM answer generation).
+
+**Parameters:**
+
+- `query` (str, required): User's question.
+- `document_id` (str, required): Document ID to search within.
+- `space_id` (str, optional): Space ID to filter by.
+- `acl_tags` (str, optional): Comma-separated ACL tags to filter by.
+- `use_openai_embeddings` (bool, optional): Use OpenAI for embeddings (default: False).
+- `search_by_space_only` (bool, optional): Search by space only, ignore document_id (default: False).
+- `rerank_top_n` (int, optional): Number of results to rerank (default: 10).
+- `max_context_chunks` (int, optional): Max context chunks for LLM (default: 5).
+- `fast_mode` (bool, optional): Use faster settings (default: False).
+
+**Example Request (form-data):**
+
+```
+query: "What is the main idea?"
+document_id: "abc123"
+space_id: "myspace123"
+acl_tags: "tag1,tag2"
+use_openai_embeddings: true
+fast_mode: true
+```
+
+**Response:**
+
+```
+{
+  "answer": "The main idea is...",
+  "citations": [...],
+  "time_ms": 1234
+}
+```
+
+---
+
+### 3. Process YouTube
+
+**POST** `/process_youtube`
+
+Extract, chunk, embed, and index transcripts from one or more YouTube videos.
+
+**Parameters:**
+
+- `youtube_urls` (str, required): JSON string array of YouTube URLs.
+- `space_id` (str, required): Space ID to associate with all videos.
+- `embedding_model` (str, optional): Embedding model to use (default: "text-embedding-ada-002").
+- `chunk_size` (int, optional): Chunk size in tokens (default: 512).
+- `overlap_tokens` (int, optional): Overlap tokens between chunks (default: 80).
+
+**Example Request (form-data):**
+
+```
+youtube_urls: ["https://youtube.com/watch?v=abc123"]
+space_id: "myspace123"
+embedding_model: "text-embedding-ada-002"
+```
+
+**Response:**
+
+```
+{
+  "document_ids": [
+    {"youtube_url": "https://youtube.com/watch?v=abc123", "document_id": "yt_abc123"}
+  ],
+  "errors": [
+    {"youtube_url": "https://youtube.com/watch?v=def456", "error": "Failed to process..."}
+  ]
+}
+```
+
+---
+
+### 4. Generate Flashcards
+
+**POST** `/generate_flashcards`
+
+Generate flashcards from a document.
+
+**Request Body (JSON):**
+
+```
+{
+  "document_id": "abc123",
+  "space_id": "myspace123",
+  "num_questions": 10,
+  "acl_tags": ["tag1", "tag2"]
+}
+```
+
+**Response:**
+
+```
+{
+  "flashcards": [...]
+}
+```
+
+---
+
+### 5. Regenerate Flashcards
+
+**POST** `/regenerate_flashcards`
+
+Regenerate flashcards from a document (same as above, but for re-generation).
+
+**Request Body (JSON):**
+
+```
+{
+  "document_id": "abc123",
+  "space_id": "myspace123",
+  "num_questions": 10,
+  "acl_tags": ["tag1", "tag2"]
+}
+```
+
+**Response:**
+
+```
+{
+  "flashcards": [...]
+}
+```
+
+---
+
+### 6. Generate Quiz
+
+**POST** `/generate_quiz`
+
+Generate a quiz from a document.
+
+**Request Body (JSON):**
+
+```
+{
+  "document_id": "abc123",
+  "space_id": "myspace123",
+  "question_type": "both", // "mcq", "true_false", or "both"
+  "num_questions": 30,
+  "acl_tags": "tag1,tag2",
+  "rerank_top_n": 50,
+  "use_openai_embeddings": true,
+  "set_id": 1,
+  "title": "Quiz Title",
+  "description": "Quiz description."
+}
+```
+
+**Response:**
+
+```
+{
+  "quiz": [...]
+}
+```
+
 ## Components
 
 - `pinecone_study_service.py`: Main FastAPI application

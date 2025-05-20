@@ -86,7 +86,9 @@ class WetroCloudYouTubeService:
                 
                 if data.get('success', False):
                     # Extract transcript entries
-                    transcript_entries = data.get('response', [])
+                    # print('data', data)
+                    transcript_entries = data.get('response', {}).get('data', [])
+
                     
                     # Convert to text
                     full_text = self.transcript_to_text(transcript_entries)
@@ -147,8 +149,8 @@ class WetroCloudYouTubeService:
             formatted_entries = []
             for entry in sorted_entries:
                 if entry.get('text'):
-                    # Convert timestamp to [MM:SS] format
-                    seconds = int(entry.get('start', 0))
+                    # Convert timestamp to [MM:SS] format - handle floating point values
+                    seconds = int(float(entry.get('start', 0)))
                     minutes = seconds // 60
                     remaining_seconds = seconds % 60
                     timestamp = f"[{minutes:02d}:{remaining_seconds:02d}]"
@@ -163,70 +165,37 @@ class WetroCloudYouTubeService:
             # Fallback to simple concatenation
             return " ".join([entry.get('text', '') for entry in transcript_entries if entry.get('text')])
     
-    def get_video_title(self, video_url: str, video_id: Optional[str] = None) -> str:
+    def get_video_title(self, video_url: str, yt_api_url: str = None) -> str:
         """
-        Extract title for the video using the YouTube title API.
+        Get the title of a YouTube video.
         
         Args:
             video_url: YouTube video URL
-            video_id: YouTube video ID
+            yt_api_url: Optional URL for title API fallback
             
         Returns:
-            Video title
+            Video title or default title with video ID
         """
-        print('video_url here', video_url)
-        print('video_id here', video_id)
+        video_id = self.extract_video_id(video_url)
+        if not video_id:
+            return "Unknown YouTube Video"
+        
         try:
-            # Use API to get video title
-            response = requests.post(
-                f"{self.yt_api_url}/yt-video-title",
-                json={'url': video_url}
-            )
-            response.raise_for_status()
-            data = response.json()
-            print('data yt', data)
-            if data and 'title' in data:
-                return data['title']
-            else:
-                logger.warning(f"API did not return a title for video {video_id}")
-                return f"YouTube Video: {video_id}"
-              
-        except Exception as title_error:
-            logger.warning(f"Error getting video title from API: {title_error}")
-            # Default title using video ID if API fails
-            return f"YouTube Video: {video_id}"
-        
-    # def get_video_title(self, video_url: str, yt_api_url: str = None) -> str:
-    #     """
-    #     Get the title of a YouTube video.
-        
-    #     Args:
-    #         video_url: YouTube video URL
-    #         yt_api_url: Optional URL for title API fallback
-            
-    #     Returns:
-    #         Video title or default title with video ID
-    #     """
-    #     video_id = self.extract_video_id(video_url)
-    #     if not video_id:
-    #         return "Unknown YouTube Video"
-        
-    #     try:
-    #         # Try using existing title API if URL provided
-    #         if yt_api_url:
-    #             response = requests.post(
-    #                 f"{yt_api_url}/yt-video-title",
-    #                 json={'url': video_url}
-    #             )
-    #             response.raise_for_status()
-    #             data = response.json()
+            # Try using existing title API if URL provided
+            if yt_api_url:
+                response = requests.post(
+                    f"{yt_api_url}/yt-video-title",
+                    json={'url': video_url}
+                )
+                response.raise_for_status()
+                data = response.json()
                 
-    #             if data and 'title' in data:
-    #                 return data['title']
+                if data and 'title' in data:
+                    return data['title']
             
-    #         # Default title using video ID
-    #         return f"YouTube Video: {video_id}"
+            # Default title using video ID
+            return f"YouTube Video: {video_id}"
               
-    #     except Exception as e:
-    #         logger.warning(f"Error getting video title: {e}")
-    #         return f"YouTube Video: {video_id}" 
+        except Exception as e:
+            logger.warning(f"Error getting video title: {e}")
+            return f"YouTube Video: {video_id}" 
