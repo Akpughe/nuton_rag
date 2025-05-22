@@ -15,7 +15,7 @@ class WetroCloudYouTubeService:
     def __init__(self):
         """Initialize the WetroCloud YouTube service with API credentials."""
         self.api_key = os.getenv('WETROCLOUD_API_KEY', 'wtc-sk-e169406c8358895cdfae650adc21452f97aba4d4')
-        self.api_url = "https://api.wetrocloud.com/v1/youtube-transcript/"
+        self.api_url = "https://api.wetrocloud.com/v2/transcript/"
         logger.info("WetroCloudYouTubeService initialized")
     
     def extract_video_id(self, video_url: str) -> Optional[str]:
@@ -70,7 +70,8 @@ class WetroCloudYouTubeService:
             }
             
             payload = {
-                'youtube_link': video_url
+                'link': video_url,
+                'resource_type': 'youtube'
             }
             
             # Make API request
