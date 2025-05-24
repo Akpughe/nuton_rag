@@ -11,9 +11,9 @@ import time
 from functools import lru_cache
 
 from chonkie_client import chunk_document, embed_chunks, embed_chunks_v2, embed_query, embed_query_v2
-from pinecone_client import upsert_vectors, hybrid_search, hybrid_search_parallel, rerank_results
-from supabase_client import insert_pdf_record, insert_yts_record
-from groq_client import generate_answer
+from pinecone_client import upsert_vectors, hybrid_search, hybrid_search_parallel, rerank_results, hybrid_search_document_aware, rerank_results_document_aware
+from supabase_client import insert_pdf_record, insert_yts_record, get_documents_in_space
+from groq_client import generate_answer, generate_answer_document_aware
 import openai_client
 from services.wetrocloud_youtube import WetroCloudYouTubeService
 from flashcard_process import generate_flashcards, regenerate_flashcards
@@ -321,42 +321,127 @@ def answer_query(
     query_emb = query_embedded["embedding"]
     query_sparse = query_embedded.get("sparse")
     
-    # Set document_id to None if search_by_space_only is True
-    doc_id_param = None if search_by_space_only else document_id
+    # Enhanced logic for search_by_space_only
+    if search_by_space_only and space_id:
+        logging.info("Using enhanced document-aware search for space-wide query")
+        
+        # Get all documents in the space
+        space_documents = get_documents_in_space(space_id)
+        
+        if space_documents["total_count"] == 0:
+            return {"answer": "No documents found in this space.", "citations": []}
+        
+        # Extract all document IDs
+        all_document_ids = []
+        all_document_ids.extend([doc["id"] for doc in space_documents["pdfs"]])
+        all_document_ids.extend([doc["id"] for doc in space_documents["yts"]])
+        
+        logging.info(f"Found {len(all_document_ids)} documents in space: {space_documents['total_count']} total ({len(space_documents['pdfs'])} PDFs, {len(space_documents['yts'])} videos)")
+        
+        # Use document-aware search
+        search_start = time.time()
+        hits = hybrid_search_document_aware(
+            query_emb=query_emb,
+            query_sparse=query_sparse,
+            document_ids=all_document_ids,
+            space_id=space_id,
+            acl_tags=acl_tags,
+            top_k_per_doc=3,  # Get fewer results per document but from all documents
+            include_full_text=True
+        )
+        logging.info(f"Document-aware search took {time.time() - search_start:.2f}s")
+        
+        if not hits:
+            return {"answer": "No relevant context found in any documents.", "citations": []}
+        
+        # Use document-aware reranking
+        rerank_start = time.time()
+        reranked = rerank_results_document_aware(
+            query=query,
+            hits=hits,
+            top_n_per_doc=2,  # Top 2 results per document
+            max_total_results=min(max_context_chunks * 2, 12)  # Allow more results for comprehensive coverage
+        )
+        logging.info(f"Document-aware reranking took {time.time() - rerank_start:.2f}s")
+        
+        # Use enhanced context for multi-document answers
+        limited_context = reranked[:max_context_chunks * 2]  # Allow more context for comprehensive answers
+        
+        # Generate document-aware answer
+        llm_start = time.time()
+        try:
+            answer, citations = generate_answer_document_aware(
+                query=query,
+                context_chunks=limited_context,
+                space_documents=space_documents,
+                system_prompt=system_prompt,
+                model=groq_model
+            )
+        except Exception as e:
+            logging.warning(f"Groq document-aware generation failed, falling back to OpenAI: {e}")
+            # Fall back to regular OpenAI generation with enhanced context formatting
+            enhanced_context = []
+            for chunk in limited_context:
+                doc_id = chunk.get("metadata", {}).get("source_document_id", "unknown")
+                # Find document name
+                doc_name = "Unknown Document"
+                for pdf_doc in space_documents["pdfs"]:
+                    if pdf_doc["id"] == doc_id:
+                        doc_name = pdf_doc.get("file_name", "Unknown PDF")
+                        break
+                for yt_doc in space_documents["yts"]:
+                    if yt_doc["id"] == doc_id:
+                        doc_name = yt_doc.get("file_name", "Unknown Video")
+                        break
+                
+                # Add document source to chunk metadata
+                enhanced_chunk = chunk.copy()
+                if "metadata" in enhanced_chunk:
+                    enhanced_chunk["metadata"]["source_document_name"] = doc_name
+                enhanced_context.append(enhanced_chunk)
+            
+            answer, citations = openai_client.generate_answer(query, enhanced_context, system_prompt, model=openai_model)
+        
+        logging.info(f"LLM generation took {time.time() - llm_start:.2f}s")
+        
+    else:
+        # Original logic for single document or global search
+        doc_id_param = None if search_by_space_only else document_id
+        
+        # Use parallel hybrid search with optimized top_k
+        search_start = time.time()
+        hits = hybrid_search_parallel(
+            query_emb=query_emb,
+            query_sparse=query_sparse,
+            top_k=max(20, rerank_top_n * 2),  # Ensure we have enough results for reranking
+            doc_id=doc_id_param,
+            space_id=space_id,
+            acl_tags=acl_tags,
+            include_full_text=True  # Need full text for reranking
+        )
+        logging.info(f"Search took {time.time() - search_start:.2f}s")
+        
+        if not hits:
+            return {"answer": "No relevant context found.", "citations": []}
+        
+        # Rerank results (faster with optimized parameters)
+        rerank_start = time.time()
+        reranked = rerank_results(query, hits, top_n=rerank_top_n)
+        logging.info(f"Reranking took {time.time() - rerank_start:.2f}s")
+        
+        # Limit context to the top max_context_chunks chunks to reduce LLM input size
+        limited_context = reranked[:max_context_chunks]
+        
+        # Generate answer with limited context
+        llm_start = time.time()
+        try:
+            answer, citations = generate_answer(query, limited_context, system_prompt, model=groq_model)
+        except Exception as e:
+            logging.warning(f"Groq generation failed, falling back to OpenAI: {e}")
+            answer, citations = openai_client.generate_answer(query, limited_context, system_prompt, model=openai_model)
+        
+        logging.info(f"LLM generation took {time.time() - llm_start:.2f}s")
     
-    # Use parallel hybrid search with optimized top_k
-    search_start = time.time()
-    hits = hybrid_search_parallel(
-        query_emb=query_emb,
-        query_sparse=query_sparse,
-        top_k=max(20, rerank_top_n * 2),  # Ensure we have enough results for reranking
-        doc_id=doc_id_param,
-        space_id=space_id,
-        acl_tags=acl_tags,
-        include_full_text=True  # Need full text for reranking
-    )
-    logging.info(f"Search took {time.time() - search_start:.2f}s")
-    
-    if not hits:
-        return {"answer": "No relevant context found.", "citations": []}
-    
-    # Rerank results (faster with optimized parameters)
-    rerank_start = time.time()
-    reranked = rerank_results(query, hits, top_n=rerank_top_n)
-    logging.info(f"Reranking took {time.time() - rerank_start:.2f}s")
-    
-    # Limit context to the top max_context_chunks chunks to reduce LLM input size
-    limited_context = reranked[:max_context_chunks]
-    
-    # Generate answer with limited context
-    llm_start = time.time()
-    try:
-        answer, citations = generate_answer(query, limited_context, system_prompt, model=groq_model)
-    except Exception as e:
-        logging.warning(f"Groq generation failed, falling back to OpenAI: {e}")
-        answer, citations = openai_client.generate_answer(query, limited_context, system_prompt, model=openai_model)
-    
-    logging.info(f"LLM generation took {time.time() - llm_start:.2f}s")
     logging.info(f"Total query processing took {time.time() - start_time:.2f}s")
     
     return {"answer": answer, "citations": citations}

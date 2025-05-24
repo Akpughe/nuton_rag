@@ -208,3 +208,38 @@ def insert_quiz_set(content_id: str, quiz_obj: Dict[str, Any], set_number: int, 
         return str(response.data[0]["id"])
 
 # update flashcard
+
+def get_documents_in_space(space_id: str) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Get all documents (PDFs and YouTube videos) in a specific space.
+    
+    Args:
+        space_id: The space ID to query documents for
+        
+    Returns:
+        Dictionary with 'pdfs' and 'yts' keys containing lists of document metadata
+    """
+    try:
+        # Get PDF documents in the space
+        pdf_response = supabase.table("pdfs").select("id, file_name, file_path, file_type").eq("space_id", space_id).execute()
+        pdf_documents = pdf_response.data if pdf_response.data else []
+        
+        # Get YouTube videos in the space
+        yts_response = supabase.table("yts").select("id, file_name, yt_url, thumbnail").eq("space_id", space_id).execute()
+        yts_documents = yts_response.data if yts_response.data else []
+        
+        logging.info(f"Found {len(pdf_documents)} PDFs and {len(yts_documents)} YouTube videos in space {space_id}")
+        
+        return {
+            "pdfs": pdf_documents,
+            "yts": yts_documents,
+            "total_count": len(pdf_documents) + len(yts_documents)
+        }
+        
+    except Exception as e:
+        logging.error(f"Error getting documents in space {space_id}: {e}")
+        return {
+            "pdfs": [],
+            "yts": [],
+            "total_count": 0
+        }
