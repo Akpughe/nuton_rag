@@ -19,7 +19,7 @@ from services.wetrocloud_youtube import WetroCloudYouTubeService
 from flashcard_process import generate_flashcards, regenerate_flashcards
 from pydantic import BaseModel
 from typing import Optional, List
-from quiz_process import generate_quiz
+from quiz_process import generate_quiz, regenerate_quiz
 
 
 app = FastAPI()
@@ -873,7 +873,49 @@ async def generate_quiz_endpoint(
         return JSONResponse(result)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500) 
-    
+
+@app.post("/regenerate_quiz")
+async def regenerate_quiz_endpoint(
+    request: QuizRequest
+) -> JSONResponse:
+    """
+    Endpoint to regenerate quiz questions from a document, avoiding duplicates from previous sets.
+    Args:
+        request: QuizRequest containing parameters:
+            - document_id: The document to regenerate the quiz from.
+            - space_id: Optional space ID.
+            - question_type: Type of questions to generate ("mcq", "true_false", or "both").
+            - num_questions: Total number of questions to generate.
+            - acl_tags: Optional comma-separated ACL tags.
+            - rerank_top_n: Number of results to rerank.
+            - use_openai_embeddings: Whether to use OpenAI for embeddings.
+            - set_id: Quiz set number (will be auto-incremented).
+            - title: Optional quiz title.
+            - description: Optional quiz description.
+    Returns:
+        JSON response with new quiz questions or error message.
+    """
+    # Validate question_type
+    if request.question_type not in ["mcq", "true_false", "both"]:
+        return JSONResponse({"error": "question_type must be one of 'mcq', 'true_false', or 'both'"}, status_code=400)
+        
+    acl_list = [tag.strip() for tag in request.acl_tags.split(",")] if request.acl_tags else None
+    try:
+        result = regenerate_quiz(
+            document_id=request.document_id,
+            space_id=request.space_id,
+            question_type=request.question_type,
+            num_questions=request.num_questions,
+            acl_tags=acl_list,
+            rerank_top_n=request.rerank_top_n,
+            use_openai_embeddings=request.use_openai_embeddings,
+            title=request.title,
+            description=request.description
+        )
+        return JSONResponse(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
