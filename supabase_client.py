@@ -146,6 +146,43 @@ def get_existing_flashcards(content_id: str) -> List[Dict[str, Any]]:
         logging.error(f"Error retrieving existing flashcards: {e}")
         return []
 
+def get_existing_quizzes(content_id: str) -> List[Dict[str, Any]]:
+    """
+    Retrieves existing quizzes for a given content_id from the quiz_sets table.
+    
+    Args:
+        content_id: The content ID to retrieve quizzes for.
+        
+    Returns:
+        List of quiz sets with their questions.
+    """
+    try:
+        # Query the quiz_sets table for all sets associated with this content_id
+        response = supabase.table("quiz_sets").select("quiz, set_number, title, description").eq("content_id", content_id).order("set_number").execute()
+        
+        if not response.data or len(response.data) == 0:
+            return []
+            
+        # Extract quiz sets from the response
+        quiz_sets = []
+        for row in response.data:
+            quiz_data = row.get("quiz", {})
+            if quiz_data and isinstance(quiz_data, dict):
+                # Extract questions from the quiz object
+                questions = quiz_data.get("questions", [])
+                quiz_sets.append({
+                    "set_number": row.get("set_number"),
+                    "title": row.get("title"),
+                    "description": row.get("description"),
+                    "questions": questions,
+                    "total_questions": len(questions)
+                })
+        
+        return quiz_sets
+    except Exception as e:
+        logging.error(f"Error retrieving existing quizzes from quiz_sets table: {e}")
+        return []
+
 def insert_quiz_set(content_id: str, quiz_obj: Dict[str, Any], set_number: int, title: str = None, description: str = None) -> str:
     """
     Insert or update a quiz in the 'quiz_sets' table.
