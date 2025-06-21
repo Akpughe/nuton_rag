@@ -21,6 +21,8 @@ from pydantic import BaseModel
 from typing import Optional, List
 from quiz_process import generate_quiz, regenerate_quiz
 
+from prompts import main_prompt, general_knowledge_prompt, no_docs_in_space_prompt, no_relevant_in_scope_prompt, additional_space_only_prompt
+
 
 app = FastAPI()
 
@@ -282,12 +284,13 @@ def answer_query(
     space_id: Optional[str] = None,
     acl_tags: Optional[List[str]] = None,
     rerank_top_n: int = 10,  # Reduced from 15 to 10 for better performance
-    system_prompt: str = "You are a helpful assistant. Use only the provided context to answer.",
+    system_prompt: str = main_prompt,
     groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
     openai_model: str = "gpt-4o",
     use_openai_embeddings: bool = True,
     search_by_space_only: bool = False,
-    max_context_chunks: int = 5  # Limit context size for better performance
+    max_context_chunks: int = 5,  # Limit context size for better performance
+    allow_general_knowledge: bool = False  # New parameter for allowing general knowledge supplementation
 ) -> Dict[str, Any]:
     """
     Optimized function to answer a user query using hybrid search, rerank, and LLM generation.
@@ -299,15 +302,20 @@ def answer_query(
         space_id: Filter results to this space ID.
         acl_tags: Optional list of ACL tags to filter by.
         rerank_top_n: Number of results to rerank.
-        system_prompt: System prompt for the LLM.
+        system_prompt: System prompt for the LLM (will be overridden if allow_general_knowledge is True).
         groq_model: Model to use with Groq.
         openai_model: Model to use with OpenAI (fallback).
         use_openai_embeddings: Whether to use OpenAI directly for embeddings.
         search_by_space_only: If True, search based on space_id only, ignoring document_id.
         max_context_chunks: Maximum number of chunks to include in context for the LLM.
+        allow_general_knowledge: If True, allows LLM to supplement answers with general knowledge when context is insufficient.
     """
     start_time = time.time()
-    logging.info(f"Answering query: '{query}' for document {document_id if not search_by_space_only else 'None'} in space {space_id}")
+    logging.info(f"Answering query: '{query}' for document {document_id if not search_by_space_only else 'None'} in space {space_id}, allow_general_knowledge: {allow_general_knowledge}")
+    
+    # Override system prompt based on allow_general_knowledge setting
+    if allow_general_knowledge:
+        system_prompt = general_knowledge_prompt
     
     # Use cached embeddings for the query
     query_embedded = get_query_embedding(query, use_openai_embeddings)
@@ -325,11 +333,30 @@ def answer_query(
     if search_by_space_only and space_id:
         logging.info("Using enhanced document-aware search for space-wide query")
         
+        # Use additional space-only prompt for space-wide searches regardless of allow_general_knowledge setting
+        if allow_general_knowledge:
+            # Combine general knowledge prompt with space-only instructions
+            system_prompt = general_knowledge_prompt + "\n\n" + additional_space_only_prompt
+        else:
+            # Combine main prompt with space-only instructions
+            system_prompt = main_prompt + "\n\n" + additional_space_only_prompt
+        
         # Get all documents in the space
         space_documents = get_documents_in_space(space_id)
         
         if space_documents["total_count"] == 0:
-            return {"answer": "No documents found in this space.", "citations": []}
+            if allow_general_knowledge:
+                # If no documents found but general knowledge is allowed, still try to answer
+                logging.info("No documents in space, but allow_general_knowledge is True - generating answer with general knowledge only")
+                try:
+                    fallback_prompt = no_docs_in_space_prompt
+                    answer, citations = generate_answer(query, [], fallback_prompt, model=groq_model)
+                except Exception as e:
+                    logging.warning(f"Groq generation failed for general knowledge fallback, trying OpenAI: {e}")
+                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model)
+                return {"answer": answer, "citations": citations}
+            else:
+                return {"answer": "No documents found in this space.", "citations": []}
         
         # Extract all document IDs
         all_document_ids = []
@@ -352,7 +379,18 @@ def answer_query(
         logging.info(f"Document-aware search took {time.time() - search_start:.2f}s")
         
         if not hits:
-            return {"answer": "No relevant context found in any documents.", "citations": []}
+            if allow_general_knowledge:
+                # If no relevant context found but general knowledge is allowed
+                logging.info("No relevant context found, but allow_general_knowledge is True - generating answer with general knowledge")
+                try:
+                    fallback_prompt = no_relevant_in_scope_prompt.format(query=query, scope="the user’s space")
+                    answer, citations = generate_answer(query, [], fallback_prompt, model=groq_model)
+                except Exception as e:
+                    logging.warning(f"Groq generation failed for general knowledge fallback, trying OpenAI: {e}")
+                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model)
+                return {"answer": answer, "citations": citations}
+            else:
+                return {"answer": "No relevant context found in any documents.", "citations": []}
         
         # Use document-aware reranking
         rerank_start = time.time()
@@ -422,7 +460,18 @@ def answer_query(
         logging.info(f"Search took {time.time() - search_start:.2f}s")
         
         if not hits:
-            return {"answer": "No relevant context found.", "citations": []}
+            if allow_general_knowledge:
+                # If no relevant context found but general knowledge is allowed
+                logging.info("No relevant context found, but allow_general_knowledge is True - generating answer with general knowledge")
+                try:
+                    fallback_prompt = no_relevant_in_scope_prompt.format(query=query, scope="the specified document(s)")
+                    answer, citations = generate_answer(query, [], fallback_prompt, model=groq_model)
+                except Exception as e:
+                    logging.warning(f"Groq generation failed for general knowledge fallback, trying OpenAI: {e}")
+                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model)
+                return {"answer": answer, "citations": citations}
+            else:
+                return {"answer": "No relevant context found.", "citations": []}
         
         # Rerank results (faster with optimized parameters)
         rerank_start = time.time()
@@ -669,7 +718,8 @@ async def answer_query_endpoint(
     search_by_space_only: bool = Form(False),
     rerank_top_n: Optional[int] = Form(10),
     max_context_chunks: Optional[int] = Form(5),
-    fast_mode: bool = Form(False)  # New parameter for faster but potentially lower quality results
+    fast_mode: bool = Form(False),  # New parameter for faster but potentially lower quality results
+    allow_general_knowledge: bool = Form(False)  # New parameter for allowing general knowledge supplementation
 ) -> JSONResponse:
     """
     Optimized endpoint to answer a query using the RAG pipeline.
@@ -685,6 +735,7 @@ async def answer_query_endpoint(
         rerank_top_n: Number of results to rerank (default: 10)
         max_context_chunks: Maximum number of chunks to include in context (default: 5)
         fast_mode: If True, uses optimized settings for faster response time
+        allow_general_knowledge: If True, allows LLM to supplement answers with general knowledge when context is insufficient
     """
     start_time = time.time()
     acl_list = [tag.strip() for tag in acl_tags.split(",")] if acl_tags else None
@@ -703,7 +754,8 @@ async def answer_query_endpoint(
             use_openai_embeddings=use_openai_embeddings,
             search_by_space_only=search_by_space_only,
             rerank_top_n=rerank_top_n,
-            max_context_chunks=max_context_chunks
+            max_context_chunks=max_context_chunks,
+            allow_general_knowledge=allow_general_knowledge
         )
         result["time_ms"] = int((time.time() - start_time) * 1000)  # Add time taken in ms
         return JSONResponse(result)
