@@ -22,6 +22,7 @@ from typing import Optional, List
 from quiz_process import generate_quiz, regenerate_quiz
 
 from prompts import main_prompt, general_knowledge_prompt, no_docs_in_space_prompt, no_relevant_in_scope_prompt, additional_space_only_prompt
+from websearch_client import analyze_document_context, generate_contextual_search_queries, perform_contextual_websearch, synthesize_rag_and_web_results
 
 
 app = FastAPI()
@@ -285,12 +286,13 @@ def answer_query(
     acl_tags: Optional[List[str]] = None,
     rerank_top_n: int = 10,  # Reduced from 15 to 10 for better performance
     system_prompt: str = main_prompt,
-    groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
-    openai_model: str = "gpt-4o-mini",
+    openai_model: str = "gpt-4o-mini",  # Fallback model for OpenAI when Groq fails
     use_openai_embeddings: bool = True,
     search_by_space_only: bool = False,
     max_context_chunks: int = 5,  # Limit context size for better performance
-    allow_general_knowledge: bool = False  # New parameter for allowing general knowledge supplementation
+    allow_general_knowledge: bool = False,  # New parameter for allowing general knowledge supplementation
+    enable_websearch: bool = False,  # New parameter for enabling contextual web search
+    model: str = "meta-llama/llama-4-scout-17b-16e-instruct"  # User-selectable model parameter
 ) -> Dict[str, Any]:
     """
     Optimized function to answer a user query using hybrid search, rerank, and LLM generation.
@@ -303,12 +305,13 @@ def answer_query(
         acl_tags: Optional list of ACL tags to filter by.
         rerank_top_n: Number of results to rerank.
         system_prompt: System prompt for the LLM (will be overridden if allow_general_knowledge is True).
-        groq_model: Model to use with Groq.
-        openai_model: Model to use with OpenAI (fallback).
+        openai_model: Fallback model to use with OpenAI when Groq fails.
         use_openai_embeddings: Whether to use OpenAI directly for embeddings.
         search_by_space_only: If True, search based on space_id only, ignoring document_id.
         max_context_chunks: Maximum number of chunks to include in context for the LLM.
         allow_general_knowledge: If True, allows LLM to supplement answers with general knowledge when context is insufficient.
+        enable_websearch: If True, performs contextual web search to supplement RAG results.
+        model: The model to use for generation. Auto-switches to GPT-4o when websearch is enabled.
     """
     start_time = time.time()
     logging.info(f"Answering query: '{query}' for document {document_id if not search_by_space_only else 'None'} in space {space_id}, allow_general_knowledge: {allow_general_knowledge}")
@@ -316,6 +319,16 @@ def answer_query(
     # Override system prompt based on allow_general_knowledge setting
     if allow_general_knowledge:
         system_prompt = general_knowledge_prompt
+    
+    # Determine which LLM to use based on model parameter
+    # Auto-switch to GPT-4o if websearch is enabled
+    if enable_websearch:
+        effective_model = "gpt-4o"
+        use_openai = True
+    else:
+        effective_model = model
+        # Determine if the model is OpenAI or Groq based on model name
+        use_openai = effective_model.startswith("gpt-") or effective_model in ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"]
     
     # Use cached embeddings for the query
     query_embedded = get_query_embedding(query, use_openai_embeddings)
@@ -348,12 +361,15 @@ def answer_query(
             if allow_general_knowledge:
                 # If no documents found but general knowledge is allowed, still try to answer
                 logging.info("No documents in space, but allow_general_knowledge is True - generating answer with general knowledge only")
-                try:
-                    fallback_prompt = no_docs_in_space_prompt
-                    answer, citations = generate_answer(query, [], fallback_prompt, model=groq_model)
-                except Exception as e:
-                    logging.warning(f"Groq generation failed for general knowledge fallback, trying OpenAI: {e}")
-                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model)
+                fallback_prompt = no_docs_in_space_prompt
+                if use_openai:
+                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=effective_model)
+                else:
+                    try:
+                        answer, citations = generate_answer(query, [], fallback_prompt, model=effective_model)
+                    except Exception as e:
+                        logging.warning(f"Groq generation failed for general knowledge fallback, trying OpenAI: {e}")
+                        answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model)
                 return {"answer": answer, "citations": citations}
             else:
                 return {"answer": "No documents found in this space.", "citations": []}
@@ -382,12 +398,15 @@ def answer_query(
             if allow_general_knowledge:
                 # If no relevant context found but general knowledge is allowed
                 logging.info("No relevant context found, but allow_general_knowledge is True - generating answer with general knowledge")
-                try:
-                    fallback_prompt = no_relevant_in_scope_prompt.format(query=query, scope="the user’s space")
-                    answer, citations = generate_answer(query, [], fallback_prompt, model=groq_model)
-                except Exception as e:
-                    logging.warning(f"Groq generation failed for general knowledge fallback, trying OpenAI: {e}")
-                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model)
+                fallback_prompt = no_relevant_in_scope_prompt.format(query=query, scope="the user's space")
+                if use_openai:
+                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=effective_model)
+                else:
+                    try:
+                        answer, citations = generate_answer(query, [], fallback_prompt, model=effective_model)
+                    except Exception as e:
+                        logging.warning(f"Groq generation failed for general knowledge fallback, trying OpenAI: {e}")
+                        answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model)
                 return {"answer": answer, "citations": citations}
             else:
                 return {"answer": "No relevant context found in any documents.", "citations": []}
@@ -407,17 +426,8 @@ def answer_query(
         
         # Generate document-aware answer
         llm_start = time.time()
-        try:
-            answer, citations = generate_answer_document_aware(
-                query=query,
-                context_chunks=limited_context,
-                space_documents=space_documents,
-                system_prompt=system_prompt,
-                model=groq_model
-            )
-        except Exception as e:
-            logging.warning(f"Groq document-aware generation failed, falling back to OpenAI: {e}")
-            # Fall back to regular OpenAI generation with enhanced context formatting
+        if use_openai:
+            # Use OpenAI with enhanced context formatting
             enhanced_context = []
             for chunk in limited_context:
                 doc_id = chunk.get("metadata", {}).get("source_document_id", "unknown")
@@ -438,7 +448,40 @@ def answer_query(
                     enhanced_chunk["metadata"]["source_document_name"] = doc_name
                 enhanced_context.append(enhanced_chunk)
             
-            answer, citations = openai_client.generate_answer(query, enhanced_context, system_prompt, model=openai_model)
+            answer, citations = openai_client.generate_answer(query, enhanced_context, system_prompt, model=effective_model)
+        else:
+            try:
+                answer, citations = generate_answer_document_aware(
+                    query=query,
+                    context_chunks=limited_context,
+                    space_documents=space_documents,
+                    system_prompt=system_prompt,
+                    model=effective_model
+                )
+            except Exception as e:
+                logging.warning(f"Groq document-aware generation failed, falling back to OpenAI: {e}")
+                # Fall back to OpenAI generation
+                enhanced_context = []
+                for chunk in limited_context:
+                    doc_id = chunk.get("metadata", {}).get("source_document_id", "unknown")
+                    # Find document name
+                    doc_name = "Unknown Document"
+                    for pdf_doc in space_documents["pdfs"]:
+                        if pdf_doc["id"] == doc_id:
+                            doc_name = pdf_doc.get("file_name", "Unknown PDF")
+                            break
+                    for yt_doc in space_documents["yts"]:
+                        if yt_doc["id"] == doc_id:
+                            doc_name = yt_doc.get("file_name", "Unknown Video")
+                            break
+                    
+                    # Add document source to chunk metadata
+                    enhanced_chunk = chunk.copy()
+                    if "metadata" in enhanced_chunk:
+                        enhanced_chunk["metadata"]["source_document_name"] = doc_name
+                    enhanced_context.append(enhanced_chunk)
+                
+                answer, citations = openai_client.generate_answer(query, enhanced_context, system_prompt, model=openai_model)
         
         logging.info(f"LLM generation took {time.time() - llm_start:.2f}s")
         
@@ -463,12 +506,15 @@ def answer_query(
             if allow_general_knowledge:
                 # If no relevant context found but general knowledge is allowed
                 logging.info("No relevant context found, but allow_general_knowledge is True - generating answer with general knowledge")
-                try:
-                    fallback_prompt = no_relevant_in_scope_prompt.format(query=query, scope="the specified document(s)")
-                    answer, citations = generate_answer(query, [], fallback_prompt, model=groq_model)
-                except Exception as e:
-                    logging.warning(f"Groq generation failed for general knowledge fallback, trying OpenAI: {e}")
-                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model)
+                fallback_prompt = no_relevant_in_scope_prompt.format(query=query, scope="the specified document(s)")
+                if use_openai:
+                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=effective_model)
+                else:
+                    try:
+                        answer, citations = generate_answer(query, [], fallback_prompt, model=effective_model)
+                    except Exception as e:
+                        logging.warning(f"Groq generation failed for general knowledge fallback, trying OpenAI: {e}")
+                        answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model)
                 return {"answer": answer, "citations": citations}
             else:
                 return {"answer": "No relevant context found.", "citations": []}
@@ -483,13 +529,63 @@ def answer_query(
         
         # Generate answer with limited context
         llm_start = time.time()
-        try:
-            answer, citations = generate_answer(query, limited_context, system_prompt, model=groq_model)
-        except Exception as e:
-            logging.warning(f"Groq generation failed, falling back to OpenAI: {e}")
-            answer, citations = openai_client.generate_answer(query, limited_context, system_prompt, model=openai_model)
+        if use_openai:
+            answer, citations = openai_client.generate_answer(query, limited_context, system_prompt, model=effective_model)
+        else:
+            try:
+                answer, citations = generate_answer(query, limited_context, system_prompt, model=effective_model)
+            except Exception as e:
+                logging.warning(f"Groq generation failed, falling back to OpenAI: {e}")
+                answer, citations = openai_client.generate_answer(query, limited_context, system_prompt, model=openai_model)
         
         logging.info(f"LLM generation took {time.time() - llm_start:.2f}s")
+    
+    # Handle websearch integration if enabled
+    if enable_websearch:
+        try:
+            websearch_start = time.time()
+            logging.info("Starting contextual web search integration")
+            
+            # Note: GPT-4o is automatically used for websearch synthesis in websearch_client
+            
+            # Build RAG context for analysis
+            rag_context = "\n\n".join([
+                chunk["text"] if "text" in chunk 
+                else chunk["metadata"]["text"] if "metadata" in chunk and "text" in chunk["metadata"] 
+                else "" 
+                for chunk in limited_context
+            ])
+
+            # Analyze document context to understand domain and guide search
+            context_analysis = analyze_document_context(rag_context, query)
+
+            # Generate targeted search queries based on document context
+            search_queries = generate_contextual_search_queries(query, context_analysis)
+
+            # Perform contextual web search
+            web_results = perform_contextual_websearch(search_queries)
+            
+            if web_results:
+                # Synthesize RAG results with web search results using GPT-4o
+                synthesized_answer, combined_sources = synthesize_rag_and_web_results(
+                    query=query,
+                    rag_context=rag_context,
+                    web_results=web_results,
+                    context_analysis=context_analysis,
+                    system_prompt=system_prompt
+                )
+                
+                # Update answer and citations with synthesized results
+                answer = synthesized_answer
+                citations.extend(combined_sources)
+                
+                logging.info(f"Websearch integration took {time.time() - websearch_start:.2f}s")
+            else:
+                logging.info("No web results found, using original RAG answer")
+                
+        except Exception as e:
+            logging.error(f"Websearch integration failed: {e}")
+            logging.info("Falling back to original RAG answer")
     
     logging.info(f"Total query processing took {time.time() - start_time:.2f}s")
     
@@ -719,7 +815,9 @@ async def answer_query_endpoint(
     rerank_top_n: Optional[int] = Form(10),
     max_context_chunks: Optional[int] = Form(5),
     fast_mode: bool = Form(False),  # New parameter for faster but potentially lower quality results
-    allow_general_knowledge: bool = Form(False)  # New parameter for allowing general knowledge supplementation
+    allow_general_knowledge: bool = Form(False),  # New parameter for allowing general knowledge supplementation
+    enable_websearch: bool = Form(False),  # New parameter for enabling contextual web search
+    model: str = Form("meta-llama/llama-4-scout-17b-16e-instruct")  # User-selectable model parameter
 ) -> JSONResponse:
     """
     Optimized endpoint to answer a query using the RAG pipeline.
@@ -736,6 +834,8 @@ async def answer_query_endpoint(
         max_context_chunks: Maximum number of chunks to include in context (default: 5)
         fast_mode: If True, uses optimized settings for faster response time
         allow_general_knowledge: If True, allows LLM to supplement answers with general knowledge when context is insufficient
+        enable_websearch: If True, performs contextual web search to supplement RAG results
+        model: The model to use for generation. Auto-switches to GPT-4o when websearch is enabled.
     """
     start_time = time.time()
     acl_list = [tag.strip() for tag in acl_tags.split(",")] if acl_tags else None
@@ -755,7 +855,9 @@ async def answer_query_endpoint(
             search_by_space_only=search_by_space_only,
             rerank_top_n=rerank_top_n,
             max_context_chunks=max_context_chunks,
-            allow_general_knowledge=allow_general_knowledge
+            allow_general_knowledge=allow_general_knowledge,
+            enable_websearch=enable_websearch,
+            model=model
         )
         result["time_ms"] = int((time.time() - start_time) * 1000)  # Add time taken in ms
         return JSONResponse(result)
