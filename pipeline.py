@@ -21,7 +21,10 @@ from pydantic import BaseModel
 from typing import Optional, List
 from quiz_process import generate_quiz, regenerate_quiz
 
-from prompts import main_prompt, general_knowledge_prompt, no_docs_in_space_prompt, no_relevant_in_scope_prompt, additional_space_only_prompt
+from prompts import main_prompt, general_knowledge_prompt, simple_general_knowledge_prompt, no_docs_in_space_prompt, no_relevant_in_scope_prompt, additional_space_only_prompt
+from intelligent_enrichment import create_enriched_system_prompt
+from enrichment_examples import create_few_shot_enhanced_prompt
+from enhanced_prompts import get_domain_from_context
 from websearch_client import analyze_document_context, generate_contextual_search_queries, perform_contextual_websearch, synthesize_rag_and_web_results
 
 
@@ -292,7 +295,8 @@ def answer_query(
     max_context_chunks: int = 5,  # Limit context size for better performance
     allow_general_knowledge: bool = False,  # New parameter for allowing general knowledge supplementation
     enable_websearch: bool = False,  # New parameter for enabling contextual web search
-    model: str = "meta-llama/llama-4-scout-17b-16e-instruct"  # User-selectable model parameter
+    model: str = "meta-llama/llama-4-scout-17b-16e-instruct",  # User-selectable model parameter
+    enrichment_mode: str = "simple"  # "simple" (default) or "advanced" for intelligent enrichment
 ) -> Dict[str, Any]:
     """
     Optimized function to answer a user query using hybrid search, rerank, and LLM generation.
@@ -312,9 +316,10 @@ def answer_query(
         allow_general_knowledge: If True, allows LLM to enrich answers with general knowledge even when documents are sufficient, providing additional insights and context.
         enable_websearch: If True, performs contextual web search to supplement RAG results.
         model: The model to use for generation. Auto-switches to GPT-4o when websearch is enabled.
+        enrichment_mode: "simple" (default, classic enrichment) or "advanced" (intelligent domain-aware enrichment).
     """
     start_time = time.time()
-    logging.info(f"Answering query: '{query}' for document {document_id if not search_by_space_only else 'None'} in space {space_id}, allow_general_knowledge: {allow_general_knowledge}, enable_websearch: {enable_websearch}")
+    logging.info(f"Answering query: '{query}' for document {document_id if not search_by_space_only else 'None'} in space {space_id}, allow_general_knowledge: {allow_general_knowledge}, enable_websearch: {enable_websearch}, enrichment_mode: {enrichment_mode}")
     
     # Determine which LLM to use based on model parameter
     # Auto-switch to GPT-4o if websearch is enabled
@@ -331,9 +336,16 @@ def answer_query(
         # Determine if the model is OpenAI or Groq based on model name
         use_openai = effective_model.startswith("gpt-") or effective_model in ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"]
     
-    # Override system prompt based on allow_general_knowledge setting (after auto-enable logic)
+    # Set initial system prompt based on allow_general_knowledge setting and enrichment mode
     if allow_general_knowledge:
-        system_prompt = general_knowledge_prompt
+        if enrichment_mode == "advanced":
+            # Will be enhanced later with intelligent enrichment
+            system_prompt = general_knowledge_prompt
+        else:
+            # Simple mode: use simple general knowledge prompt (classic enrichment without complexity)
+            system_prompt = simple_general_knowledge_prompt
+    else:
+        system_prompt = main_prompt
     
     # Use cached embeddings for the query
     query_embedded = get_query_embedding(query, use_openai_embeddings)
@@ -428,6 +440,33 @@ def answer_query(
         
         # Use enhanced context for multi-document answers
         limited_context = reranked[:max_context_chunks * 2]  # Allow more context for comprehensive answers
+        
+        # Apply intelligent enrichment if general knowledge is enabled and in advanced mode
+        if allow_general_knowledge and enrichment_mode == "advanced":
+            # Build context from available chunks for enrichment analysis
+            rag_context_preview = "\n\n".join([
+                chunk["text"] if "text" in chunk 
+                else chunk["metadata"]["text"] if "metadata" in chunk and "text" in chunk["metadata"] 
+                else "" 
+                for chunk in limited_context[:3]  # Use first few chunks for analysis
+            ])
+            
+            # Create intelligent enrichment prompt
+            enhanced_prompt, enrichment_metadata = create_enriched_system_prompt(
+                query, rag_context_preview, allow_general_knowledge, general_knowledge_prompt
+            )
+            
+            # Add few-shot examples for better guidance
+            domain = enrichment_metadata.get("domain", "general")
+            system_prompt = create_few_shot_enhanced_prompt(enhanced_prompt, domain)
+            
+            # Log enrichment strategy
+            if enrichment_metadata.get("enrichment_applied"):
+                logging.info(f"Applied intelligent enrichment for {domain} domain: {enrichment_metadata.get('reason', 'standard enrichment')}")
+            else:
+                logging.info(f"Using standard general knowledge prompt: {enrichment_metadata.get('reason', 'no specific enrichment needed')}")
+        elif allow_general_knowledge and enrichment_mode == "simple":
+            logging.info("Using simple general knowledge enrichment mode (classic behavior)")
         
         # Generate document-aware answer
         llm_start = time.time()
@@ -531,6 +570,33 @@ def answer_query(
         
         # Limit context to the top max_context_chunks chunks to reduce LLM input size
         limited_context = reranked[:max_context_chunks]
+        
+        # Apply intelligent enrichment if general knowledge is enabled and in advanced mode
+        if allow_general_knowledge and enrichment_mode == "advanced":
+            # Build context from available chunks for enrichment analysis
+            rag_context_preview = "\n\n".join([
+                chunk["text"] if "text" in chunk 
+                else chunk["metadata"]["text"] if "metadata" in chunk and "text" in chunk["metadata"] 
+                else "" 
+                for chunk in limited_context[:3]  # Use first few chunks for analysis
+            ])
+            
+            # Create intelligent enrichment prompt
+            enhanced_prompt, enrichment_metadata = create_enriched_system_prompt(
+                query, rag_context_preview, allow_general_knowledge, general_knowledge_prompt
+            )
+            
+            # Add few-shot examples for better guidance
+            domain = enrichment_metadata.get("domain", "general")
+            system_prompt = create_few_shot_enhanced_prompt(enhanced_prompt, domain)
+            
+            # Log enrichment strategy
+            if enrichment_metadata.get("enrichment_applied"):
+                logging.info(f"Applied intelligent enrichment for {domain} domain: {enrichment_metadata.get('reason', 'standard enrichment')}")
+            else:
+                logging.info(f"Using standard general knowledge prompt: {enrichment_metadata.get('reason', 'no specific enrichment needed')}")
+        elif allow_general_knowledge and enrichment_mode == "simple":
+            logging.info("Using simple general knowledge enrichment mode (classic behavior)")
         
         # Generate answer with limited context
         llm_start = time.time()
@@ -823,7 +889,8 @@ async def answer_query_endpoint(
     fast_mode: bool = Form(False),  # New parameter for faster but potentially lower quality results
     allow_general_knowledge: bool = Form(False),  # New parameter for allowing general knowledge supplementation
     enable_websearch: bool = Form(False),  # New parameter for enabling contextual web search
-    model: str = Form("meta-llama/llama-4-scout-17b-16e-instruct")  # User-selectable model parameter
+    model: str = Form("meta-llama/llama-4-scout-17b-16e-instruct"),  # User-selectable model parameter
+    enrichment_mode: str = Form("simple")  # "simple" (default) or "advanced" for intelligent enrichment
 ) -> JSONResponse:
     """
     Optimized endpoint to answer a query using the RAG pipeline.
@@ -842,6 +909,7 @@ async def answer_query_endpoint(
         allow_general_knowledge: If True, allows LLM to enrich answers with general knowledge, expanding beyond documents with additional insights and context
         enable_websearch: If True, performs contextual web search to supplement RAG results
         model: The model to use for generation. Auto-switches to GPT-4o when websearch is enabled.
+        enrichment_mode: "simple" (default, classic enrichment) or "advanced" (intelligent domain-aware enrichment)
     """
     start_time = time.time()
     acl_list = [tag.strip() for tag in acl_tags.split(",")] if acl_tags else None
@@ -863,7 +931,8 @@ async def answer_query_endpoint(
             max_context_chunks=max_context_chunks,
             allow_general_knowledge=allow_general_knowledge,
             enable_websearch=enable_websearch,
-            model=model
+            model=model,
+            enrichment_mode=enrichment_mode
         )
         result["time_ms"] = int((time.time() - start_time) * 1000)  # Add time taken in ms
         return JSONResponse(result)
