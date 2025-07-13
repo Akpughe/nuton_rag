@@ -368,10 +368,11 @@ def synthesize_rag_and_web_results(
     rag_context: str,
     web_results: List[Dict[str, Any]],
     context_analysis: Dict[str, Any],
-    system_prompt: str
+    system_prompt: str,
+    has_general_knowledge: bool = True
 ) -> Tuple[str, List[Dict]]:
     """
-    Synthesize RAG results with web search results using GPT-4o.
+    Synthesize RAG results with web search results using GPT-4o, leveraging general knowledge.
     
     Args:
         query: The user's original query
@@ -379,6 +380,7 @@ def synthesize_rag_and_web_results(
         web_results: Results from web search
         context_analysis: Analysis of document context
         system_prompt: Base system prompt
+        has_general_knowledge: Whether general knowledge is enabled for richer synthesis
         
     Returns:
         Tuple of (synthesized answer, combined sources)
@@ -396,6 +398,31 @@ def synthesize_rag_and_web_results(
     intent_type = context_analysis.get("intent_type", "learning")
     action_focus = context_analysis.get("action_focus", "")
     
+    # Build knowledge sources description based on general knowledge availability
+    if has_general_knowledge:
+        knowledge_sources = """three powerful knowledge sources:
+1. The user's uploaded documents (their foundation knowledge)
+2. Your built-in general knowledge (established concepts and frameworks)
+3. Curated web search results (current, actionable resources and guidance)"""
+        
+        general_knowledge_guidance = """- Enrich the response with your domain expertise to provide foundational understanding, broader context, and connections
+- Create a cohesive response that builds from document foundation, through expert insights, to current applications (web results)
+- Use your knowledge to explain concepts, provide historical context, and make connections that enhance understanding"""
+        
+        integration_strategy = """KNOWLEDGE ENRICHMENT STRATEGY:
+- Start with the user's document content as the foundation
+- Enhance with your domain expertise to provide depth, context, and connections
+- Bridge concepts with foundational knowledge and professional insights"""
+    else:
+        knowledge_sources = """two powerful knowledge sources:
+1. The user's uploaded documents (their foundation knowledge)
+2. Curated web search results (current, actionable resources and guidance)"""
+        
+        general_knowledge_guidance = """- Create a cohesive response that builds from document context to current applications (web results)"""
+        
+        integration_strategy = """INTEGRATION STRATEGY:
+- Start with the user's document context as the foundation"""
+    
     synthesis_prompt = f"""{system_prompt}
 
 You are synthesizing information to help the user achieve their specific intent and goals.
@@ -404,18 +431,22 @@ USER'S TRUE INTENT: {user_intent}
 INTENT TYPE: {intent_type}
 ACTION FOCUS: {action_focus}
 
-You are combining two sources:
-1. The user's uploaded documents (their foundation knowledge)
-2. Curated web search results (actionable resources and guidance)
+You are combining {knowledge_sources}
 
 SYNTHESIS GUIDELINES:
 - Focus on helping the user ACHIEVE their specific intent, not just providing information
 - If they want to "become" something, provide clear pathways and next steps
 - If they want to "learn" something, structure the response as a learning journey
 - If they want to "implement" something, provide actionable steps and resources
-- Use the document content as context for their current understanding
-- Leverage web results to fill knowledge gaps and provide actionable next steps
+- Use document content as context for their current understanding
+{general_knowledge_guidance}
+- Use web results to fill knowledge gaps with current, actionable next steps
 - Prioritize resources that match their intent (tutorials for learning, career guides for becoming, etc.)
+
+{integration_strategy}
+- Bridge to the user's document context to show relevance
+- Culminate with current, actionable resources from web search
+- Ensure the response flows logically from theory to practice
 
 Domain Context: {context_analysis.get('domain', 'general')}
 User Level: {context_analysis.get('user_level', 'intermediate')}

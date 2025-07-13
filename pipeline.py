@@ -309,26 +309,31 @@ def answer_query(
         use_openai_embeddings: Whether to use OpenAI directly for embeddings.
         search_by_space_only: If True, search based on space_id only, ignoring document_id.
         max_context_chunks: Maximum number of chunks to include in context for the LLM.
-        allow_general_knowledge: If True, allows LLM to supplement answers with general knowledge when context is insufficient.
+        allow_general_knowledge: If True, allows LLM to enrich answers with general knowledge even when documents are sufficient, providing additional insights and context.
         enable_websearch: If True, performs contextual web search to supplement RAG results.
         model: The model to use for generation. Auto-switches to GPT-4o when websearch is enabled.
     """
     start_time = time.time()
-    logging.info(f"Answering query: '{query}' for document {document_id if not search_by_space_only else 'None'} in space {space_id}, allow_general_knowledge: {allow_general_knowledge}")
-    
-    # Override system prompt based on allow_general_knowledge setting
-    if allow_general_knowledge:
-        system_prompt = general_knowledge_prompt
+    logging.info(f"Answering query: '{query}' for document {document_id if not search_by_space_only else 'None'} in space {space_id}, allow_general_knowledge: {allow_general_knowledge}, enable_websearch: {enable_websearch}")
     
     # Determine which LLM to use based on model parameter
     # Auto-switch to GPT-4o if websearch is enabled
     if enable_websearch:
         effective_model = "gpt-4o"
         use_openai = True
+        # Smart auto-enable: If websearch is enabled, also enable general knowledge for richer synthesis
+        # This allows the LLM to enrich the synthesis with foundational knowledge and make better connections
+        if not allow_general_knowledge:
+            allow_general_knowledge = True
+            logging.info("Auto-enabled general knowledge to enrich web search synthesis with foundational insights")
     else:
         effective_model = model
         # Determine if the model is OpenAI or Groq based on model name
         use_openai = effective_model.startswith("gpt-") or effective_model in ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-3.5-turbo"]
+    
+    # Override system prompt based on allow_general_knowledge setting (after auto-enable logic)
+    if allow_general_knowledge:
+        system_prompt = general_knowledge_prompt
     
     # Use cached embeddings for the query
     query_embedded = get_query_embedding(query, use_openai_embeddings)
@@ -360,7 +365,7 @@ def answer_query(
         if space_documents["total_count"] == 0:
             if allow_general_knowledge:
                 # If no documents found but general knowledge is allowed, still try to answer
-                logging.info("No documents in space, but allow_general_knowledge is True - generating answer with general knowledge only")
+                logging.info("No documents in space, but allow_general_knowledge is True - generating enriched answer with domain expertise")
                 fallback_prompt = no_docs_in_space_prompt
                 if use_openai:
                     answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=effective_model)
@@ -397,7 +402,7 @@ def answer_query(
         if not hits:
             if allow_general_knowledge:
                 # If no relevant context found but general knowledge is allowed
-                logging.info("No relevant context found, but allow_general_knowledge is True - generating answer with general knowledge")
+                logging.info("No relevant context found, but allow_general_knowledge is True - generating enriched answer with domain expertise")
                 fallback_prompt = no_relevant_in_scope_prompt.format(query=query, scope="the user's space")
                 if use_openai:
                     answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=effective_model)
@@ -505,7 +510,7 @@ def answer_query(
         if not hits:
             if allow_general_knowledge:
                 # If no relevant context found but general knowledge is allowed
-                logging.info("No relevant context found, but allow_general_knowledge is True - generating answer with general knowledge")
+                logging.info("No relevant context found, but allow_general_knowledge is True - generating enriched answer with domain expertise")
                 fallback_prompt = no_relevant_in_scope_prompt.format(query=query, scope="the specified document(s)")
                 if use_openai:
                     answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=effective_model)
@@ -572,7 +577,8 @@ def answer_query(
                     rag_context=rag_context,
                     web_results=web_results,
                     context_analysis=context_analysis,
-                    system_prompt=system_prompt
+                    system_prompt=system_prompt,
+                    has_general_knowledge=allow_general_knowledge
                 )
                 
                 # Update answer and citations with synthesized results
@@ -833,7 +839,7 @@ async def answer_query_endpoint(
         rerank_top_n: Number of results to rerank (default: 10)
         max_context_chunks: Maximum number of chunks to include in context (default: 5)
         fast_mode: If True, uses optimized settings for faster response time
-        allow_general_knowledge: If True, allows LLM to supplement answers with general knowledge when context is insufficient
+        allow_general_knowledge: If True, allows LLM to enrich answers with general knowledge, expanding beyond documents with additional insights and context
         enable_websearch: If True, performs contextual web search to supplement RAG results
         model: The model to use for generation. Auto-switches to GPT-4o when websearch is enabled.
     """
