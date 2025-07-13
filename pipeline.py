@@ -286,7 +286,7 @@ def answer_query(
     rerank_top_n: int = 10,  # Reduced from 15 to 10 for better performance
     system_prompt: str = main_prompt,
     groq_model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
-    openai_model: str = "gpt-4o",
+    openai_model: str = "gpt-4o-mini",
     use_openai_embeddings: bool = True,
     search_by_space_only: bool = False,
     max_context_chunks: int = 5,  # Limit context size for better performance
