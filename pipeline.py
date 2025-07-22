@@ -296,7 +296,9 @@ def answer_query(
     allow_general_knowledge: bool = False,  # New parameter for allowing general knowledge supplementation
     enable_websearch: bool = False,  # New parameter for enabling contextual web search
     model: str = "meta-llama/llama-4-scout-17b-16e-instruct",  # User-selectable model parameter
-    enrichment_mode: str = "simple"  # "simple" (default) or "advanced" for intelligent enrichment
+    enrichment_mode: str = "simple",  # "simple" (default) or "advanced" for intelligent enrichment
+    learning_style: Optional[str] = None,  # Learning style for personalized educational responses
+    educational_mode: bool = False  # Enable tutoring/educational approach
 ) -> Dict[str, Any]:
     """
     Optimized function to answer a user query using hybrid search, rerank, and LLM generation.
@@ -317,9 +319,16 @@ def answer_query(
         enable_websearch: If True, performs contextual web search to supplement RAG results.
         model: The model to use for generation. Auto-switches to GPT-4o when websearch is enabled.
         enrichment_mode: "simple" (default, classic enrichment) or "advanced" (intelligent domain-aware enrichment).
+        learning_style: Learning style for personalized educational responses ("academic_focus", "deep_dive", "quick_practical", "exploratory_curious", "narrative_reader", "default", or None).
+        educational_mode: If True, enables tutoring/educational approach with context-rich responses.
     """
     start_time = time.time()
-    logging.info(f"Answering query: '{query}' for document {document_id if not search_by_space_only else 'None'} in space {space_id}, allow_general_knowledge: {allow_general_knowledge}, enable_websearch: {enable_websearch}, enrichment_mode: {enrichment_mode}")
+    logging.info(f"Answering query: '{query}' for document {document_id if not search_by_space_only else 'None'} in space {space_id}, allow_general_knowledge: {allow_general_knowledge}, enable_websearch: {enable_websearch}, enrichment_mode: {enrichment_mode}, learning_style: {learning_style}, educational_mode: {educational_mode}")
+    
+    # Auto-enable educational mode if learning style is specified
+    if learning_style and not educational_mode:
+        educational_mode = True
+        logging.info(f"Auto-enabled educational mode due to learning style: {learning_style}")
     
     # Determine which LLM to use based on model parameter
     # Auto-switch to GPT-4o if websearch is enabled
@@ -451,9 +460,10 @@ def answer_query(
                 for chunk in limited_context[:3]  # Use first few chunks for analysis
             ])
             
-            # Create intelligent enrichment prompt
+            # Create intelligent enrichment prompt with learning style integration
             enhanced_prompt, enrichment_metadata = create_enriched_system_prompt(
-                query, rag_context_preview, allow_general_knowledge, general_knowledge_prompt
+                query, rag_context_preview, allow_general_knowledge, general_knowledge_prompt,
+                learning_style, educational_mode
             )
             
             # Add few-shot examples for better guidance
@@ -462,9 +472,13 @@ def answer_query(
             
             # Log enrichment strategy
             if enrichment_metadata.get("enrichment_applied"):
-                logging.info(f"Applied intelligent enrichment for {domain} domain: {enrichment_metadata.get('reason', 'standard enrichment')}")
+                learning_info = f" with {learning_style} learning style" if learning_style else ""
+                educational_info = " (educational mode)" if enrichment_metadata.get("educational_mode") else ""
+                logging.info(f"Applied intelligent enrichment for {domain} domain{learning_info}{educational_info}: {enrichment_metadata.get('reason', 'standard enrichment')}")
             else:
-                logging.info(f"Using standard general knowledge prompt: {enrichment_metadata.get('reason', 'no specific enrichment needed')}")
+                learning_info = f" with {learning_style} learning style" if learning_style else ""
+                educational_info = " (educational mode)" if educational_mode else ""
+                logging.info(f"Using standard prompt{learning_info}{educational_info}: {enrichment_metadata.get('reason', 'no specific enrichment needed')}")
         elif allow_general_knowledge and enrichment_mode == "simple":
             logging.info("Using simple general knowledge enrichment mode (classic behavior)")
         
@@ -581,9 +595,10 @@ def answer_query(
                 for chunk in limited_context[:3]  # Use first few chunks for analysis
             ])
             
-            # Create intelligent enrichment prompt
+            # Create intelligent enrichment prompt with learning style integration
             enhanced_prompt, enrichment_metadata = create_enriched_system_prompt(
-                query, rag_context_preview, allow_general_knowledge, general_knowledge_prompt
+                query, rag_context_preview, allow_general_knowledge, general_knowledge_prompt,
+                learning_style, educational_mode
             )
             
             # Add few-shot examples for better guidance
@@ -592,9 +607,13 @@ def answer_query(
             
             # Log enrichment strategy
             if enrichment_metadata.get("enrichment_applied"):
-                logging.info(f"Applied intelligent enrichment for {domain} domain: {enrichment_metadata.get('reason', 'standard enrichment')}")
+                learning_info = f" with {learning_style} learning style" if learning_style else ""
+                educational_info = " (educational mode)" if enrichment_metadata.get("educational_mode") else ""
+                logging.info(f"Applied intelligent enrichment for {domain} domain{learning_info}{educational_info}: {enrichment_metadata.get('reason', 'standard enrichment')}")
             else:
-                logging.info(f"Using standard general knowledge prompt: {enrichment_metadata.get('reason', 'no specific enrichment needed')}")
+                learning_info = f" with {learning_style} learning style" if learning_style else ""
+                educational_info = " (educational mode)" if educational_mode else ""
+                logging.info(f"Using standard prompt{learning_info}{educational_info}: {enrichment_metadata.get('reason', 'no specific enrichment needed')}")
         elif allow_general_knowledge and enrichment_mode == "simple":
             logging.info("Using simple general knowledge enrichment mode (classic behavior)")
         
@@ -890,7 +909,9 @@ async def answer_query_endpoint(
     allow_general_knowledge: bool = Form(False),  # New parameter for allowing general knowledge supplementation
     enable_websearch: bool = Form(False),  # New parameter for enabling contextual web search
     model: str = Form("meta-llama/llama-4-scout-17b-16e-instruct"),  # User-selectable model parameter
-    enrichment_mode: str = Form("simple")  # "simple" (default) or "advanced" for intelligent enrichment
+    enrichment_mode: str = Form("simple"),  # "simple" (default) or "advanced" for intelligent enrichment
+    learning_style: Optional[str] = Form(None),  # Learning style for personalized educational responses
+    educational_mode: bool = Form(False)  # Enable tutoring/educational approach
 ) -> JSONResponse:
     """
     Optimized endpoint to answer a query using the RAG pipeline.
@@ -910,6 +931,8 @@ async def answer_query_endpoint(
         enable_websearch: If True, performs contextual web search to supplement RAG results
         model: The model to use for generation. Auto-switches to GPT-4o when websearch is enabled.
         enrichment_mode: "simple" (default, classic enrichment) or "advanced" (intelligent domain-aware enrichment)
+        learning_style: Learning style for personalized educational responses ("academic_focus", "deep_dive", "quick_practical", "exploratory_curious", "narrative_reader", "default", or None)
+        educational_mode: If True, enables tutoring/educational approach with context-rich responses
     """
     start_time = time.time()
     acl_list = [tag.strip() for tag in acl_tags.split(",")] if acl_tags else None
@@ -932,7 +955,9 @@ async def answer_query_endpoint(
             allow_general_knowledge=allow_general_knowledge,
             enable_websearch=enable_websearch,
             model=model,
-            enrichment_mode=enrichment_mode
+            enrichment_mode=enrichment_mode,
+            learning_style=learning_style,
+            educational_mode=educational_mode
         )
         result["time_ms"] = int((time.time() - start_time) * 1000)  # Add time taken in ms
         return JSONResponse(result)
