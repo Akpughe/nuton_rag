@@ -26,6 +26,7 @@ from intelligent_enrichment import create_enriched_system_prompt
 from enrichment_examples import create_few_shot_enhanced_prompt
 from enhanced_prompts import get_domain_from_context
 from websearch_client import analyze_document_context, generate_contextual_search_queries, perform_contextual_websearch, synthesize_rag_and_web_results
+from services.google_drive_service import GoogleDriveService
 
 
 app = FastAPI()
@@ -63,6 +64,21 @@ class QuizRequest(BaseModel):
     set_id: int = 1
     title: Optional[str] = None
     description: Optional[str] = None
+
+
+class DriveFilesRequest(BaseModel):
+    access_token: str
+    refresh_token: str
+    folder_id: Optional[str] = None
+    file_types: Optional[List[str]] = ["pdf", "doc", "docx"]
+    max_results: int = 100
+
+
+class DriveImportRequest(BaseModel):
+    file_ids: List[str]
+    space_id: str
+    access_token: str
+    refresh_token: str
 
 
 def flatten_chunks(chunks):
@@ -267,6 +283,96 @@ def process_document_with_openai(
     except Exception as e:
         logging.exception(f"Error processing document with OpenAI: {e}")
         raise
+
+
+def process_drive_files(file_ids: List[str], space_id: str, access_token: str, refresh_token: str) -> Dict[str, Any]:
+    """
+    Process multiple Google Drive files through the pipeline.
+    
+    Args:
+        file_ids: List of Google Drive file IDs to process
+        space_id: Space ID to associate with the documents
+        access_token: User's Google access token
+        refresh_token: User's Google refresh token
+        
+    Returns:
+        Dictionary with processing results and any errors
+    """
+    results = {
+        "processed_files": [],
+        "errors": [],
+        "updated_tokens": None
+    }
+    
+    try:
+        # Initialize Google Drive service
+        drive_service = GoogleDriveService(access_token, refresh_token)
+        
+        # Get updated tokens after potential refresh
+        updated_tokens = drive_service.get_updated_tokens()
+        results["updated_tokens"] = updated_tokens
+        
+        for file_id in file_ids:
+            try:
+                logging.info(f"Processing Google Drive file: {file_id}")
+                
+                # Download file content and metadata
+                file_content, file_metadata = drive_service.download_file(file_id)
+                
+                # Save to temporary file
+                temp_file_path = drive_service.save_temp_file(file_content, file_metadata['name'])
+                
+                try:
+                    # Prepare metadata for pipeline
+                    pipeline_metadata = {
+                        "filename": file_metadata['name'],
+                        "space_id": space_id,
+                        "file_path": file_metadata.get('webViewLink', ''),
+                        "source": "google_drive",
+                        "drive_file_id": file_id,
+                        "file_size": file_metadata.get('size', 0),
+                        "mime_type": file_metadata.get('mimeType', ''),
+                        "created_time": file_metadata.get('createdTime', ''),
+                        "modified_time": file_metadata.get('modifiedTime', '')
+                    }
+                    
+                    # Process through existing pipeline
+                    document_id = process_document_with_openai(
+                        file_path=temp_file_path,
+                        metadata=pipeline_metadata
+                    )
+                    
+                    results["processed_files"].append({
+                        "file_id": file_id,
+                        "document_id": document_id,
+                        "filename": file_metadata['name'],
+                        "status": "success"
+                    })
+                    
+                    logging.info(f"Successfully processed Drive file {file_id} -> document {document_id}")
+                    
+                finally:
+                    # Clean up temporary file
+                    if os.path.exists(temp_file_path):
+                        os.remove(temp_file_path)
+                        logging.info(f"Cleaned up temporary file: {temp_file_path}")
+                        
+            except Exception as e:
+                error_msg = f"Failed to process file {file_id}: {str(e)}"
+                logging.error(error_msg)
+                results["errors"].append({
+                    "file_id": file_id,
+                    "error": error_msg
+                })
+                
+    except Exception as e:
+        error_msg = f"Failed to initialize Google Drive service: {str(e)}"
+        logging.error(error_msg)
+        results["errors"].append({
+            "general_error": error_msg
+        })
+    
+    return results
 
 
 # Add caching for query embeddings
@@ -1169,6 +1275,95 @@ async def regenerate_quiz_endpoint(
         return JSONResponse(result)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/google-drive/files")
+async def get_drive_files(request: DriveFilesRequest) -> JSONResponse:
+    """
+    List files from user's Google Drive.
+    
+    Args:
+        request: DriveFilesRequest with access tokens and filter options
+        
+    Returns:
+        JSON response with file list and updated tokens
+    """
+    try:
+        logging.info(f"Listing Google Drive files for user")
+        
+        # Initialize Google Drive service
+        drive_service = GoogleDriveService(request.access_token, request.refresh_token)
+        
+        # List files with filters
+        files = drive_service.list_files(
+            folder_id=request.folder_id,
+            file_types=request.file_types,
+            max_results=request.max_results
+        )
+        
+        # Get updated tokens
+        updated_tokens = drive_service.get_updated_tokens()
+        
+        return JSONResponse({
+            "files": files,
+            "updated_tokens": updated_tokens
+        })
+        
+    except Exception as e:
+        logging.error(f"Error listing Drive files: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/google-drive/import")
+async def import_drive_files(request: DriveImportRequest) -> JSONResponse:
+    """
+    Import selected Google Drive files into the RAG pipeline.
+    
+    Args:
+        request: DriveImportRequest with file IDs and space information
+        
+    Returns:
+        JSON response with processing results
+    """
+    try:
+        logging.info(f"Importing {len(request.file_ids)} Google Drive files to space {request.space_id}")
+        
+        # Process the files
+        results = process_drive_files(
+            file_ids=request.file_ids,
+            space_id=request.space_id,
+            access_token=request.access_token,
+            refresh_token=request.refresh_token
+        )
+        
+        # Determine overall status
+        total_files = len(request.file_ids)
+        successful_files = len(results["processed_files"])
+        
+        if successful_files == total_files:
+            status = "completed"
+            message = f"Successfully processed all {total_files} files"
+        elif successful_files > 0:
+            status = "partial_success"
+            message = f"Processed {successful_files}/{total_files} files successfully"
+        else:
+            status = "failed"
+            message = f"Failed to process any files"
+        
+        response_data = {
+            "status": status,
+            "message": message,
+            "processed_files": results["processed_files"],
+            "errors": results["errors"],
+            "updated_tokens": results["updated_tokens"]
+        }
+        
+        return JSONResponse(response_data)
+        
+    except Exception as e:
+        logging.error(f"Error importing Drive files: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
 
 if __name__ == "__main__":
     import uvicorn
