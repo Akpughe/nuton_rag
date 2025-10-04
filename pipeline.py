@@ -16,6 +16,8 @@ from supabase_client import insert_pdf_record, insert_yts_record, get_documents_
 from groq_client import generate_answer, generate_answer_document_aware
 import openai_client
 from services.wetrocloud_youtube import WetroCloudYouTubeService
+from services.youtube_transcript_service import YouTubeTranscriptService
+from services.ytdlp_transcript_service import YTDLPTranscriptService
 from flashcard_process import generate_flashcards, regenerate_flashcards
 from pydantic import BaseModel
 from typing import Optional, List
@@ -821,20 +823,28 @@ def process_youtube(
         logging.error(error_msg)
         raise ValueError(error_msg)
     
-    # Get transcript
+    # Get transcript (with fallback enabled by default)
     transcript_result = wetro_service.get_transcript(youtube_url)
     if not transcript_result.get('success'):
         error_msg = f"Failed to extract transcript: {transcript_result.get('message')}"
         logging.error(error_msg)
         raise ValueError(error_msg)
-    
+
     transcript_text = transcript_result['text']
-    # print('transcript_text', transcript_text)
-    
-    # Get video metadata
-    yt_api_url = os.getenv('YT_API_URL', 'https://pdf-ocr-staging-production.up.railway.app')
-    video_title = wetro_service.get_video_title(youtube_url, yt_api_url)
-    thumbnail = f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+
+    # Get video title - prefer title from yt-dlp if available
+    if 'video_title' in transcript_result and transcript_result['video_title']:
+        # yt-dlp provides the title (either direct or fallback)
+        video_title = transcript_result['video_title']
+        logging.info(f"Using video title from {transcript_result.get('method', 'transcript service')}: {video_title}")
+    else:
+        # Fall back to external API for title (WetroCloud doesn't return title)
+        yt_api_url = os.getenv('YT_API_URL', 'https://pdf-ocr-staging-production.up.railway.app')
+        video_title = wetro_service.get_video_title(youtube_url, yt_api_url)
+        logging.info(f"Using video title from external API: {video_title}")
+
+    # Use thumbnail from transcript result if available, otherwise construct it
+    thumbnail = transcript_result.get('thumbnail', f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg")
     
     # Insert into yts table
     yts_record = {
@@ -1082,19 +1092,19 @@ async def process_youtube_endpoint(
     """
     Endpoint to process multiple YouTube videos: extract transcripts, chunk, embed, and index.
     Returns the document_ids for all processed videos.
-    
+
     Args:
         youtube_urls: JSON string array of YouTube URLs to process
         space_id: Space ID to associate with all videos
         embedding_model: Model to use for embeddings
         chunk_size: Size of chunks in tokens
         overlap_tokens: Number of tokens to overlap between chunks
-        
+
     Returns:
         List of document_ids with their corresponding YouTube URLs
     """
     logging.info(f"Process YouTube endpoint called with multiple URLs, space_id: {space_id}")
-    
+
     # Parse the youtube_urls JSON string
     try:
         urls = json.loads(youtube_urls)
@@ -1102,10 +1112,10 @@ async def process_youtube_endpoint(
             return JSONResponse({"error": "youtube_urls must be a JSON array"}, status_code=400)
     except json.JSONDecodeError:
         return JSONResponse({"error": "Invalid JSON in youtube_urls"}, status_code=400)
-    
+
     document_ids = []
     errors = []
-    
+
     # Process each YouTube URL
     for url in urls:
         try:
@@ -1116,13 +1126,13 @@ async def process_youtube_endpoint(
                 chunk_size=chunk_size,
                 overlap_tokens=overlap_tokens
             )
-            
+
             document_ids.append({"youtube_url": url, "document_id": document_id})
-            
+
         except Exception as e:
             logging.exception(f"Error processing YouTube URL {url}: {e}")
             errors.append({"youtube_url": url, "error": str(e)})
-    
+
     # Return results
     if document_ids:
         result = {"document_ids": document_ids}
@@ -1131,6 +1141,260 @@ async def process_youtube_endpoint(
         return JSONResponse(result)
     else:
         return JSONResponse({"error": "All YouTube URLs failed to process", "details": errors}, status_code=500)
+
+
+@app.post("/extract_youtube_transcript")
+async def extract_youtube_transcript_endpoint(
+    video_url: str = Form(...),
+    use_proxy: bool = Form(False),
+    languages: str = Form("en")  # Comma-separated language codes
+) -> JSONResponse:
+    """
+    Extract transcript from a YouTube video using youtube-transcript-api.
+
+    This endpoint uses the youtube-transcript-api library which:
+    - Supports WebShare proxy to bypass cloud provider IP blocking
+    - Works reliably on cloud deployments (AWS, GCP, Azure, etc.)
+    - Provides direct access to YouTube transcripts without external APIs
+
+    Args:
+        video_url: YouTube video URL or video ID
+        use_proxy: Enable WebShare proxy (recommended for cloud deployments)
+                  Requires WEBSHARE_PROXY_USERNAME and WEBSHARE_PROXY_PASSWORD env vars
+        languages: Comma-separated list of preferred language codes (default: "en")
+
+    Returns:
+        JSON response with transcript text and metadata
+    """
+    logging.info(f"Extract YouTube transcript endpoint called for: {video_url}, use_proxy: {use_proxy}")
+
+    # Parse languages
+    lang_list = [lang.strip() for lang in languages.split(",")]
+
+    try:
+        # Initialize the service
+        yt_service = YouTubeTranscriptService(use_proxy=use_proxy)
+
+        # Get proxy status for diagnostics
+        proxy_status = yt_service.get_proxy_status()
+
+        # Get transcript
+        result = yt_service.get_transcript(video_url, languages=lang_list)
+
+        if result['success']:
+            return JSONResponse({
+                'success': True,
+                'video_id': result['video_id'],
+                'transcript': result['text'],
+                'thumbnail': result['thumbnail'],
+                'language': result['language'],
+                'transcript_entries': result['transcript_entries'],
+                'proxy_status': proxy_status
+            })
+        else:
+            error_response = {
+                'success': False,
+                'error': result['message'],
+                'proxy_status': proxy_status
+            }
+            if 'suggestions' in result:
+                error_response['suggestions'] = result['suggestions']
+
+            return JSONResponse(error_response, status_code=400)
+
+    except Exception as e:
+        logging.exception(f"Error in extract_youtube_transcript_endpoint: {e}")
+        return JSONResponse({
+            'success': False,
+            'error': str(e)
+        }, status_code=500)
+
+
+@app.get("/youtube_proxy_status")
+async def youtube_proxy_status_endpoint() -> JSONResponse:
+    """
+    Check WebShare proxy configuration status.
+
+    Returns:
+        JSON response with proxy configuration details
+    """
+    has_username = bool(os.getenv('WEBSHARE_PROXY_USERNAME'))
+    has_password = bool(os.getenv('WEBSHARE_PROXY_PASSWORD'))
+
+    return JSONResponse({
+        'proxy_configured': has_username and has_password,
+        'has_username': has_username,
+        'has_password': has_password,
+        'message': 'Proxy fully configured' if (has_username and has_password) else 'Missing WebShare credentials',
+        'instructions': {
+            'step_1': 'Sign up at https://www.webshare.io/',
+            'step_2': 'Purchase RESIDENTIAL proxy package (not Static or Proxy Server)',
+            'step_3': 'Get your proxy username and password from dashboard',
+            'step_4': 'Set environment variables: WEBSHARE_PROXY_USERNAME and WEBSHARE_PROXY_PASSWORD',
+            'step_5': 'Restart the server'
+        }
+    })
+
+
+@app.post("/extract_transcript_ytdlp")
+async def extract_transcript_ytdlp_endpoint(
+    video_url: str = Form(...),
+    languages: str = Form("en")  # Comma-separated language codes
+) -> JSONResponse:
+    """
+    Extract transcript from YouTube using yt-dlp (RECOMMENDED - Most Reliable).
+
+    This endpoint uses yt-dlp which:
+    - Works WITHOUT proxies in 99% of cases
+    - Uses YouTube's internal APIs directly
+    - Actively maintained for YouTube changes
+    - Doesn't get blocked by IP restrictions
+    - Most robust solution available
+
+    Args:
+        video_url: YouTube video URL or video ID
+        languages: Comma-separated list of preferred language codes (default: "en")
+
+    Returns:
+        JSON response with transcript text and metadata
+    """
+    logging.info(f"Extract YouTube transcript (yt-dlp) endpoint called for: {video_url}")
+
+    # Parse languages
+    lang_list = [lang.strip() for lang in languages.split(",")]
+
+    try:
+        # Initialize yt-dlp service
+        ytdlp_service = YTDLPTranscriptService()
+
+        # Get transcript
+        result = ytdlp_service.get_transcript(video_url, languages=lang_list)
+
+        if result['success']:
+            return JSONResponse({
+                'success': True,
+                'video_id': result['video_id'],
+                'video_title': result['video_title'],
+                'transcript': result['text'],
+                'thumbnail': result['thumbnail'],
+                'language': result['language'],
+                'is_automatic': result['is_automatic'],
+                'transcript_entries': result['transcript_entries'],
+                'method': result['method']
+            })
+        else:
+            return JSONResponse({
+                'success': False,
+                'error': result['message']
+            }, status_code=400)
+
+    except Exception as e:
+        logging.exception(f"Error in extract_transcript_ytdlp_endpoint: {e}")
+        return JSONResponse({
+            'success': False,
+            'error': str(e)
+        }, status_code=500)
+
+
+@app.get("/youtube_info_ytdlp")
+async def youtube_info_ytdlp_endpoint(
+    video_url: str
+) -> JSONResponse:
+    """
+    Get YouTube video information and available subtitles using yt-dlp.
+
+    Args:
+        video_url: YouTube video URL or video ID
+
+    Returns:
+        JSON response with video info and available subtitles
+    """
+    logging.info(f"YouTube info (yt-dlp) endpoint called for: {video_url}")
+
+    try:
+        ytdlp_service = YTDLPTranscriptService()
+
+        # Get video info
+        video_info = ytdlp_service.get_video_info(video_url)
+
+        if not video_info['success']:
+            return JSONResponse({
+                'success': False,
+                'error': video_info['message']
+            }, status_code=400)
+
+        # Get available subtitles
+        subtitles_info = ytdlp_service.get_available_subtitles(video_url)
+
+        return JSONResponse({
+            'success': True,
+            'video_id': video_info['video_id'],
+            'title': video_info['title'],
+            'description': video_info['description'],
+            'duration': video_info['duration'],
+            'channel': video_info['channel'],
+            'upload_date': video_info['upload_date'],
+            'view_count': video_info['view_count'],
+            'thumbnail': video_info['thumbnail'],
+            'video_url': video_info['video_url'],
+            'available_subtitles': subtitles_info.get('available_subtitles', []),
+            'method': 'yt-dlp'
+        })
+
+    except Exception as e:
+        logging.exception(f"Error in youtube_info_ytdlp_endpoint: {e}")
+        return JSONResponse({
+            'success': False,
+            'error': str(e)
+        }, status_code=500)
+
+
+@app.get("/youtube_transcript_info")
+async def youtube_transcript_info_endpoint(
+    video_url: str,
+    use_proxy: bool = False
+) -> JSONResponse:
+    """
+    Get available transcript languages for a YouTube video.
+
+    Args:
+        video_url: YouTube video URL or video ID
+        use_proxy: Enable WebShare proxy (recommended for cloud deployments)
+
+    Returns:
+        JSON response with available transcripts and video info
+    """
+    logging.info(f"YouTube transcript info endpoint called for: {video_url}")
+
+    try:
+        yt_service = YouTubeTranscriptService(use_proxy=use_proxy)
+
+        # Get available transcripts
+        transcripts_result = yt_service.get_available_transcripts(video_url)
+
+        # Get video info
+        video_info = yt_service.get_video_info(video_url)
+
+        if transcripts_result['success']:
+            return JSONResponse({
+                'success': True,
+                'video_id': transcripts_result['video_id'],
+                'video_url': video_info.get('video_url'),
+                'thumbnail': video_info.get('thumbnail'),
+                'available_transcripts': transcripts_result['available_transcripts']
+            })
+        else:
+            return JSONResponse({
+                'success': False,
+                'error': transcripts_result['message']
+            }, status_code=400)
+
+    except Exception as e:
+        logging.exception(f"Error in youtube_transcript_info_endpoint: {e}")
+        return JSONResponse({
+            'success': False,
+            'error': str(e)
+        }, status_code=500)
 
 
 @app.post("/generate_flashcards")
