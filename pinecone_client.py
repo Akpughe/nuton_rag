@@ -85,10 +85,17 @@ def upsert_vectors(
                 "text": chunk_text[:3000],  # Limit text length for Pinecone metadata size limits
                 "page_number": ','.join(map(str, chunk.get("pages", []))) if isinstance(chunk.get("pages"), list) else (chunk.get("pages") or "false")
             }
-            
+
             # Add source_file if provided
             if source_file:
                 metadata["source_file"] = source_file
+
+            # Add chapter information if available
+            if isinstance(chunk, dict):
+                if chunk.get("chapter_number"):
+                    metadata["chapter_number"] = str(chunk.get("chapter_number"))
+                if chunk.get("chapter_title"):
+                    metadata["chapter_title"] = str(chunk.get("chapter_title"))[:500]  # Limit length
                 
             # Add any existing metadata from the chunk
             if isinstance(chunk, dict) and chunk.get("metadata"):
@@ -124,10 +131,17 @@ def upsert_vectors(
                     "text": chunk_text[:3000],  # Limit text length for Pinecone metadata size limits
                     "page_number": ','.join(map(str, chunk.get("pages", []))) if isinstance(chunk.get("pages"), list) else (chunk.get("pages") or "false")
                 }
-                
+
                 # Add source_file if provided
                 if source_file:
                     metadata["source_file"] = source_file
+
+                # Add chapter information if available
+                if isinstance(chunk, dict):
+                    if chunk.get("chapter_number"):
+                        metadata["chapter_number"] = str(chunk.get("chapter_number"))
+                    if chunk.get("chapter_title"):
+                        metadata["chapter_title"] = str(chunk.get("chapter_title"))[:500]  # Limit length
                     
                 # Add any existing metadata from the chunk
                 if isinstance(chunk, dict) and chunk.get("metadata"):

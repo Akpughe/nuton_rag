@@ -181,7 +181,7 @@ def process_document(
     return document_id
 
 
-def process_document_with_openai(
+async def process_document_with_openai(
     file_path: str,
     metadata: Dict[str, Any],
     chunk_size: int = 512,
@@ -191,25 +191,108 @@ def process_document_with_openai(
     lang: str = "en",
     min_characters_per_chunk: int = 12,
     embedding_model: str = "text-embedding-ada-002",
-    batch_size: int = 64
+    batch_size: int = 64,
+    enable_chapter_detection: bool = True
 ) -> str:
     """
     Ingests a document using OpenAI for embeddings: chunk, embed with OpenAI, insert into Supabase, upsert to Pinecone.
+    Now includes chapter detection for better context.
     Returns the document_id (Supabase id).
     """
     try:
-        # 1. Chunk document
-        logging.info(f"Chunking document: {file_path}")
-        chunks = chunk_document(
-            file_path=file_path,
-            chunk_size=chunk_size,
-            overlap_tokens=overlap_tokens,
-            tokenizer=tokenizer,
-            recipe=recipe,
-            lang=lang,
-            min_characters_per_chunk=min_characters_per_chunk
-        )
-        chunks = flatten_chunks(chunks)
+        from text_extractor import extract_text_from_file, validate_extracted_text
+        from chapter_detector import detect_chapters_with_ai, assign_chapters_to_chunks, get_fallback_chapter
+        import asyncio
+
+        chunks = []
+        detected_chapters = []
+
+        # 1. Extract full text for chapter detection (only for PDFs)
+        file_ext = os.path.splitext(file_path)[1].lower()
+        if enable_chapter_detection and file_ext == '.pdf':
+            try:
+                logging.info(f"Extracting text from PDF for chapter detection: {file_path}")
+                full_text = extract_text_from_file(file_path)
+
+                if not validate_extracted_text(full_text):
+                    logging.warning("Extracted text validation failed, proceeding without chapter detection")
+                    enable_chapter_detection = False
+                else:
+                    logging.info(f"Extracted {len(full_text)} characters, starting parallel processing")
+
+                    # 2. Run chapter detection and chunking IN PARALLEL
+                    async def parallel_processing():
+                        # Create tasks for parallel execution
+                        chapter_task = detect_chapters_with_ai(full_text, model="llama-3.1-8b-instant", timeout=10)
+
+                        # Wrap synchronous chunk_document in executor
+                        loop = asyncio.get_event_loop()
+                        chunk_task = loop.run_in_executor(
+                            None,
+                            lambda: chunk_document(
+                                text=full_text,
+                                chunk_size=chunk_size,
+                                overlap_tokens=overlap_tokens,
+                                tokenizer=tokenizer,
+                                recipe=recipe,
+                                lang=lang,
+                                min_characters_per_chunk=min_characters_per_chunk
+                            )
+                        )
+
+                        # Wait for both to complete
+                        chapters, chunks_raw = await asyncio.gather(
+                            chapter_task,
+                            chunk_task,
+                            return_exceptions=True
+                        )
+
+                        return chapters, chunks_raw
+
+                    # Run parallel processing
+                    parallel_start = time.time()
+                    detected_chapters, chunks = await parallel_processing()
+                    logging.info(f"Parallel processing took {time.time() - parallel_start:.2f}s")
+
+                    # Handle exceptions from parallel tasks
+                    if isinstance(detected_chapters, Exception):
+                        logging.error(f"Chapter detection failed: {detected_chapters}")
+                        detected_chapters = get_fallback_chapter()
+
+                    if isinstance(chunks, Exception):
+                        logging.error(f"Chunking failed: {chunks}")
+                        raise chunks
+
+                    chunks = flatten_chunks(chunks)
+
+                    # 3. Assign chapters to chunks
+                    if detected_chapters and len(detected_chapters) > 0:
+                        assignment_start = time.time()
+                        chunks = assign_chapters_to_chunks(chunks, detected_chapters, full_text)
+                        logging.info(f"Chapter assignment took {time.time() - assignment_start:.2f}s")
+                    else:
+                        logging.warning("No chapters detected, using fallback")
+                        for chunk in chunks:
+                            chunk['chapter_number'] = "1"
+                            chunk['chapter_title'] = "Full Document"
+
+            except Exception as e:
+                logging.warning(f"Chapter detection process failed: {e}, falling back to regular chunking")
+                enable_chapter_detection = False
+
+        # Fallback: regular chunking without chapter detection
+        if not chunks:
+            logging.info(f"Chunking document (without chapter detection): {file_path}")
+            chunks = chunk_document(
+                file_path=file_path,
+                chunk_size=chunk_size,
+                overlap_tokens=overlap_tokens,
+                tokenizer=tokenizer,
+                recipe=recipe,
+                lang=lang,
+                min_characters_per_chunk=min_characters_per_chunk
+            )
+            chunks = flatten_chunks(chunks)
         # print('chunks', chunks)
         
         if not chunks:
@@ -287,7 +370,7 @@ def process_document_with_openai(
         raise
 
 
-def process_drive_files(file_ids: List[str], space_id: str, access_token: str, refresh_token: str) -> Dict[str, Any]:
+async def process_drive_files(file_ids: List[str], space_id: str, access_token: str, refresh_token: str) -> Dict[str, Any]:
     """
     Process multiple Google Drive files through the pipeline.
     
@@ -339,7 +422,7 @@ def process_drive_files(file_ids: List[str], space_id: str, access_token: str, r
                     }
                     
                     # Process through existing pipeline
-                    document_id = process_document_with_openai(
+                    document_id = await process_document_with_openai(
                         file_path=temp_file_path,
                         metadata=pipeline_metadata
                     )
@@ -988,7 +1071,7 @@ async def process_document_endpoint(
             
             # Process the document using the appropriate function
             if use_openai:
-                document_id = process_document_with_openai(temp_file_path, metadata)
+                document_id = await process_document_with_openai(temp_file_path, metadata)
             else:
                 document_id = process_document(temp_file_path, metadata)
                 
@@ -1593,7 +1676,7 @@ async def import_drive_files(request: DriveImportRequest) -> JSONResponse:
         logging.info(f"Importing {len(request.file_ids)} Google Drive files to space {request.space_id}")
         
         # Process the files
-        results = process_drive_files(
+        results = await process_drive_files(
             file_ids=request.file_ids,
             space_id=request.space_id,
             access_token=request.access_token,
