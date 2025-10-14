@@ -41,3 +41,4 @@ google-auth>=2.20.0
 google-auth-oauthlib>=1.0.0
 google-auth-httplib2>=0.1.0
 cryptography>=41.0.0
+exa-py>=1.0.0

@@ -1,18 +1,50 @@
 import os
 import json
 import requests
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
+from exa_py import Exa
 
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SERP_API_KEY = os.getenv("SERP_API_KEY")  # For Google Search API
-BING_API_KEY = os.getenv("BING_API_KEY")  # Alternative search API
+EXA_API_KEY = os.getenv("EXA_API_KEY")  # For Exa semantic search API
 
 # Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Initialize Exa client
+exa_client = Exa(api_key=EXA_API_KEY) if EXA_API_KEY else None
+
+# Quality domains for educational content
+QUALITY_DOMAINS = [
+    # Video & Courses
+    "youtube.com", "coursera.org", "udemy.com", "edx.org",
+    "khanacademy.org", "skillshare.com", "brilliant.org", "pluralsight.com",
+
+    # Tech & Programming Learning
+    "freecodecamp.org", "w3schools.com", "geeksforgeeks.org", "tutorialspoint.com",
+    "codecademy.com", "css-tricks.com", "hashnode.com", "dev.to",
+
+    # Blogs & Articles
+    "medium.com", "towardsdatascience.com", "dzone.com",
+    "infoq.com", "smashingmagazine.com",
+
+    # Academic & Research
+    "mit.edu", "stanford.edu", "harvard.edu", "cam.ac.uk",
+    "nature.com", "sciencedirect.com", "springer.com",
+    "arxiv.org", "researchgate.net", "jstor.org",
+
+    # Developer Resources
+    "github.com", "gitlab.com", "bitbucket.org",
+    "stackoverflow.com", "superuser.com",
+
+    # General Knowledge & Trusted Media
+    "wikipedia.org", "britannica.com", "nationalgeographic.com",
+    "npr.org", "bbc.com", "nytimes.com"
+]
+
 
 def analyze_document_context(rag_context: str, query: str) -> Dict[str, Any]:
     """
@@ -207,86 +239,161 @@ def generate_contextual_search_queries(query: str, context_analysis: Dict[str, A
             
         return fallback_queries[:3]
 
-def perform_web_search(search_query: str) -> List[Dict[str, str]]:
+def perform_web_search(
+    search_query: str,
+    category: Optional[str] = None,
+    intent_type: Optional[str] = None
+) -> List[Dict[str, str]]:
     """
-    Perform web search using available search APIs.
-    
+    Perform web search using Exa SDK (semantic search optimized for LLMs).
+
+    Uses "auto" search type (intelligently blends neural + keyword),
+    highlights for context-relevant excerpts, and domain filtering for quality.
+
     Args:
         search_query: The search query string
-        
-    Returns:
-        List of search results with title, url, and snippet
-    """
-    results = []
-    
-    # Try SerpAPI first (Google Search)
-    if SERP_API_KEY:
-        try:
-            url = "https://serpapi.com/search"
-            params = {
-                "q": search_query,
-                "api_key": SERP_API_KEY,
-                "engine": "google",
-                "num": 5
-            }
-            
-            response = requests.get(url, params=params, timeout=10)
-            data = response.json()
-            
-            for result in data.get("organic_results", [])[:5]:
-                results.append({
-                    "title": result.get("title", ""),
-                    "url": result.get("link", ""),
-                    "snippet": result.get("snippet", "")
-                })
-                
-        except Exception as e:
-            print(f"SerpAPI search failed: {e}")
-    
-    # Try Bing Search API as fallback
-    elif BING_API_KEY:
-        try:
-            url = "https://api.bing.microsoft.com/v7.0/search"
-            headers = {"Ocp-Apim-Subscription-Key": BING_API_KEY}
-            params = {"q": search_query, "count": 5}
-            
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-            data = response.json()
-            
-            for result in data.get("webPages", {}).get("value", [])[:5]:
-                results.append({
-                    "title": result.get("name", ""),
-                    "url": result.get("url", ""),
-                    "snippet": result.get("snippet", "")
-                })
-                
-        except Exception as e:
-            print(f"Bing search failed: {e}")
-    
-    # If no API keys or all failed, return empty results
-    if not results:
-        print(f"No search results for: {search_query}")
-    
-    return results
+        category: Optional Exa category filter ("tutorial", "github", "research paper", etc.)
+        intent_type: Optional intent type to map to category if not provided
 
-def perform_contextual_websearch(search_queries: List[str]) -> List[Dict[str, Any]]:
+    Returns:
+        List of search results with title, url, and snippet (from highlights)
     """
-    Perform multiple web searches and aggregate results.
-    
+    if not exa_client:
+        print("No EXA_API_KEY found or Exa client not initialized")
+        return []
+
+    try:
+        # Map intent type to Exa category if category not explicitly provided
+        if not category and intent_type:
+            category_mapping = {
+                # Learning & Guides
+                "tutorial": "tutorial",
+                "guide": "tutorial",
+                "how-to": "tutorial",
+                "learning": "course",
+                "becoming": "career path",
+
+                # Technical Implementation
+                "implementation": "github",
+                "code": "github",
+                "repository": "github",
+                "demo": "example",
+
+                # Knowledge Types
+                "definition": None,  # auto-handle with dictionary / encyclopedia
+                "concept": "concept",
+                "theory": "concept",
+                "principle": "concept",
+
+                # Academic / Research
+                "research": "research paper",
+                "study": "research paper",
+                "thesis": "research paper",
+                "publication": "research paper",
+
+                # Practical Application
+                "application": "application",
+                "case study": "application",
+                "example": "application",
+                "use-case": "application",
+
+                # Technology / Ecosystem
+                "tool": "tool",
+                "framework": "framework",
+                "library": "library",
+                "package": "library",
+                "module": "library",
+                "sdk": "library",
+                "database": "database",
+                "api": "api",
+                "service": "api",
+
+                # General Knowledge
+                "article": "article",
+                "blog": "article",
+                "documentation": "docs",
+                "faq": "docs",
+                "wiki": "docs",
+
+                # Multimedia
+                "video": "video",
+                "lecture": "video",
+                "course": "course",
+                "podcast": "podcast",
+            }
+
+            category = category_mapping.get(intent_type)
+
+        # Build search parameters
+        search_params = {
+            "query": search_query,
+            "type": "auto",  # Intelligently blends neural + keyword (Exa's recommendation)
+            "num_results": 5,
+            "use_autoprompt": True,  # Let Exa optimize the query
+            "include_domains": QUALITY_DOMAINS,  # Filter at API level for speed
+            "highlights": {
+                "query": search_query,
+                "num_sentences": 3,
+                "highlights_per_url": 1
+            }
+        }
+
+        # Add category filter if available
+        if category:
+            search_params["category"] = category
+
+        # Perform search with the Exa SDK
+        results = exa_client.search_and_contents(**search_params)
+
+        # Extract and format results
+        formatted_results = []
+        for result in results.results:
+            # Use highlights if available, fall back to text excerpt
+            snippet = ""
+            if result.highlights and len(result.highlights) > 0:
+                snippet = " ".join(result.highlights)
+            elif result.text:
+                snippet = result.text[:500]
+
+            formatted_results.append({
+                "title": result.title or "",
+                "url": result.url or "",
+                "snippet": snippet
+            })
+
+        return formatted_results
+
+    except Exception as e:
+        print(f"Exa SDK search failed: {e}")
+        # Fallback to empty results
+        return []
+
+def perform_contextual_websearch(
+    search_queries: List[str],
+    context_analysis: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Perform multiple web searches and aggregate results with intent-aware filtering.
+
     Args:
         search_queries: List of search query strings
-        
+        context_analysis: Optional context analysis with intent information
+
     Returns:
-        List of aggregated search results
+        List of aggregated search results (max 5)
     """
     all_results = []
-    
+
+    # Extract intent type from context analysis
+    intent_type = context_analysis.get("intent_type") if context_analysis else None
+
     for query in search_queries:
-        results = perform_web_search(query)
+        # Pass intent type to enable category filtering at API level
+        results = perform_web_search(query, intent_type=intent_type)
         for result in results:
             result["search_query"] = query
             all_results.append(result)
-    
+
     # Remove duplicates based on URL
     seen_urls = set()
     unique_results = []
@@ -295,8 +402,9 @@ def perform_contextual_websearch(search_queries: List[str]) -> List[Dict[str, An
         if url and url not in seen_urls:
             seen_urls.add(url)
             unique_results.append(result)
-    
-    return rank_and_filter_results(unique_results, search_queries)[:5]  # Limit to 5 best results
+
+    # Return top 5 results (already filtered by domain at API level, so less ranking needed)
+    return unique_results[:5]
 
 def rank_and_filter_results(results: List[Dict[str, Any]], search_queries: List[str]) -> List[Dict[str, Any]]:
     """
@@ -369,7 +477,8 @@ def synthesize_rag_and_web_results(
     web_results: List[Dict[str, Any]],
     context_analysis: Dict[str, Any],
     system_prompt: str,
-    has_general_knowledge: bool = True
+    has_general_knowledge: bool = True,
+    conversation_history: Optional[List[Dict[str, str]]] = None
 ) -> Tuple[str, List[Dict]]:
     """
     Synthesize RAG results with web search results using GPT-4o, leveraging general knowledge.
@@ -470,16 +579,23 @@ TASK: Help the user achieve their specific intent by:
 
 Provide a response that helps them take concrete action toward their intent."""
 
+    # Build messages array with conversation history
+    messages = [{"role": "system", "content": synthesis_prompt}]
+
+    # Insert conversation history for context continuity
+    if conversation_history:
+        messages.extend(conversation_history)
+
+    # Add current user message
+    messages.append({"role": "user", "content": user_message})
+
     try:
         response = client.chat.completions.create(
             model="gpt-4o",
-            messages=[
-                {"role": "system", "content": synthesis_prompt},
-                {"role": "user", "content": user_message}
-            ],
+            messages=messages,
             temperature=0.3
         )
-        
+
         answer = response.choices[0].message.content
         
         # Combine sources for citation tracking
