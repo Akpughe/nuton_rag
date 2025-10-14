@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Dict, Any, Optional
 import os
@@ -27,7 +27,7 @@ from prompts import main_prompt, general_knowledge_prompt, simple_general_knowle
 from intelligent_enrichment import create_enriched_system_prompt
 from enrichment_examples import create_few_shot_enhanced_prompt
 from enhanced_prompts import get_domain_from_context
-from websearch_client import analyze_document_context, generate_contextual_search_queries, perform_contextual_websearch, synthesize_rag_and_web_results
+from websearch_client import analyze_and_generate_queries, perform_contextual_websearch_async, synthesize_rag_and_web_results
 from services.google_drive_service import GoogleDriveService
 
 
@@ -519,7 +519,7 @@ def get_query_embedding(query: str, use_openai: bool = True):
     return result
 
 
-def answer_query(
+async def answer_query(
     query: str,
     document_id: Optional[str] = None,
     space_id: Optional[str] = None,
@@ -537,12 +537,13 @@ def answer_query(
     learning_style: Optional[str] = None,  # Learning style for personalized educational responses
     educational_mode: bool = False,  # Enable tutoring/educational approach
     conversation_history: Optional[List[Dict[str, str]]] = None,  # Conversation history for context continuity
-    max_history_messages: int = 10  # Maximum number of history messages to keep
+    max_history_messages: int = 10,  # Maximum number of history messages to keep
+    return_context: bool = False  # Return context chunks for streaming endpoints
 ) -> Dict[str, Any]:
     """
     Optimized function to answer a user query using hybrid search, rerank, and LLM generation.
     Returns dict with answer and citations.
-    
+
     Args:
         query: The user's question.
         document_id: Filter results to this document ID.
@@ -560,9 +561,13 @@ def answer_query(
         enrichment_mode: "simple" (default, classic enrichment) or "advanced" (intelligent domain-aware enrichment).
         learning_style: Learning style for personalized educational responses ("academic_focus", "deep_dive", "quick_practical", "exploratory_curious", "narrative_reader", "default", or None).
         educational_mode: If True, enables tutoring/educational approach with context-rich responses.
+        return_context: If True, includes context_chunks in the return dict for streaming endpoints.
     """
     start_time = time.time()
     logging.info(f"Answering query: '{query}' for document {document_id if not search_by_space_only else 'None'} in space {space_id}, allow_general_knowledge: {allow_general_knowledge}, enable_websearch: {enable_websearch}, enrichment_mode: {enrichment_mode}, learning_style: {learning_style}, educational_mode: {educational_mode}")
+
+    # Initialize context_chunks for optional return (used by streaming endpoints)
+    context_chunks = []
 
     # Validate and truncate conversation history for speed
     validated_history = _validate_and_truncate_history(
@@ -695,6 +700,7 @@ def answer_query(
         
         # Use enhanced context for multi-document answers
         limited_context = reranked[:max_context_chunks * 2]  # Allow more context for comprehensive answers
+        context_chunks = limited_context  # Store for optional return
         
         # Apply intelligent enrichment if general knowledge is enabled and in advanced mode
         if allow_general_knowledge and enrichment_mode == "advanced":
@@ -831,6 +837,7 @@ def answer_query(
         
         # Limit context to the top max_context_chunks chunks to reduce LLM input size
         limited_context = reranked[:max_context_chunks]
+        context_chunks = limited_context  # Store for optional return
         
         # Apply intelligent enrichment if general knowledge is enabled and in advanced mode
         if allow_general_knowledge and enrichment_mode == "advanced":
@@ -887,20 +894,17 @@ def answer_query(
             
             # Build RAG context for analysis
             rag_context = "\n\n".join([
-                chunk["text"] if "text" in chunk 
-                else chunk["metadata"]["text"] if "metadata" in chunk and "text" in chunk["metadata"] 
-                else "" 
+                chunk["text"] if "text" in chunk
+                else chunk["metadata"]["text"] if "metadata" in chunk and "text" in chunk["metadata"]
+                else ""
                 for chunk in limited_context
             ])
 
-            # Analyze document context to understand domain and guide search
-            context_analysis = analyze_document_context(rag_context, query)
+            # Combined: Analyze context and generate queries in ONE Groq call (faster!)
+            context_analysis, search_queries = analyze_and_generate_queries(rag_context, query)
 
-            # Generate targeted search queries based on document context
-            search_queries = generate_contextual_search_queries(query, context_analysis)
-
-            # Perform contextual web search with intent context
-            web_results = perform_contextual_websearch(search_queries, context_analysis)
+            # Perform contextual web search with intent context (PARALLEL Exa searches!)
+            web_results = await perform_contextual_websearch_async(search_queries, context_analysis)
             
             if web_results:
                 # Synthesize RAG results with web search results using GPT-4o
@@ -927,8 +931,12 @@ def answer_query(
             logging.info("Falling back to original RAG answer")
     
     logging.info(f"Total query processing took {time.time() - start_time:.2f}s")
-    
-    return {"answer": answer, "citations": citations}
+
+    # Return answer and citations, optionally include context chunks for streaming
+    result = {"answer": answer, "citations": citations}
+    if return_context:
+        result["context_chunks"] = context_chunks
+    return result
 
 
 def process_youtube(
@@ -1151,6 +1159,200 @@ async def process_document_endpoint(
         return JSONResponse({"error": "All files failed to process", "details": errors}, status_code=500)
 
 
+@app.post("/answer_query_stream")
+async def answer_query_stream_endpoint(
+    query: str = Form(...),
+    document_id: str = Form(...),
+    space_id: Optional[str] = Form(None),
+    acl_tags: Optional[str] = Form(None),
+    use_openai_embeddings: bool = Form(True),
+    search_by_space_only: bool = Form(False),
+    rerank_top_n: Optional[int] = Form(10),
+    max_context_chunks: Optional[int] = Form(5),
+    fast_mode: bool = Form(False),
+    allow_general_knowledge: bool = Form(False),
+    enable_websearch: bool = Form(False),
+    model: str = Form("openai/gpt-oss-20b"),
+    enrichment_mode: str = Form("simple"),
+    learning_style: Optional[str] = Form(None),
+    educational_mode: bool = Form(False),
+    conversation_history: Optional[str] = Form(None)
+):
+    """
+    STREAMING endpoint: Returns real-time status updates and progressive answers.
+    Uses Server-Sent Events (SSE) for streaming responses.
+    """
+    # Parse params outside the generator
+    start_time = time.time()
+    acl_list = [tag.strip() for tag in acl_tags.split(",")] if acl_tags else None
+
+    # Parse conversation history
+    history_list = None
+    if conversation_history:
+        try:
+            history_list = json.loads(conversation_history)
+            if not isinstance(history_list, list):
+                history_list = None
+        except json.JSONDecodeError:
+            history_list = None
+
+    # Fast mode adjustments
+    effective_rerank = rerank_top_n
+    effective_chunks = max_context_chunks
+    if fast_mode:
+        effective_rerank = min(rerank_top_n, 5)
+        effective_chunks = min(max_context_chunks, 3)
+
+    async def generate_stream():
+        """Generator function for SSE streaming."""
+        try:
+            # Send initial status
+            yield f"data: {json.dumps({'status': '🔍 Searching documents...', 'type': 'status'})}\n\n"
+
+            # Call answer_query to get RAG results (without websearch first)
+            # Request context_chunks so we can use them for websearch synthesis
+            rag_result = await answer_query(
+                query,
+                document_id,
+                space_id=space_id,
+                acl_tags=acl_list,
+                use_openai_embeddings=use_openai_embeddings,
+                search_by_space_only=search_by_space_only,
+                rerank_top_n=effective_rerank,
+                max_context_chunks=effective_chunks,
+                allow_general_knowledge=allow_general_knowledge,
+                enable_websearch=False,  # Don't do websearch in the main function
+                model=model,
+                enrichment_mode=enrichment_mode,
+                learning_style=learning_style,
+                educational_mode=educational_mode,
+                conversation_history=history_list,
+                return_context=True  # Get context chunks for websearch synthesis
+            )
+
+            # Stream RAG answer
+            rag_time = int((time.time() - start_time) * 1000)
+            yield f"data: {json.dumps({'status': '✅ Document search complete', 'type': 'status'})}\n\n"
+            yield f"data: {json.dumps({'answer': rag_result['answer'], 'citations': rag_result['citations'], 'time_ms': rag_time, 'type': 'rag_answer'})}\n\n"
+
+            # If websearch is enabled, do it now with progressive updates
+            if enable_websearch:
+                try:
+                    websearch_start = time.time()
+
+                    yield f"data: {json.dumps({'status': '🧠 Analyzing context for web search...', 'type': 'status'})}\n\n"
+
+                    # Build RAG context from the context chunks (same as in answer_query function)
+                    context_chunks_list = rag_result.get('context_chunks', [])
+                    if context_chunks_list:
+                        # Build context from chunks like in answer_query (lines 889-894)
+                        rag_context = "\n\n".join([
+                            chunk["text"] if "text" in chunk
+                            else chunk["metadata"]["text"] if "metadata" in chunk and "text" in chunk["metadata"]
+                            else ""
+                            for chunk in context_chunks_list
+                        ])
+                    else:
+                        # Fallback to using answer if context_chunks not available
+                        logging.warning("No context_chunks in rag_result, falling back to using answer as context")
+                        rag_context = rag_result['answer']
+
+                    # Build correct system prompt based on parameters (same logic as answer_query)
+                    synthesis_system_prompt = main_prompt
+
+                    # Auto-enable educational mode if learning style is specified
+                    effective_educational_mode = educational_mode
+                    if learning_style and not educational_mode:
+                        effective_educational_mode = True
+                        logging.info(f"Auto-enabled educational mode for web synthesis due to learning style: {learning_style}")
+
+                    # Set initial system prompt based on allow_general_knowledge setting
+                    if allow_general_knowledge:
+                        if enrichment_mode == "advanced":
+                            synthesis_system_prompt = general_knowledge_prompt
+                        else:
+                            synthesis_system_prompt = simple_general_knowledge_prompt
+                    else:
+                        synthesis_system_prompt = main_prompt
+
+                    # Apply intelligent enrichment if enrichment_mode is advanced
+                    if allow_general_knowledge and enrichment_mode == "advanced":
+                        # Build context preview from RAG answer for enrichment analysis
+                        rag_context_preview = rag_context[:2000]  # Use first 2000 chars as preview
+
+                        # Create intelligent enrichment prompt with learning style integration
+                        enhanced_prompt, enrichment_metadata = create_enriched_system_prompt(
+                            query, rag_context_preview, allow_general_knowledge, general_knowledge_prompt,
+                            learning_style, effective_educational_mode
+                        )
+
+                        # Add few-shot examples for better guidance
+                        domain = enrichment_metadata.get("domain", "general")
+                        synthesis_system_prompt = create_few_shot_enhanced_prompt(enhanced_prompt, domain)
+
+                        # Log enrichment strategy
+                        if enrichment_metadata.get("enrichment_applied"):
+                            learning_info = f" with {learning_style} learning style" if learning_style else ""
+                            educational_info = " (educational mode)" if enrichment_metadata.get("educational_mode") else ""
+                            logging.info(f"Applied intelligent enrichment for web synthesis - {domain} domain{learning_info}{educational_info}: {enrichment_metadata.get('reason', 'standard enrichment')}")
+                        else:
+                            learning_info = f" with {learning_style} learning style" if learning_style else ""
+                            educational_info = " (educational mode)" if effective_educational_mode else ""
+                            logging.info(f"Using standard prompt for web synthesis{learning_info}{educational_info}: {enrichment_metadata.get('reason', 'no specific enrichment needed')}")
+                    elif allow_general_knowledge and enrichment_mode == "simple":
+                        logging.info("Using simple general knowledge enrichment mode for web synthesis (classic behavior)")
+
+                    # Combined: Analyze context and generate queries in ONE Groq call
+                    context_analysis, search_queries = analyze_and_generate_queries(rag_context, query)
+
+                    yield f"data: {json.dumps({'status': f'🔍 Generated {len(search_queries)} targeted search queries', 'type': 'status'})}\n\n"
+
+                    # Perform contextual web search with parallel Exa searches
+                    yield f"data: {json.dumps({'status': '🌐 Searching web in parallel...', 'type': 'status'})}\n\n"
+                    web_results = await perform_contextual_websearch_async(search_queries, context_analysis)
+
+                    if web_results:
+                        yield f"data: {json.dumps({'status': f'✅ Found {len(web_results)} quality web sources', 'type': 'status'})}\n\n"
+
+                        # Synthesize RAG results with web search results
+                        yield f"data: {json.dumps({'status': '💭 Synthesizing RAG + web insights...', 'type': 'status'})}\n\n"
+
+                        synthesized_answer, combined_sources = synthesize_rag_and_web_results(
+                            query=query,
+                            rag_context=rag_context,
+                            web_results=web_results,
+                            context_analysis=context_analysis,
+                            system_prompt=synthesis_system_prompt,  # Use computed prompt with all parameters
+                            has_general_knowledge=allow_general_knowledge,
+                            conversation_history=history_list
+                        )
+
+                        # Stream the web-enhanced answer as a new event
+                        web_time = int((time.time() - websearch_start) * 1000)
+                        total_citations = rag_result['citations'] + combined_sources
+
+                        yield f"data: {json.dumps({'status': '✅ Web enrichment complete', 'type': 'status'})}\n\n"
+                        yield f"data: {json.dumps({'answer': synthesized_answer, 'citations': total_citations, 'time_ms': web_time, 'type': 'web_enhanced_answer'})}\n\n"
+
+                        logging.info(f"Websearch integration took {web_time}ms")
+                    else:
+                        yield f"data: {json.dumps({'status': '⚠️ No web results found, using RAG answer', 'type': 'status'})}\n\n"
+
+                except Exception as e:
+                    logging.error(f"Websearch integration failed: {e}")
+                    yield f"data: {json.dumps({'status': '⚠️ Web search failed, using RAG answer', 'type': 'status'})}\n\n"
+
+            # Send final completion
+            total_time = int((time.time() - start_time) * 1000)
+            yield f"data: {json.dumps({'status': '🎉 Complete', 'time_ms': total_time, 'type': 'complete'})}\n\n"
+
+        except Exception as e:
+            logging.exception(f"Error in streaming endpoint: {e}")
+            yield f"data: {json.dumps({'error': str(e), 'type': 'error'})}\n\n"
+
+    return StreamingResponse(generate_stream(), media_type="text/event-stream")
+
+
 @app.post("/answer_query")
 async def answer_query_endpoint(
     query: str = Form(...),
@@ -1212,7 +1414,7 @@ async def answer_query_endpoint(
         max_context_chunks = min(max_context_chunks, 3)  # Use fewer chunks in context
 
     try:
-        result = answer_query(
+        result = await answer_query(
             query,
             document_id,
             space_id=space_id,

@@ -5,14 +5,17 @@ from typing import List, Dict, Any, Tuple, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 from exa_py import Exa
+from groq import Groq
 
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 EXA_API_KEY = os.getenv("EXA_API_KEY")  # For Exa semantic search API
 
 # Initialize OpenAI client
 client = OpenAI(api_key=OPENAI_API_KEY)
+groq_client = Groq(api_key=GROQ_API_KEY)
 
 # Initialize Exa client
 exa_client = Exa(api_key=EXA_API_KEY) if EXA_API_KEY else None
@@ -88,8 +91,8 @@ def analyze_document_context(rag_context: str, query: str) -> Dict[str, Any]:
 
     
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
+        response = groq_client.chat.completions.create(
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": "You are an expert at analyzing educational content and understanding learning contexts. Respond only with valid JSON."},
                 {"role": "user", "content": analysis_prompt}
@@ -132,6 +135,117 @@ def analyze_document_context(rag_context: str, query: str) -> Dict[str, Any]:
             "key_concepts": [],
             "preferred_formats": ["tutorials", "guides", "articles"]
         }
+
+def analyze_and_generate_queries(rag_context: str, query: str) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Combined function: Analyze context and generate search queries in ONE Groq call for speed.
+
+    Args:
+        rag_context: The context extracted from user's documents
+        query: The user's original query
+
+    Returns:
+        Tuple of (context_analysis dict, list of search queries)
+    """
+    combined_prompt = f"""
+    Analyze the user's query and their document context, then generate targeted search queries.
+
+    User Query: {query}
+
+    Document Context:
+    {rag_context}
+
+    PART 1: CONTEXT ANALYSIS
+    Determine:
+    1. Query Intent: What is the user really trying to achieve?
+    2. Action Level: Are they seeking definitions, tutorials, guides, or implementation help?
+    3. Context Domain: What specific field/domain is this about?
+    4. User's Current Level: Based on their documents, what's their expertise level?
+    5. Gap Analysis: What specific knowledge or guidance would help them most?
+
+    PART 2: SEARCH QUERY GENERATION
+    Generate 3-5 purposeful search queries that will return actionable, high-quality resources.
+
+    Create queries that:
+    - Target the user's TRUE INTENT, not just keywords
+    - Return resources that help them TAKE ACTION or ACHIEVE their goal
+    - Find step-by-step guides, tutorials, and practical resources
+    - Prioritize authoritative, educational content
+    - Match their skill level
+
+    Provide a JSON response with this structure:
+    {{
+        "analysis": {{
+            "query_intent": "what the user is really trying to achieve",
+            "intent_type": "definition/tutorial/guide/implementation/becoming/learning",
+            "action_focus": "specific actionable outcome they want",
+            "domain": "specific domain/field",
+            "user_level": "beginner/intermediate/advanced",
+            "knowledge_gaps": ["gap1", "gap2"],
+            "search_focus": "what type of content would be most helpful",
+            "key_concepts": ["concept1", "concept2"],
+            "preferred_formats": ["tutorials", "guides", "videos"]
+        }},
+        "queries": ["query1", "query2", "query3", "query4", "query5"]
+    }}
+    """
+
+    try:
+        response = groq_client.chat.completions.create(
+            model="openai/gpt-oss-120b",
+            messages=[
+                {"role": "system", "content": "You are an expert at analyzing educational content and generating targeted search queries. Respond only with valid JSON."},
+                {"role": "user", "content": combined_prompt}
+            ],
+            temperature=0.4
+        )
+        response_content = response.choices[0].message.content.strip()
+
+        # Extract JSON if wrapped in markdown code blocks
+        if response_content.startswith('```json'):
+            response_content = response_content.replace('```json', '').replace('```', '').strip()
+        elif response_content.startswith('```'):
+            response_content = response_content.replace('```', '').strip()
+
+        result = json.loads(response_content)
+        context_analysis = result.get("analysis", {})
+        queries = result.get("queries", [])[:5]  # Limit to 5
+
+        return context_analysis, queries
+
+    except Exception as e:
+        print(f"Error in analyze_and_generate_queries: {e}")
+        # Fallback to basic analysis and queries
+        intent_type = "learning"
+        if "how to" in query.lower() or "how can" in query.lower():
+            intent_type = "tutorial"
+        elif "what is" in query.lower() or "define" in query.lower():
+            intent_type = "definition"
+        elif "build" in query.lower() or "create" in query.lower():
+            intent_type = "implementation"
+        elif "become" in query.lower():
+            intent_type = "becoming"
+
+        fallback_analysis = {
+            "query_intent": "Understanding and learning about the topic",
+            "intent_type": intent_type,
+            "action_focus": "gain practical knowledge",
+            "domain": "general",
+            "user_level": "intermediate",
+            "knowledge_gaps": ["current developments", "practical applications"],
+            "search_focus": "actionable guides and tutorials",
+            "key_concepts": [],
+            "preferred_formats": ["tutorials", "guides", "articles"]
+        }
+
+        fallback_queries = [
+            f"learn {query}",
+            f"{query} tutorial",
+            f"{query} guide"
+        ]
+
+        return fallback_analysis, fallback_queries
+
 
 def generate_contextual_search_queries(query: str, context_analysis: Dict[str, Any]) -> List[str]:
     """
@@ -188,8 +302,8 @@ def generate_contextual_search_queries(query: str, context_analysis: Dict[str, A
     """
     
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
+        response = groq_client.chat.completions.create(
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": "Generate targeted search queries that complement existing document knowledge. Respond only with valid JSON array."},
                 {"role": "user", "content": query_generation_prompt}
@@ -368,12 +482,65 @@ def perform_web_search(
         # Fallback to empty results
         return []
 
+async def perform_contextual_websearch_async(
+    search_queries: List[str],
+    context_analysis: Optional[Dict[str, Any]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Perform multiple web searches IN PARALLEL and aggregate results with intent-aware filtering.
+
+    Args:
+        search_queries: List of search query strings
+        context_analysis: Optional context analysis with intent information
+
+    Returns:
+        List of aggregated search results (max 5)
+    """
+    import asyncio
+    from concurrent.futures import ThreadPoolExecutor
+
+    # Extract intent type from context analysis
+    intent_type = context_analysis.get("intent_type") if context_analysis else None
+
+    # Run all searches in parallel using thread pool (Exa SDK is synchronous)
+    loop = asyncio.get_event_loop()
+    with ThreadPoolExecutor(max_workers=len(search_queries)) as executor:
+        futures = [
+            loop.run_in_executor(executor, perform_web_search, query, None, intent_type)
+            for query in search_queries
+        ]
+        results_list = await asyncio.gather(*futures, return_exceptions=True)
+
+    # Aggregate results
+    all_results = []
+    for i, results in enumerate(results_list):
+        if isinstance(results, Exception):
+            print(f"Search failed for query {search_queries[i]}: {results}")
+            continue
+        for result in results:
+            result["search_query"] = search_queries[i]
+            all_results.append(result)
+
+    # Remove duplicates based on URL
+    seen_urls = set()
+    unique_results = []
+    for result in all_results:
+        url = result.get("url", "")
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            unique_results.append(result)
+
+    # Return top 5 results (already filtered by domain at API level, so less ranking needed)
+    return unique_results[:5]
+
+
 def perform_contextual_websearch(
     search_queries: List[str],
     context_analysis: Optional[Dict[str, Any]] = None
 ) -> List[Dict[str, Any]]:
     """
     Perform multiple web searches and aggregate results with intent-aware filtering.
+    Synchronous wrapper for backward compatibility.
 
     Args:
         search_queries: List of search query strings
@@ -557,6 +724,13 @@ SYNTHESIS GUIDELINES:
 - Culminate with current, actionable resources from web search
 - Ensure the response flows logically from theory to practice
 
+FORMATTING INSTRUCTIONS:
+- Write in natural, flowing prose - avoid tables and structured lists unless absolutely necessary
+- Integrate web resources naturally into your narrative explanation
+- Only use tables if you're comparing 5+ items with multiple attributes (rare cases)
+- Prefer weaving sources into sentences rather than listing them separately
+- Make the response read like an expert explanation, not a research compilation
+
 Domain Context: {context_analysis.get('domain', 'general')}
 User Level: {context_analysis.get('user_level', 'intermediate')}
 Key Concepts: {', '.join(context_analysis.get('key_concepts', []))}
@@ -590,8 +764,8 @@ Provide a response that helps them take concrete action toward their intent."""
     messages.append({"role": "user", "content": user_message})
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
+        response = groq_client.chat.completions.create(
+            model="openai/gpt-oss-120b",
             messages=messages,
             temperature=0.3
         )
