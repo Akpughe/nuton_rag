@@ -1,5 +1,5 @@
 import os
-from typing import List, Dict, Tuple, Any
+from typing import List, Dict, Tuple, Any, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -14,7 +14,8 @@ def generate_answer(
     query: str,
     context_chunks: List[Dict],
     system_prompt: str,
-    model: str = "gpt-4o"
+    model: str = "gpt-4o",
+    conversation_history: Optional[List[Dict[str, str]]] = None
 ) -> Tuple[str, List[Dict]]:
     """
     Generate an answer using OpenAI GPT-4o, given a query and context chunks.
@@ -40,11 +41,17 @@ def generate_answer(
             context_texts.append("")
     
     context = "\n\n".join(context_texts)
-    
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"{query}\n\nContext:\n{context}"}
-    ]
+
+    # Build messages array with conversation history
+    messages = [{"role": "system", "content": system_prompt}]
+
+    # Insert conversation history for context continuity
+    if conversation_history:
+        messages.extend(conversation_history)
+
+    # Add current query with RAG context
+    messages.append({"role": "user", "content": f"{query}\n\nContext:\n{context}"})
+
     try:
         response = client.chat.completions.create(
             model=model,

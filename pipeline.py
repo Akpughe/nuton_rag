@@ -99,6 +99,52 @@ def flatten_chunks(chunks):
     return chunks
 
 
+def _validate_and_truncate_history(
+    history: Optional[List[Dict[str, str]]],
+    max_messages: int = 10,
+    max_tokens: int = 2000
+) -> Optional[List[Dict[str, str]]]:
+    """
+    Validate and truncate conversation history for speed.
+
+    Args:
+        history: Raw conversation history
+        max_messages: Maximum number of messages to keep
+        max_tokens: Maximum estimated tokens (using char/4 approximation)
+
+    Returns:
+        Validated history or None if invalid/empty
+    """
+    if not history:
+        return None
+
+    # Validate structure
+    validated = []
+    for msg in history:
+        if isinstance(msg, dict) and "role" in msg and "content" in msg:
+            if msg["role"] in ["user", "assistant"] and isinstance(msg["content"], str):
+                validated.append(msg)
+
+    if not validated:
+        return None
+
+    # Truncate to last N messages (keep conversation recent)
+    validated = validated[-max_messages:]
+
+    # Fast token estimation (4 chars ≈ 1 token)
+    total_chars = sum(len(msg["content"]) for msg in validated)
+    estimated_tokens = total_chars // 4
+
+    # If over budget, remove oldest messages
+    while estimated_tokens > max_tokens and len(validated) > 2:
+        validated.pop(0)  # Remove oldest
+        total_chars = sum(len(msg["content"]) for msg in validated)
+        estimated_tokens = total_chars // 4
+
+    logging.info(f"Conversation history: {len(validated)} messages, ~{estimated_tokens} tokens")
+    return validated
+
+
 def process_document(
     file_path: str,
     metadata: Dict[str, Any],
@@ -489,7 +535,9 @@ def answer_query(
     model: str = "meta-llama/llama-4-scout-17b-16e-instruct",  # User-selectable model parameter
     enrichment_mode: str = "simple",  # "simple" (default) or "advanced" for intelligent enrichment
     learning_style: Optional[str] = None,  # Learning style for personalized educational responses
-    educational_mode: bool = False  # Enable tutoring/educational approach
+    educational_mode: bool = False,  # Enable tutoring/educational approach
+    conversation_history: Optional[List[Dict[str, str]]] = None,  # Conversation history for context continuity
+    max_history_messages: int = 10  # Maximum number of history messages to keep
 ) -> Dict[str, Any]:
     """
     Optimized function to answer a user query using hybrid search, rerank, and LLM generation.
@@ -515,7 +563,14 @@ def answer_query(
     """
     start_time = time.time()
     logging.info(f"Answering query: '{query}' for document {document_id if not search_by_space_only else 'None'} in space {space_id}, allow_general_knowledge: {allow_general_knowledge}, enable_websearch: {enable_websearch}, enrichment_mode: {enrichment_mode}, learning_style: {learning_style}, educational_mode: {educational_mode}")
-    
+
+    # Validate and truncate conversation history for speed
+    validated_history = _validate_and_truncate_history(
+        conversation_history,
+        max_messages=max_history_messages,
+        max_tokens=2000  # Keep history compact
+    )
+
     # Auto-enable educational mode if learning style is specified
     if learning_style and not educational_mode:
         educational_mode = True
@@ -580,13 +635,13 @@ def answer_query(
                 logging.info("No documents in space, but allow_general_knowledge is True - generating enriched answer with domain expertise")
                 fallback_prompt = no_docs_in_space_prompt
                 if use_openai:
-                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=effective_model)
+                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=effective_model, conversation_history=validated_history)
                 else:
                     try:
-                        answer, citations = generate_answer(query, [], fallback_prompt, model=effective_model)
+                        answer, citations = generate_answer(query, [], fallback_prompt, model=effective_model, conversation_history=validated_history)
                     except Exception as e:
                         logging.warning(f"Groq generation failed for general knowledge fallback, trying OpenAI: {e}")
-                        answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model)
+                        answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model, conversation_history=validated_history)
                 return {"answer": answer, "citations": citations}
             else:
                 return {"answer": "No documents found in this space.", "citations": []}
@@ -617,13 +672,13 @@ def answer_query(
                 logging.info("No relevant context found, but allow_general_knowledge is True - generating enriched answer with domain expertise")
                 fallback_prompt = no_relevant_in_scope_prompt.format(query=query, scope="the user's space")
                 if use_openai:
-                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=effective_model)
+                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=effective_model, conversation_history=validated_history)
                 else:
                     try:
-                        answer, citations = generate_answer(query, [], fallback_prompt, model=effective_model)
+                        answer, citations = generate_answer(query, [], fallback_prompt, model=effective_model, conversation_history=validated_history)
                     except Exception as e:
                         logging.warning(f"Groq generation failed for general knowledge fallback, trying OpenAI: {e}")
-                        answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model)
+                        answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model, conversation_history=validated_history)
                 return {"answer": answer, "citations": citations}
             else:
                 return {"answer": "No relevant context found in any documents.", "citations": []}
@@ -690,14 +745,14 @@ def answer_query(
                     if yt_doc["id"] == doc_id:
                         doc_name = yt_doc.get("file_name", "Unknown Video")
                         break
-                
+
                 # Add document source to chunk metadata
                 enhanced_chunk = chunk.copy()
                 if "metadata" in enhanced_chunk:
                     enhanced_chunk["metadata"]["source_document_name"] = doc_name
                 enhanced_context.append(enhanced_chunk)
-            
-            answer, citations = openai_client.generate_answer(query, enhanced_context, system_prompt, model=effective_model)
+
+            answer, citations = openai_client.generate_answer(query, enhanced_context, system_prompt, model=effective_model, conversation_history=validated_history)
         else:
             try:
                 answer, citations = generate_answer_document_aware(
@@ -705,7 +760,8 @@ def answer_query(
                     context_chunks=limited_context,
                     space_documents=space_documents,
                     system_prompt=system_prompt,
-                    model=effective_model
+                    model=effective_model,
+                    conversation_history=validated_history
                 )
             except Exception as e:
                 logging.warning(f"Groq document-aware generation failed, falling back to OpenAI: {e}")
@@ -723,14 +779,14 @@ def answer_query(
                         if yt_doc["id"] == doc_id:
                             doc_name = yt_doc.get("file_name", "Unknown Video")
                             break
-                    
+
                     # Add document source to chunk metadata
                     enhanced_chunk = chunk.copy()
                     if "metadata" in enhanced_chunk:
                         enhanced_chunk["metadata"]["source_document_name"] = doc_name
                     enhanced_context.append(enhanced_chunk)
-                
-                answer, citations = openai_client.generate_answer(query, enhanced_context, system_prompt, model=openai_model)
+
+                answer, citations = openai_client.generate_answer(query, enhanced_context, system_prompt, model=openai_model, conversation_history=validated_history)
         
         logging.info(f"LLM generation took {time.time() - llm_start:.2f}s")
         
@@ -757,13 +813,13 @@ def answer_query(
                 logging.info("No relevant context found, but allow_general_knowledge is True - generating enriched answer with domain expertise")
                 fallback_prompt = no_relevant_in_scope_prompt.format(query=query, scope="the specified document(s)")
                 if use_openai:
-                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=effective_model)
+                    answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=effective_model, conversation_history=validated_history)
                 else:
                     try:
-                        answer, citations = generate_answer(query, [], fallback_prompt, model=effective_model)
+                        answer, citations = generate_answer(query, [], fallback_prompt, model=effective_model, conversation_history=validated_history)
                     except Exception as e:
                         logging.warning(f"Groq generation failed for general knowledge fallback, trying OpenAI: {e}")
-                        answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model)
+                        answer, citations = openai_client.generate_answer(query, [], fallback_prompt, model=openai_model, conversation_history=validated_history)
                 return {"answer": answer, "citations": citations}
             else:
                 return {"answer": "No relevant context found.", "citations": []}
@@ -811,14 +867,14 @@ def answer_query(
         # Generate answer with limited context
         llm_start = time.time()
         if use_openai:
-            answer, citations = openai_client.generate_answer(query, limited_context, system_prompt, model=effective_model)
+            answer, citations = openai_client.generate_answer(query, limited_context, system_prompt, model=effective_model, conversation_history=validated_history)
         else:
             try:
-                answer, citations = generate_answer(query, limited_context, system_prompt, model=effective_model)
+                answer, citations = generate_answer(query, limited_context, system_prompt, model=effective_model, conversation_history=validated_history)
             except Exception as e:
                 logging.warning(f"Groq generation failed, falling back to OpenAI: {e}")
-                answer, citations = openai_client.generate_answer(query, limited_context, system_prompt, model=openai_model)
-        
+                answer, citations = openai_client.generate_answer(query, limited_context, system_prompt, model=openai_model, conversation_history=validated_history)
+
         logging.info(f"LLM generation took {time.time() - llm_start:.2f}s")
     
     # Handle websearch integration if enabled
@@ -843,8 +899,8 @@ def answer_query(
             # Generate targeted search queries based on document context
             search_queries = generate_contextual_search_queries(query, context_analysis)
 
-            # Perform contextual web search
-            web_results = perform_contextual_websearch(search_queries)
+            # Perform contextual web search with intent context
+            web_results = perform_contextual_websearch(search_queries, context_analysis)
             
             if web_results:
                 # Synthesize RAG results with web search results using GPT-4o
@@ -854,7 +910,8 @@ def answer_query(
                     web_results=web_results,
                     context_analysis=context_analysis,
                     system_prompt=system_prompt,
-                    has_general_knowledge=allow_general_knowledge
+                    has_general_knowledge=allow_general_knowledge,
+                    conversation_history=validated_history
                 )
                 
                 # Update answer and citations with synthesized results
@@ -1110,7 +1167,8 @@ async def answer_query_endpoint(
     model: str = Form("meta-llama/llama-4-scout-17b-16e-instruct"),  # User-selectable model parameter
     enrichment_mode: str = Form("simple"),  # "simple" (default) or "advanced" for intelligent enrichment
     learning_style: Optional[str] = Form(None),  # Learning style for personalized educational responses
-    educational_mode: bool = Form(False)  # Enable tutoring/educational approach
+    educational_mode: bool = Form(False),  # Enable tutoring/educational approach
+    conversation_history: Optional[str] = Form(None)  # JSON string: "[{role, content}, ...]"
 ) -> JSONResponse:
     """
     Optimized endpoint to answer a query using the RAG pipeline.
@@ -1135,18 +1193,30 @@ async def answer_query_endpoint(
     """
     start_time = time.time()
     acl_list = [tag.strip() for tag in acl_tags.split(",")] if acl_tags else None
-    
+
+    # Parse conversation history from JSON string
+    history_list = None
+    if conversation_history:
+        try:
+            history_list = json.loads(conversation_history)
+            if not isinstance(history_list, list):
+                logging.warning("conversation_history is not a list, ignoring")
+                history_list = None
+        except json.JSONDecodeError as e:
+            logging.warning(f"Failed to parse conversation_history JSON: {e}")
+            history_list = None
+
     # If fast_mode is enabled, adjust parameters for faster response
     if fast_mode:
         rerank_top_n = min(rerank_top_n, 5)  # Limit reranking in fast mode
         max_context_chunks = min(max_context_chunks, 3)  # Use fewer chunks in context
-    
+
     try:
         result = answer_query(
-            query, 
-            document_id, 
-            space_id=space_id, 
-            acl_tags=acl_list, 
+            query,
+            document_id,
+            space_id=space_id,
+            acl_tags=acl_list,
             use_openai_embeddings=use_openai_embeddings,
             search_by_space_only=search_by_space_only,
             rerank_top_n=rerank_top_n,
@@ -1156,7 +1226,8 @@ async def answer_query_endpoint(
             model=model,
             enrichment_mode=enrichment_mode,
             learning_style=learning_style,
-            educational_mode=educational_mode
+            educational_mode=educational_mode,
+            conversation_history=history_list
         )
         result["time_ms"] = int((time.time() - start_time) * 1000)  # Add time taken in ms
         return JSONResponse(result)
