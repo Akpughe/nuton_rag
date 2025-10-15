@@ -22,9 +22,45 @@ class YTDLPTranscriptService:
     - No proxy required in 99% of cases
     """
 
-    def __init__(self):
-        """Initialize the yt-dlp transcript service."""
-        logger.info("YTDLPTranscriptService initialized")
+    def __init__(self, browser: Optional[str] = None):
+        """
+        Initialize the yt-dlp transcript service.
+
+        Args:
+            browser: Browser to extract cookies from (chrome, firefox, safari, edge, etc.)
+                    If None, will try common browsers in order.
+        """
+        self.browser = browser
+        logger.info(f"YTDLPTranscriptService initialized with browser: {browser or 'auto-detect'}")
+
+    def _get_base_ydl_opts(self) -> Dict[str, Any]:
+        """
+        Get base yt-dlp options with cookie handling.
+
+        Returns:
+            Dictionary of yt-dlp options
+        """
+        opts = {
+            'quiet': True,
+            'no_warnings': True,
+        }
+
+        # Add cookie extraction from browser
+        if self.browser:
+            # Use specific browser if provided
+            opts['cookiesfrombrowser'] = (self.browser,)
+            logger.info(f"Using cookies from browser: {self.browser}")
+        else:
+            # Try common browsers in order (works on macOS, Linux, Windows)
+            # yt-dlp will try each until it finds one with valid cookies
+            try:
+                # Try chrome first (most common)
+                opts['cookiesfrombrowser'] = ('chrome',)
+                logger.info("Attempting to use cookies from Chrome")
+            except Exception:
+                logger.warning("Could not use Chrome cookies, will try default")
+
+        return opts
 
     def extract_video_id(self, video_url: str) -> Optional[str]:
         """
@@ -91,17 +127,16 @@ class YTDLPTranscriptService:
             output_template = os.path.join(temp_dir, '%(id)s.%(ext)s')
 
             # yt-dlp options for subtitle extraction only
-            ydl_opts = {
+            ydl_opts = self._get_base_ydl_opts()
+            ydl_opts.update({
                 'skip_download': True,  # Don't download video
                 'writesubtitles': True,  # Download manual subtitles
                 'writeautomaticsub': True,  # Download auto-generated subtitles
                 'subtitleslangs': languages,  # Preferred languages
                 'subtitlesformat': 'vtt',  # VTT format (easier to parse)
                 'outtmpl': output_template,
-                'quiet': True,  # Less verbose output
-                'no_warnings': True,
                 'extract_flat': False,
-            }
+            })
 
             try:
                 # Extract subtitles
@@ -300,11 +335,10 @@ class YTDLPTranscriptService:
             }
 
         try:
-            ydl_opts = {
+            ydl_opts = self._get_base_ydl_opts()
+            ydl_opts.update({
                 'skip_download': True,
-                'quiet': True,
-                'no_warnings': True,
-            }
+            })
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(video_url, download=False)
@@ -363,11 +397,10 @@ class YTDLPTranscriptService:
             }
 
         try:
-            ydl_opts = {
+            ydl_opts = self._get_base_ydl_opts()
+            ydl_opts.update({
                 'skip_download': True,
-                'quiet': True,
-                'no_warnings': True,
-            }
+            })
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(video_url, download=False)
