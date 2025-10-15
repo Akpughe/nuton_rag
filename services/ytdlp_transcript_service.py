@@ -22,20 +22,34 @@ class YTDLPTranscriptService:
     - No proxy required in 99% of cases
     """
 
-    def __init__(self, browser: Optional[str] = None):
+    def __init__(self, browser: Optional[str] = None, use_cookies: bool = True):
         """
         Initialize the yt-dlp transcript service.
 
         Args:
             browser: Browser to extract cookies from (chrome, firefox, safari, edge, etc.)
                     If None, will try common browsers in order.
+            use_cookies: Whether to attempt cookie extraction. Set to False for
+                        environments without browsers (servers, containers, etc.)
+                        Can also be controlled via YTDLP_USE_COOKIES env var.
         """
-        self.browser = browser
-        logger.info(f"YTDLPTranscriptService initialized with browser: {browser or 'auto-detect'}")
+        # Check environment variable first (for container/Docker deployments)
+        env_use_cookies = os.getenv('YTDLP_USE_COOKIES', '').lower()
+        if env_use_cookies in ('false', '0', 'no'):
+            use_cookies = False
+            logger.info("Cookie extraction disabled via YTDLP_USE_COOKIES environment variable")
 
-    def _get_base_ydl_opts(self) -> Dict[str, Any]:
+        self.browser = browser
+        self.use_cookies = use_cookies
+        self._cookie_fallback_needed = False  # Track if we should skip cookies on retry
+        logger.info(f"YTDLPTranscriptService initialized with browser: {browser or 'auto-detect'}, use_cookies: {use_cookies}")
+
+    def _get_base_ydl_opts(self, skip_cookies: bool = False) -> Dict[str, Any]:
         """
         Get base yt-dlp options with cookie handling.
+
+        Args:
+            skip_cookies: If True, force skip cookie extraction (for retry logic)
 
         Returns:
             Dictionary of yt-dlp options
@@ -45,20 +59,38 @@ class YTDLPTranscriptService:
             'no_warnings': True,
         }
 
-        # Add cookie extraction from browser
+        # Check if we should skip cookies (either explicitly or from previous failure)
+        if not self.use_cookies or skip_cookies or self._cookie_fallback_needed:
+            if not self._cookie_fallback_needed:
+                logger.info("Cookie extraction disabled - running without browser cookies")
+            return opts
+
+        # Try to add cookie extraction from browser with fallback
         if self.browser:
             # Use specific browser if provided
-            opts['cookiesfrombrowser'] = (self.browser,)
-            logger.info(f"Using cookies from browser: {self.browser}")
+            try:
+                opts['cookiesfrombrowser'] = (self.browser,)
+                logger.info(f"Configured cookies from browser: {self.browser}")
+            except Exception as e:
+                logger.info(f"Could not configure cookies from {self.browser}: {e}")
+                # Don't fail - continue without cookies
         else:
             # Try common browsers in order (works on macOS, Linux, Windows)
-            # yt-dlp will try each until it finds one with valid cookies
-            try:
-                # Try chrome first (most common)
-                opts['cookiesfrombrowser'] = ('chrome',)
-                logger.info("Attempting to use cookies from Chrome")
-            except Exception:
-                logger.warning("Could not use Chrome cookies, will try default")
+            # List of browsers to try, in order of popularity
+            browsers_to_try = ['chrome', 'firefox', 'safari', 'edge', 'brave']
+
+            cookie_configured = False
+            for browser in browsers_to_try:
+                try:
+                    opts['cookiesfrombrowser'] = (browser,)
+                    logger.info(f"Configured cookies from {browser}")
+                    cookie_configured = True
+                    break  # Stop after first successful configuration
+                except Exception:
+                    continue
+
+            if not cookie_configured:
+                logger.info("No browser cookies available - will attempt without authentication")
 
         return opts
 
@@ -98,14 +130,18 @@ class YTDLPTranscriptService:
     def get_transcript(
         self,
         video_url: str,
-        languages: List[str] = ['en']
+        languages: List[str] = ['en'],
+        _retry_without_cookies: bool = False
     ) -> Dict[str, Any]:
         """
         Get transcript for a YouTube video using yt-dlp.
 
+        Automatically retries without cookies if cookie extraction fails.
+
         Args:
             video_url: YouTube video URL or video ID
             languages: List of preferred language codes (default: ['en'])
+            _retry_without_cookies: Internal flag for retry logic
 
         Returns:
             Dictionary with transcript data and status
@@ -120,14 +156,18 @@ class YTDLPTranscriptService:
                 'message': error_msg
             }
 
-        logger.info(f"Extracting transcript for video ID: {video_id} with yt-dlp")
+        if _retry_without_cookies:
+            logger.info(f"🔄 Retrying transcript extraction WITHOUT cookies for video: {video_id}")
+        else:
+            logger.info(f"Extracting transcript for video ID: {video_id} with yt-dlp")
 
         # Create temporary directory for subtitle files
         with tempfile.TemporaryDirectory() as temp_dir:
             output_template = os.path.join(temp_dir, '%(id)s.%(ext)s')
 
             # yt-dlp options for subtitle extraction only
-            ydl_opts = self._get_base_ydl_opts()
+            # Use skip_cookies flag during retry
+            ydl_opts = self._get_base_ydl_opts(skip_cookies=_retry_without_cookies)
             ydl_opts.update({
                 'skip_download': True,  # Don't download video
                 'writesubtitles': True,  # Download manual subtitles
@@ -217,15 +257,57 @@ class YTDLPTranscriptService:
                     }
 
             except yt_dlp.utils.DownloadError as e:
-                error_msg = f"yt-dlp download error: {str(e)}"
+                error_str = str(e)
+                error_msg = f"yt-dlp download error: {error_str}"
+
+                # Check if it's a cookie-related error and we haven't already retried
+                is_cookie_error = ('cookies' in error_str.lower() or
+                                 'sign in' in error_str.lower() or
+                                 'bot' in error_str.lower() or
+                                 'chrome' in error_str.lower())
+
+                if is_cookie_error and not _retry_without_cookies and self.use_cookies:
+                    # Auto-retry without cookies (self-healing!)
+                    logger.warning(f"Cookie-related error detected, auto-retrying without cookies: {error_str}")
+                    self._cookie_fallback_needed = True  # Cache for future calls
+                    return self.get_transcript(video_url, languages, _retry_without_cookies=True)
+
+                # If retry also failed or wasn't cookie-related, log and return error
                 logger.error(error_msg)
+
+                if is_cookie_error and _retry_without_cookies:
+                    error_msg += "\n\n⚠️ Auto-retry without cookies also failed. This video may require authentication."
+                elif is_cookie_error:
+                    error_msg += "\n\n💡 TIP: Set environment variable YTDLP_USE_COOKIES=false for container deployments."
+
                 return {
                     'success': False,
                     'message': error_msg
                 }
+
             except Exception as e:
-                error_msg = f"Unexpected error: {str(e)}"
+                error_str = str(e)
+                error_msg = f"Unexpected error: {error_str}"
+
+                # Check if it's a cookie-related error and we haven't already retried
+                is_cookie_error = ('cookies' in error_str.lower() or
+                                 'browser' in error_str.lower() or
+                                 'chrome' in error_str.lower())
+
+                if is_cookie_error and not _retry_without_cookies and self.use_cookies:
+                    # Auto-retry without cookies (self-healing!)
+                    logger.warning(f"Cookie-related error detected, auto-retrying without cookies: {error_str}")
+                    self._cookie_fallback_needed = True  # Cache for future calls
+                    return self.get_transcript(video_url, languages, _retry_without_cookies=True)
+
+                # If retry also failed or wasn't cookie-related, log and return error
                 logger.error(error_msg)
+
+                if is_cookie_error and _retry_without_cookies:
+                    error_msg += "\n\n⚠️ Auto-retry without cookies also failed."
+                elif is_cookie_error:
+                    error_msg += "\n\n💡 TIP: Set environment variable YTDLP_USE_COOKIES=false for container deployments."
+
                 return {
                     'success': False,
                     'message': error_msg
