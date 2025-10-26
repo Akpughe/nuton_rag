@@ -96,7 +96,26 @@ def upsert_vectors(
                     metadata["chapter_number"] = str(chunk.get("chapter_number"))
                 if chunk.get("chapter_title"):
                     metadata["chapter_title"] = str(chunk.get("chapter_title"))[:500]  # Limit length
-                
+
+                # Add enhanced metadata from hybrid PDF processor
+                if chunk.get("extraction_method"):
+                    metadata["extraction_method"] = str(chunk.get("extraction_method"))
+                if chunk.get("extraction_quality"):
+                    metadata["extraction_quality"] = int(chunk.get("extraction_quality"))
+                if chunk.get("heading_path"):
+                    # Store as comma-separated string for Pinecone compatibility
+                    metadata["heading_path"] = ", ".join(str(h) for h in chunk.get("heading_path", []))
+
+                # Add LLM correction metadata (from parallel quality correction)
+                if chunk.get("was_llm_corrected") is not None:
+                    metadata["was_llm_corrected"] = bool(chunk.get("was_llm_corrected"))
+                if chunk.get("original_length"):
+                    metadata["original_length"] = int(chunk.get("original_length"))
+                if chunk.get("corrected_length"):
+                    metadata["corrected_length"] = int(chunk.get("corrected_length"))
+                if chunk.get("correction_model"):
+                    metadata["correction_model"] = str(chunk.get("correction_model"))
+
             # Add any existing metadata from the chunk
             if isinstance(chunk, dict) and chunk.get("metadata"):
                 metadata.update(chunk.get("metadata", {}))
@@ -142,7 +161,26 @@ def upsert_vectors(
                         metadata["chapter_number"] = str(chunk.get("chapter_number"))
                     if chunk.get("chapter_title"):
                         metadata["chapter_title"] = str(chunk.get("chapter_title"))[:500]  # Limit length
-                    
+
+                    # Add enhanced metadata from hybrid PDF processor
+                    if chunk.get("extraction_method"):
+                        metadata["extraction_method"] = str(chunk.get("extraction_method"))
+                    if chunk.get("extraction_quality"):
+                        metadata["extraction_quality"] = int(chunk.get("extraction_quality"))
+                    if chunk.get("heading_path"):
+                        # Store as comma-separated string for Pinecone compatibility
+                        metadata["heading_path"] = ", ".join(str(h) for h in chunk.get("heading_path", []))
+
+                    # Add LLM correction metadata (from parallel quality correction)
+                    if chunk.get("was_llm_corrected") is not None:
+                        metadata["was_llm_corrected"] = bool(chunk.get("was_llm_corrected"))
+                    if chunk.get("original_length"):
+                        metadata["original_length"] = int(chunk.get("original_length"))
+                    if chunk.get("corrected_length"):
+                        metadata["corrected_length"] = int(chunk.get("corrected_length"))
+                    if chunk.get("correction_model"):
+                        metadata["correction_model"] = str(chunk.get("correction_model"))
+
                 # Add any existing metadata from the chunk
                 if isinstance(chunk, dict) and chunk.get("metadata"):
                     metadata.update(chunk.get("metadata", {}))
