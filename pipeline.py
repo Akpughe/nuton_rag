@@ -1753,6 +1753,106 @@ async def youtube_transcript_info_endpoint(
         }, status_code=500)
 
 
+@app.post("/test_vcyon_transcript")
+async def test_vcyon_transcript_endpoint(
+    video_url: str = Form(...),
+    languages: str = Form("en")  # Comma-separated language codes
+) -> JSONResponse:
+    """
+    Test the Vcyon API for YouTube transcript extraction.
+
+    This endpoint specifically tests the Vcyon API integration:
+    - Extracts video ID from URL
+    - Calls Vcyon's transcript API directly
+    - Returns detailed information about video and transcript
+    - Gets video metadata using Vcyon's video info endpoint
+
+    Args:
+        video_url: YouTube video URL
+        languages: Comma-separated list of preferred language codes (default: "en")
+
+    Returns:
+        JSON response with transcript, video info, and API status
+    """
+    logging.info(f"Test Vcyon API endpoint called for: {video_url}")
+
+    # Parse languages
+    lang_list = [lang.strip() for lang in languages.split(",")]
+
+    try:
+        # Initialize WetroCloud service with Vcyon and yt-dlp fallback
+        wetro_service = WetroCloudYouTubeService(
+            enable_vcyon_fallback=True,   # Try Vcyon first when WetroCloud fails
+            enable_ytdlp_fallback=True    # Use yt-dlp as final fallback
+        )
+
+        # Extract video ID
+        video_id = wetro_service.extract_video_id(video_url)
+        if not video_id:
+            return JSONResponse({
+                'success': False,
+                'error': 'Invalid YouTube URL - could not extract video ID'
+            }, status_code=400)
+
+        # Get video information from Vcyon
+        logging.info(f"Getting video info from Vcyon for video ID: {video_id}")
+        video_info = wetro_service._get_video_info_from_vcyon(video_url)
+
+        # Get transcript from Vcyon
+        logging.info(f"Getting transcript from Vcyon for video ID: {video_id}")
+        transcript_result = wetro_service._get_transcript_from_vcyon(video_url, lang_list)
+        print('transcript_result', transcript_result)
+
+        if transcript_result['success']:
+            response_data = {
+                'success': True,
+                'method': 'vcyon',
+                'video_id': video_id,
+                'video_url': video_url,
+                'transcript': transcript_result['text'],
+                'transcript_length': len(transcript_result['text']),
+                'transcript_entries_count': len(transcript_result.get('transcript_entries', [])),
+                'language': transcript_result.get('language', 'unknown'),
+                'thumbnail': transcript_result.get('thumbnail'),
+            }
+
+            # Add video metadata if available
+            if video_info:
+                response_data['video_info'] = {
+                    'title': video_info.get('title', 'N/A'),
+                    'author': video_info.get('author', 'N/A'),
+                    'description': video_info.get('description', '')[:200] + '...' if video_info.get('description') else 'N/A',
+                    'duration': video_info.get('duration', 0),
+                    'view_count': video_info.get('view_count', 0),
+                    'thumbnails': video_info.get('thumbnails', [])
+                }
+            else:
+                response_data['video_info'] = None
+                response_data['video_info_note'] = 'Video info not available from Vcyon API'
+
+            # Add a preview of the transcript (first 500 characters)
+            if transcript_result['text']:
+                lines = transcript_result['text'].split('\n')
+                response_data['transcript_preview'] = '\n'.join(lines[:10])  # First 10 lines
+
+            return JSONResponse(response_data)
+        else:
+            return JSONResponse({
+                'success': False,
+                'error': transcript_result.get('message', 'Unknown error from Vcyon API'),
+                'video_id': video_id,
+                'video_url': video_url,
+                'video_info': video_info if video_info else None
+            }, status_code=400)
+
+    except Exception as e:
+        logging.exception(f"Error in test_vcyon_transcript_endpoint: {e}")
+        return JSONResponse({
+            'success': False,
+            'error': str(e)
+        }, status_code=500)
+
+
 @app.post("/generate_flashcards")
 async def generate_flashcards_endpoint(
     request: FlashcardRequest
