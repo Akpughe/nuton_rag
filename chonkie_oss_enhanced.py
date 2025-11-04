@@ -25,6 +25,14 @@ from chonkie.tokenizer import AutoTokenizer
 # Our metadata extractor
 from pdf_metadata_extractor import PDFMetadataExtractor, extract_pdf_with_metadata
 
+# Mistral OCR integration
+try:
+    from mistral_ocr_extractor import MistralOCRExtractor, MistralOCRConfig
+    MISTRAL_OCR_AVAILABLE = True
+except ImportError:
+    MISTRAL_OCR_AVAILABLE = False
+    logging.warning("Mistral OCR not available. Install with: pip install mistralai")
+
 load_dotenv()
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -109,6 +117,10 @@ def chunk_document_with_metadata(
     detect_chapters: bool = True,
     detect_fonts: bool = True,
     detect_structure: bool = True,
+    # Mistral OCR options
+    use_mistral_ocr: bool = True,  # Use Mistral OCR as primary extraction method
+    mistral_enhance_metadata: bool = True,  # Use LLM to enhance metadata
+    mistral_fallback_to_legacy: bool = True,  # Fall back to legacy on error
     # Pinecone options
     pinecone_format: bool = False,
     namespace: Optional[str] = None,
@@ -118,7 +130,7 @@ def chunk_document_with_metadata(
     Chunk a document with full metadata extraction.
 
     Args:
-        file_path: Path to file to chunk
+        file_path: Path to file to chunk (PDF, PPTX, DOCX, images) or URL
         text: Text to chunk directly
         chunk_size: Target chunk size in tokens
         overlap_tokens: Overlap between chunks
@@ -130,6 +142,9 @@ def chunk_document_with_metadata(
         detect_chapters: Detect chapters and sections
         detect_fonts: Use font info for heading detection
         detect_structure: Detect document structure
+        use_mistral_ocr: Use Mistral OCR as primary extraction (supports PDF/PPTX/DOCX/images/URLs)
+        mistral_enhance_metadata: Use Mistral LLM to enhance metadata extraction
+        mistral_fallback_to_legacy: Fall back to legacy extraction if Mistral fails
         pinecone_format: Format output for Pinecone
         namespace: Pinecone namespace (optional)
         **kwargs: Additional chunker arguments
@@ -150,10 +165,65 @@ def chunk_document_with_metadata(
         'stats': {}
     }
 
-    # Step 1: Extract metadata from PDF
+    # Step 1: Extract metadata from document
     pdf_metadata = None
-    if file_path and file_path.lower().endswith('.pdf') and extract_metadata:
-        logging.info(f"Extracting metadata from PDF: {file_path}")
+
+    # Try Mistral OCR first if enabled and available
+    if file_path and use_mistral_ocr and MISTRAL_OCR_AVAILABLE and extract_metadata:
+        logging.info(f"Attempting Mistral OCR extraction: {file_path}")
+
+        try:
+            # Configure Mistral OCR
+            mistral_config = MistralOCRConfig(
+                enhance_metadata_with_llm=mistral_enhance_metadata,
+                fallback_method="legacy" if mistral_fallback_to_legacy else None,
+                include_images=True,
+                include_image_base64=True,
+            )
+
+            # Initialize extractor
+            mistral_extractor = MistralOCRExtractor(config=mistral_config)
+
+            # Extract document
+            mistral_result = mistral_extractor.process_document(file_path)
+
+            # Convert Mistral result to pdf_metadata format
+            pdf_metadata = mistral_result
+            text = mistral_result['full_text']
+
+            # Store metadata
+            result['metadata'] = {
+                'file_name': mistral_result['file_name'],
+                'total_pages': mistral_result['total_pages'],
+                'chapters': mistral_result.get('chapters', []),
+                'structure': mistral_result.get('structure', {}),
+                'quality_score': mistral_result.get('metadata_quality', {}),
+                'has_chapters': len(mistral_result.get('chapters', [])) > 0,
+                'has_headings': len(mistral_result.get('headings', [])) > 0,
+                'has_images': len(mistral_result.get('images', [])) > 0,
+                'image_count': len(mistral_result.get('images', [])),
+                'extraction_method': mistral_result.get('extraction_method', 'mistral_ocr'),
+                'extraction_time_ms': mistral_result.get('extraction_time_ms', 0),
+            }
+
+            logging.info(f"✅ Mistral OCR extraction successful: "
+                        f"{len(mistral_result.get('chapters', []))} chapters, "
+                        f"{len(mistral_result.get('headings', []))} headings, "
+                        f"{len(mistral_result.get('images', []))} images")
+
+        except Exception as e:
+            logging.warning(f"Mistral OCR extraction failed: {e}")
+
+            # Fall back to legacy extraction if configured
+            if mistral_fallback_to_legacy:
+                logging.info("Falling back to legacy PDF extraction...")
+                pdf_metadata = None  # Reset to trigger legacy extraction below
+            else:
+                raise
+
+    # Legacy extraction (fallback or if Mistral OCR disabled/unavailable)
+    if pdf_metadata is None and file_path and file_path.lower().endswith('.pdf') and extract_metadata:
+        logging.info(f"Using legacy PDF extraction: {file_path}")
 
         try:
             pdf_metadata = extract_pdf_with_metadata(
@@ -175,9 +245,10 @@ def chunk_document_with_metadata(
                 'quality_score': pdf_metadata.get('metadata_quality', {}),
                 'has_chapters': len(pdf_metadata.get('chapters', [])) > 0,
                 'has_headings': len(pdf_metadata.get('headings', [])) > 0,
+                'extraction_method': 'legacy_pdf',
             }
 
-            logging.info(f"Metadata extracted: {len(pdf_metadata.get('chapters', []))} chapters, "
+            logging.info(f"Legacy metadata extracted: {len(pdf_metadata.get('chapters', []))} chapters, "
                         f"{len(pdf_metadata.get('headings', []))} headings")
 
         except Exception as e:
