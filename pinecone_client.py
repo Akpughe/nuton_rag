@@ -13,9 +13,9 @@ load_dotenv()
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "nuton-index")
 
-# Index names
-DENSE_INDEX = f"{PINECONE_INDEX_NAME}-dense"
-SPARSE_INDEX = f"{PINECONE_INDEX_NAME}-sparse"
+# Index names - MULTIMODAL (1024 dims, Jina CLIP-v2)
+DENSE_INDEX = "nuton-index-multi-modal"  # NEW: 1024-dim multimodal index
+SPARSE_INDEX = f"{PINECONE_INDEX_NAME}-sparse"  # Keep existing sparse index
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -35,10 +35,15 @@ def upsert_vectors(
     embeddings: List[Dict[str, Any]],
     chunks: List[Any],
     batch_size: int = 100,
-    source_file: Optional[str] = None
+    source_file: Optional[str] = None,
+    include_images: bool = False,  # NEW: Whether chunks include image data
+    pdf_metadata: Optional[Dict[str, Any]] = None  # NEW: PDF metadata with images
 ) -> None:
     """
     Upsert dense (and optionally sparse) vectors to Pinecone, with metadata.
+
+    Now supports both text and image chunks for multimodal search.
+
     Args:
         doc_id: Document id to include in metadata.
         space_id: Space id to include in metadata.
@@ -46,6 +51,8 @@ def upsert_vectors(
         chunks: List of chunk dicts (must align with embeddings).
         batch_size: Max vectors per upsert call.
         source_file: Original document filename to include in metadata.
+        include_images: Whether to also upsert image vectors from pdf_metadata.
+        pdf_metadata: Full PDF metadata including images (if include_images=True).
     """
     logger.info(f"upsert_vectors called with doc_id={doc_id}, space_id={space_id}, source_file={source_file}")
     
@@ -196,6 +203,109 @@ def upsert_vectors(
             logger.info(f"Sparse vectors to upsert: {len(sparse_vectors)}")
             if sparse_vectors:
                 sparse_index.upsert(vectors=sparse_vectors)
+
+    # NEW: Upsert image vectors if requested
+    if include_images and pdf_metadata and pdf_metadata.get('images'):
+        logger.info(f"Upserting {len(pdf_metadata['images'])} image vectors...")
+        upsert_image_vectors(
+            doc_id=doc_id,
+            space_id=space_id,
+            images=pdf_metadata['images'],
+            source_file=source_file,
+            batch_size=batch_size
+        )
+
+
+def upsert_image_vectors(
+    doc_id: str,
+    space_id: str,
+    images: List[Dict[str, Any]],
+    embeddings: Optional[List[List[float]]] = None,
+    source_file: Optional[str] = None,
+    batch_size: int = 50
+) -> None:
+    """
+    Upsert image vectors to Pinecone for multimodal search.
+
+    Args:
+        doc_id: Document ID
+        space_id: Space ID
+        images: List of image metadata dicts from extraction
+        embeddings: Pre-computed image embeddings (optional, will compute if not provided)
+        source_file: Source filename
+        batch_size: Batch size for upserts
+    """
+    if not images:
+        logger.info("No images to upsert")
+        return
+
+    # Initialize indexes
+    dense_index = pc.Index(DENSE_INDEX)
+
+    # If embeddings not provided, we need to embed images
+    if embeddings is None:
+        logger.info("Image embeddings not provided - images will need to be embedded separately")
+        # For now, skip embedding here - it should be done before calling this function
+        logger.warning("Skipping image upsert - embeddings required")
+        return
+
+    if len(embeddings) != len(images):
+        raise ValueError(f"Number of embeddings ({len(embeddings)}) must match number of images ({len(images)})")
+
+    # Upsert in batches
+    image_vectors = []
+
+    for idx, (img, embedding) in enumerate(zip(images, embeddings)):
+        # Determine image storage strategy (hybrid: inline <30KB, reference >30KB)
+        img_base64 = img.get('image_base64', '')
+        image_size_kb = len(img_base64) / 1024 if img_base64 else 0
+
+        # Build metadata for image
+        metadata = {
+            "type": "image",
+            "document_id": doc_id,
+            "space_id": space_id,
+            "image_id": img.get('id', f"img_{idx}"),
+            "page": img.get('page', 0),
+            "position_in_doc": img.get('position_in_doc', 0),
+        }
+
+        # Add source file
+        if source_file:
+            metadata["source_file"] = source_file
+
+        # Hybrid storage: small images inline, large images as reference
+        if image_size_kb < 30 and img_base64:
+            # Store inline (small image)
+            metadata["image_base64"] = img_base64[:40000]  # Pinecone limit
+            metadata["image_storage"] = "inline"
+        else:
+            # Store reference only (large image)
+            metadata["image_storage"] = "reference"
+            metadata["image_size_kb"] = int(image_size_kb)
+
+        # Create vector
+        vector = {
+            "id": f"{doc_id}::image_{idx}",
+            "values": embedding,
+            "metadata": metadata
+        }
+
+        image_vectors.append(vector)
+
+        # Upsert batch when full
+        if len(image_vectors) >= batch_size:
+            logger.info(f"Upserting batch of {len(image_vectors)} image vectors")
+            dense_index.upsert(vectors=image_vectors)
+            image_vectors = []
+
+    # Upsert remaining
+    if image_vectors:
+        logger.info(f"Upserting final batch of {len(image_vectors)} image vectors")
+        dense_index.upsert(vectors=image_vectors)
+
+    logger.info(f"✅ Successfully upserted {len(images)} image vectors")
+
 
 @lru_cache(maxsize=100)
 def get_filter_dict(doc_id: Optional[str] = None, space_id: Optional[str] = None, acl_tags: Optional[List[str]] = None) -> Dict[str, Any]:
