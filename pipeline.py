@@ -50,7 +50,11 @@ app.add_middleware(
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+NOTES_DIR = "note"
+os.makedirs(NOTES_DIR, exist_ok=True)
+
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 class FlashcardRequest(BaseModel):
@@ -2064,6 +2068,124 @@ async def regenerate_quiz_endpoint(
         return JSONResponse(result)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/generate_notes")
+async def generate_notes_endpoint(
+    document_id: str = Form(...),
+    space_id: Optional[str] = Form(None),
+    academic_level: str = Form("graduate"),
+    include_diagrams: bool = Form(True),
+    include_mermaid: bool = Form(True),
+    max_chunks: int = Form(2000),
+    acl_tags: Optional[str] = Form(None)
+) -> JSONResponse:
+    """
+    Generate comprehensive study notes from a document.
+
+    This endpoint creates extensive, well-formatted markdown study notes that cover
+    every detail of the document, organized hierarchically with proper formatting,
+    diagrams, and mermaid visualizations.
+
+    Args:
+        document_id: Document ID to generate notes for (required)
+        space_id: Optional space ID filter
+        academic_level: Target academic level - one of:
+            - "undergraduate": Clear explanations with examples
+            - "graduate": Advanced analysis with frameworks
+            - "msc": Technical depth with methodologies
+            - "phd": Critical analysis with research gaps
+        include_diagrams: Whether to include diagrams from PDF (default: True)
+        include_mermaid: Whether to generate mermaid diagrams (default: True)
+        max_chunks: Maximum number of chunks to retrieve (default: 2000)
+        acl_tags: Optional comma-separated ACL tags
+
+    Returns:
+        JSON response with:
+        {
+            "notes_markdown": "# Complete markdown notes...",
+            "metadata": {
+                "academic_level": "graduate",
+                "total_pages": 120,
+                "total_chapters": 8,
+                "total_chunks_processed": 350,
+                "diagrams_included": 12,
+                "generation_time_seconds": 145.2,
+                "coverage_score": 0.98,
+                "notes_length_chars": 50000,
+                "generated_at": "2025-11-04T..."
+            },
+            "status": "success"
+        }
+
+    Example:
+        POST /generate_notes
+        Form data:
+            document_id=abc123
+            academic_level=graduate
+            include_diagrams=true
+            include_mermaid=true
+    """
+    from note_generation_process import generate_comprehensive_notes
+
+    # Validate academic level
+    valid_levels = ["undergraduate", "graduate", "msc", "phd"]
+    if academic_level not in valid_levels:
+        return JSONResponse({
+            "error": f"Invalid academic_level. Must be one of: {', '.join(valid_levels)}",
+            "status": "error"
+        }, status_code=400)
+
+    # Parse ACL tags
+    acl_list = [tag.strip() for tag in acl_tags.split(",")] if acl_tags else None
+
+    try:
+        logger.info(f"🚀 Generating notes for document {document_id}, level={academic_level}")
+
+        # Generate notes
+        result = await generate_comprehensive_notes(
+            document_id=document_id,
+            space_id=space_id,
+            academic_level=academic_level,
+            personalization_options=None,
+            include_diagrams=include_diagrams,
+            include_mermaid=include_mermaid,
+            max_chunks=max_chunks,
+            acl_tags=acl_list
+        )
+
+        if result.get("status") == "error":
+            logger.error(f"Note generation failed: {result.get('message', 'Unknown error')}")
+            return JSONResponse(result, status_code=500)
+
+        logger.info(f"✅ Notes generated successfully: {len(result.get('notes_markdown', ''))} characters")
+
+        # Save notes to file in note/ folder
+        try:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{document_id}_{academic_level}_{timestamp}.md"
+            filepath = os.path.join(NOTES_DIR, filename)
+
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(result.get("notes_markdown", ""))
+
+            logger.info(f"💾 Notes saved to: {filepath}")
+            result["saved_to_file"] = filepath
+        except Exception as file_error:
+            logger.error(f"⚠️ Failed to save notes to file: {file_error}")
+            result["file_save_error"] = str(file_error)
+
+        return JSONResponse(result)
+
+    except Exception as e:
+        logger.error(f"❌ Error in note generation endpoint: {e}", exc_info=True)
+        return JSONResponse({
+            "notes_markdown": "",
+            "metadata": {},
+            "status": "error",
+            "message": str(e)
+        }, status_code=500)
 
 
 @app.post("/api/google-drive/files")

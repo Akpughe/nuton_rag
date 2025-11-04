@@ -123,6 +123,12 @@ def upsert_vectors(
                 if chunk.get("correction_model"):
                     metadata["correction_model"] = str(chunk.get("correction_model"))
 
+                # Add chunk position indices for better coverage tracking
+                if chunk.get("start_index") is not None:
+                    metadata["start_index"] = int(chunk.get("start_index"))
+                if chunk.get("end_index") is not None:
+                    metadata["end_index"] = int(chunk.get("end_index"))
+
             # Add any existing metadata from the chunk
             if isinstance(chunk, dict) and chunk.get("metadata"):
                 metadata.update(chunk.get("metadata", {}))
@@ -187,6 +193,12 @@ def upsert_vectors(
                         metadata["corrected_length"] = int(chunk.get("corrected_length"))
                     if chunk.get("correction_model"):
                         metadata["correction_model"] = str(chunk.get("correction_model"))
+
+                    # Add chunk position indices for better coverage tracking
+                    if chunk.get("start_index") is not None:
+                        metadata["start_index"] = int(chunk.get("start_index"))
+                    if chunk.get("end_index") is not None:
+                        metadata["end_index"] = int(chunk.get("end_index"))
 
                 # Add any existing metadata from the chunk
                 if isinstance(chunk, dict) and chunk.get("metadata"):
@@ -758,4 +770,332 @@ def rerank_results_document_aware(
     for doc_id, count in final_distribution.items():
         logging.info(f"  Final results from document {doc_id}: {count} chunks")
     
-    return final_results 
+    return final_results
+
+
+def calculate_coverage_from_chunks(chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Calculate coverage percentage from chunks using start_index and end_index.
+    Helper function for gap-filling logic.
+    
+    Args:
+        chunks: List of chunk dictionaries with metadata
+        
+    Returns:
+        Dictionary with coverage metrics
+    """
+    ranges = []
+    
+    for chunk in chunks:
+        metadata = chunk.get("metadata", {})
+        start_idx = metadata.get("start_index")
+        end_idx = metadata.get("end_index")
+        
+        if start_idx is not None and end_idx is not None:
+            try:
+                start_idx = int(start_idx)
+                end_idx = int(end_idx)
+                if end_idx > start_idx:
+                    ranges.append((start_idx, end_idx))
+            except (ValueError, TypeError):
+                continue
+    
+    if not ranges:
+        return {
+            "coverage_percentage": 0.0,
+            "gaps": [],
+            "covered_ranges": []
+        }
+    
+    ranges.sort()
+    
+    # Merge overlapping ranges
+    merged_ranges = []
+    current_start, current_end = ranges[0]
+    
+    for start, end in ranges[1:]:
+        if start <= current_end:
+            current_end = max(current_end, end)
+        else:
+            merged_ranges.append((current_start, current_end))
+            current_start, current_end = start, end
+    
+    merged_ranges.append((current_start, current_end))
+    
+    # Calculate coverage
+    total_covered = sum(end - start for start, end in merged_ranges)
+    total_document_chars = merged_ranges[-1][1] - merged_ranges[0][0] if merged_ranges else 0
+    coverage_percentage = total_covered / total_document_chars if total_document_chars > 0 else 0.0
+    
+    # Find gaps
+    gaps = []
+    for i in range(len(merged_ranges) - 1):
+        gap_start = merged_ranges[i][1]
+        gap_end = merged_ranges[i + 1][0]
+        gap_size = gap_end - gap_start
+        if gap_size > 0:
+            gaps.append({
+                "start": gap_start,
+                "end": gap_end,
+                "size": gap_size
+            })
+    
+    return {
+        "coverage_percentage": coverage_percentage,
+        "gaps": gaps,
+        "covered_ranges": merged_ranges,
+        "total_covered": total_covered,
+        "total_document_chars": total_document_chars
+    }
+
+
+def fetch_chunks_for_gap(
+    document_id: str,
+    gap_start: int,
+    gap_end: int,
+    space_id: Optional[str] = None,
+    acl_tags: Optional[List[str]] = None,
+    max_attempts: int = 3
+) -> List[Dict[str, Any]]:
+    """
+    Fetch chunks that fall within a specific gap in coverage.
+    
+    Args:
+        document_id: Document ID
+        gap_start: Start index of the gap
+        gap_end: End index of the gap
+        space_id: Optional space ID filter
+        acl_tags: Optional ACL tags
+        max_attempts: Number of query variations to try
+        
+    Returns:
+        List of chunks that fall within the gap
+    """
+    dense_index = pc.Index(DENSE_INDEX)
+    
+    # Build base filter
+    filter_dict = {"document_id": {"$eq": document_id}}
+    if space_id:
+        filter_dict["space_id"] = {"$eq": space_id}
+    if acl_tags:
+        filter_dict["acl_tags"] = {"$in": acl_tags}
+    
+    # Try to fetch by filtering on start_index range
+    # Note: Pinecone supports numeric range filters
+    filter_dict["start_index"] = {"$gte": gap_start, "$lt": gap_end}
+    
+    try:
+        # Use a neutral query for gap-filling (we're relying on the filter)
+        from chonkie_client import embed_query_multimodal
+        neutral_query = "content information text data"
+        query_result = embed_query_multimodal(neutral_query)
+        query_emb = query_result["embedding"]
+        
+        results = dense_index.query(
+            vector=query_emb,
+            top_k=50,  # Get multiple chunks from gap
+            filter=filter_dict,
+            include_metadata=True
+        )
+        
+        gap_chunks = []
+        for match in results.matches:
+            gap_chunks.append({
+                "id": match.id,
+                "score": match.score,
+                "metadata": match.metadata
+            })
+        
+        logging.info(f"Found {len(gap_chunks)} chunks in gap [{gap_start}, {gap_end}]")
+        return gap_chunks
+        
+    except Exception as e:
+        logging.warning(f"Error fetching chunks for gap [{gap_start}, {gap_end}]: {e}")
+        return []
+
+
+def fetch_all_document_chunks(
+    document_id: str,
+    space_id: Optional[str] = None,
+    max_chunks: int = 2000,
+    acl_tags: Optional[List[str]] = None,
+    target_coverage: float = 0.80,
+    enable_gap_filling: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    Fetch ALL chunks for a document using broad query + gap-filling for 80%+ coverage.
+    Returns chunks sorted by: chapter_number → page_number → start_index.
+
+    This function is designed for note generation where we need complete document coverage.
+    It uses an iterative approach:
+    1. Initial broad semantic search
+    2. Calculate coverage using start_index/end_index
+    3. Fill gaps with targeted queries until target_coverage is reached
+
+    Args:
+        document_id: Document ID to fetch chunks for
+        space_id: Optional space ID filter
+        max_chunks: Maximum number of chunks to retrieve (default: 2000)
+        acl_tags: Optional ACL tags to filter by
+        target_coverage: Target coverage percentage (default: 0.80 = 80%)
+        enable_gap_filling: Whether to enable gap-filling (default: True)
+
+    Returns:
+        List of chunk dictionaries sorted by document position
+    """
+    logging.info(f"🔍 Fetching all chunks for document {document_id}, max_chunks={max_chunks}, target_coverage={target_coverage:.0%}")
+
+    # Phase 1: Broad semantic search
+    broad_query = "Extract all content, concepts, details, examples, explanations, definitions, facts, and information from this complete document"
+
+    # Embed the query using multimodal embeddings (Jina CLIP-v2, 1024 dims)
+    try:
+        from chonkie_client import embed_query_multimodal
+        query_result = embed_query_multimodal(broad_query)
+        query_emb = query_result["embedding"]
+    except Exception as e:
+        logging.error(f"Error embedding broad query: {e}")
+        # Fallback: try without multimodal
+        from chonkie_client import embed_query_v2
+        query_embedded = embed_query_v2(broad_query)
+        query_emb = query_embedded["embedding"]
+
+    # Search with high top_k to get all chunks
+    dense_index = pc.Index(DENSE_INDEX)
+
+    # Build filter
+    filter_dict = {"document_id": {"$eq": document_id}}
+    if space_id:
+        filter_dict["space_id"] = {"$eq": space_id}
+    if acl_tags:
+        filter_dict["acl_tags"] = {"$in": acl_tags}
+
+    try:
+        # Query Pinecone with high top_k
+        results = dense_index.query(
+            vector=query_emb,
+            top_k=max_chunks,
+            filter=filter_dict,
+            include_metadata=True
+        )
+
+        # Convert matches to list of dicts
+        chunks = []
+        chunk_ids = set()  # Track IDs to avoid duplicates
+        
+        for match in results.matches:
+            chunks.append({
+                "id": match.id,
+                "score": match.score,
+                "metadata": match.metadata
+            })
+            chunk_ids.add(match.id)
+
+        logging.info(f"📥 Phase 1: Retrieved {len(chunks)} chunks from initial broad search")
+
+        # Phase 2: Calculate coverage and fill gaps if needed
+        if enable_gap_filling and len(chunks) > 0:
+            coverage_result = calculate_coverage_from_chunks(chunks)
+            current_coverage = coverage_result["coverage_percentage"]
+            
+            logging.info(f"📊 Initial coverage: {current_coverage:.2%}")
+            
+            if current_coverage < target_coverage:
+                gaps = coverage_result["gaps"]
+                logging.info(f"🔧 Coverage below target ({current_coverage:.2%} < {target_coverage:.0%}), filling {len(gaps)} gaps...")
+                
+                # Sort gaps by size (largest first) to maximize coverage improvement
+                gaps_sorted = sorted(gaps, key=lambda g: g["size"], reverse=True)
+                
+                gap_fill_iterations = 0
+                max_gap_fill_iterations = 5
+                
+                while current_coverage < target_coverage and gap_fill_iterations < max_gap_fill_iterations and gaps_sorted:
+                    gap_fill_iterations += 1
+                    
+                    # Fill top gaps (largest gaps first)
+                    gaps_to_fill = gaps_sorted[:3]  # Fill top 3 gaps per iteration
+                    
+                    for gap in gaps_to_fill:
+                        gap_chunks = fetch_chunks_for_gap(
+                            document_id=document_id,
+                            gap_start=gap["start"],
+                            gap_end=gap["end"],
+                            space_id=space_id,
+                            acl_tags=acl_tags
+                        )
+                        
+                        # Add new chunks (avoid duplicates)
+                        new_chunks_added = 0
+                        for chunk in gap_chunks:
+                            if chunk["id"] not in chunk_ids:
+                                chunks.append(chunk)
+                                chunk_ids.add(chunk["id"])
+                                new_chunks_added += 1
+                        
+                        logging.info(f"   Gap [{gap['start']}, {gap['end']}] ({gap['size']:,} chars): +{new_chunks_added} chunks")
+                    
+                    # Recalculate coverage
+                    coverage_result = calculate_coverage_from_chunks(chunks)
+                    new_coverage = coverage_result["coverage_percentage"]
+                    
+                    logging.info(f"   Iteration {gap_fill_iterations}: Coverage improved from {current_coverage:.2%} → {new_coverage:.2%}")
+                    
+                    if new_coverage <= current_coverage:
+                        logging.info("   Coverage not improving, stopping gap-filling")
+                        break
+                    
+                    current_coverage = new_coverage
+                    gaps_sorted = sorted(coverage_result["gaps"], key=lambda g: g["size"], reverse=True)
+                
+                logging.info(f"✅ Gap-filling complete: Final coverage {current_coverage:.2%}")
+
+        # Sort chunks by position in document
+        def get_sort_key(chunk: Dict[str, Any]) -> tuple:
+            metadata = chunk.get("metadata", {})
+
+            # Get chapter number
+            chapter_num = metadata.get("chapter_number", 0)
+            if isinstance(chapter_num, str):
+                try:
+                    chapter_num = int(chapter_num)
+                except (ValueError, TypeError):
+                    chapter_num = 0
+
+            # Get page number
+            page_num = metadata.get("page_number", "0")
+            if isinstance(page_num, str):
+                page_num = page_num.split(',')[0] if page_num else "0"
+                try:
+                    page_num = int(page_num)
+                except (ValueError, TypeError):
+                    page_num = 0
+
+            # Get start_index for precise position tracking
+            start_idx = metadata.get("start_index", 0)
+            if isinstance(start_idx, str):
+                try:
+                    start_idx = int(start_idx)
+                except (ValueError, TypeError):
+                    start_idx = 0
+
+            # Fallback: Try to infer position from chunk ID
+            chunk_id = chunk.get("id", "")
+            position = 0
+            if "::" in chunk_id and "_" in chunk_id:
+                try:
+                    position = int(chunk_id.split("_")[-1])
+                except (ValueError, IndexError):
+                    position = 0
+
+            return (chapter_num, page_num, start_idx, position)
+
+        sorted_chunks = sorted(chunks, key=get_sort_key)
+
+        logging.info(f"✅ Fetched and sorted {len(sorted_chunks)} chunks for note generation")
+
+        return sorted_chunks
+
+    except Exception as e:
+        logging.error(f"❌ Error fetching chunks: {e}")
+        return [] 
