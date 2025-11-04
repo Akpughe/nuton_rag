@@ -10,8 +10,8 @@ import json
 import time
 from functools import lru_cache
 
-from chonkie_client import chunk_document, embed_chunks, embed_chunks_v2, embed_query, embed_query_v2
-from pinecone_client import upsert_vectors, hybrid_search, hybrid_search_parallel, rerank_results, hybrid_search_document_aware, rerank_results_document_aware
+from chonkie_client import chunk_document, embed_chunks, embed_chunks_v2, embed_query, embed_query_v2, embed_chunks_multimodal, embed_query_multimodal
+from pinecone_client import upsert_vectors, upsert_image_vectors, hybrid_search, hybrid_search_parallel, rerank_results, hybrid_search_document_aware, rerank_results_document_aware
 from supabase_client import insert_pdf_record, insert_yts_record, get_documents_in_space
 from groq_client import generate_answer, generate_answer_document_aware
 import openai_client
@@ -23,6 +23,10 @@ from pydantic import BaseModel
 from typing import Optional, List
 from quiz_process import generate_quiz, regenerate_quiz
 from hybrid_pdf_processor import extract_and_chunk_pdf_async
+from diagram_explainer import explain_diagrams_batch
+from mistral_ocr_extractor import MistralOCRExtractor, MistralOCRConfig
+from chonkie import RecursiveChunker
+from chonkie.tokenizer import AutoTokenizer
 
 from prompts import main_prompt, general_knowledge_prompt, simple_general_knowledge_prompt, no_docs_in_space_prompt, no_relevant_in_scope_prompt, additional_space_only_prompt
 from intelligent_enrichment import create_enriched_system_prompt
@@ -270,20 +274,84 @@ async def process_document_with_openai(
         The document_id (Supabase id)
     """
     try:
-        from text_extractor import extract_text_from_file, validate_extracted_text
-        from chapter_detector import detect_chapters_with_ai, assign_chapters_to_chunks, get_fallback_chapter
-        import asyncio
-
         chunks = []
+        extraction_method = "unknown"
+        extraction_result = None  # Initialize to track Mistral OCR result
 
-        # 1. Detect PDF files and use hybrid processor with parallel LLM correction
+        # 1. PRIMARY: Try Mistral OCR extraction first (supports PDF, PPTX, DOCX, images, URLs)
         file_ext = os.path.splitext(file_path)[1].lower()
-        if file_ext == '.pdf':
+        supported_formats = ['.pdf', '.pptx', '.docx', '.png', '.jpg', '.jpeg', '.webp', '.avif']
+
+        if file_ext in supported_formats or file_path.startswith(('http://', 'https://')):
             try:
-                logging.info(f"Using hybrid PDF processor with selective quality correction (threshold={quality_threshold})...")
+                logging.info(f"📄 Extracting document with Mistral OCR: {os.path.basename(file_path)}")
+
+                # Configure Mistral OCR (matching test_multimodal_pipeline.py)
+                mistral_config = MistralOCRConfig(
+                    enhance_metadata_with_llm=True,
+                    fallback_method="legacy",
+                    include_images=True,
+                    include_image_base64=True,  # Enable base64 for image embedding
+                )
+
+                # Initialize extractor and process document
+                extractor = MistralOCRExtractor(config=mistral_config)
+                extraction_result = extractor.process_document(file_path)
+
+                # Get full text from extraction
+                full_text = extraction_result.get('full_text', '')
+
+                if not full_text:
+                    raise ValueError("Mistral OCR returned no text")
+
+                logging.info(f"✅ Mistral OCR extraction successful!")
+                logging.info(f"   Method: {extraction_result.get('extraction_method')}")
+                logging.info(f"   Pages: {extraction_result.get('total_pages')}")
+                logging.info(f"   Text length: {len(full_text)} chars")
+                extraction_method = extraction_result.get('extraction_method', 'mistral_ocr')
+
+                # 2. Chunk with simple Chonkie RecursiveChunker (matching test_multimodal_pipeline.py)
+                logging.info(f"✂️ Chunking with Chonkie RecursiveChunker (size={chunk_size})")
+
+                # Initialize tokenizer
+                chonkie_tokenizer = AutoTokenizer("cl100k_base")  # OpenAI tokenizer
+
+                # Initialize RecursiveChunker
+                chunker = RecursiveChunker(
+                    tokenizer=chonkie_tokenizer,
+                    chunk_size=chunk_size,
+                    min_characters_per_chunk=min_characters_per_chunk
+                )
+
+                # Chunk the text
+                chunk_objects = chunker.chunk(full_text)
+
+                # Convert to dicts (matching test format)
+                chunks = []
+                for i, chunk_obj in enumerate(chunk_objects):
+                    chunk_dict = {
+                        "text": chunk_obj.text,
+                        "start_index": chunk_obj.start_index,
+                        "end_index": chunk_obj.end_index,
+                        "token_count": chunk_obj.token_count,
+                        "chunk_index": i
+                    }
+                    chunks.append(chunk_dict)
+
+                logging.info(f"✅ Chunking complete: {len(chunks)} chunks")
+                logging.info(f"   Total tokens: {sum(c['token_count'] for c in chunks)}")
+                logging.info(f"   Avg tokens/chunk: {sum(c['token_count'] for c in chunks) / len(chunks):.1f}")
+
+            except Exception as e:
+                logging.warning(f"Mistral OCR extraction failed: {e}")
+                chunks = []
+
+        # 3. FALLBACK: Use DocChunker for PDFs if Mistral OCR failed
+        if not chunks and file_ext == '.pdf':
+            try:
+                logging.info(f"📄 Fallback: Using DocChunker with quality correction (threshold={quality_threshold})")
 
                 # Use async hybrid processor for PDFs (with SELECTIVE LLM correction!)
-                # OPTIMIZATION: Only corrects chunks below quality threshold (60-80% cost savings!)
                 chunks = await extract_and_chunk_pdf_async(
                     pdf_path=file_path,
                     chunk_size=chunk_size,
@@ -292,20 +360,21 @@ async def process_document_with_openai(
                     recipe=recipe,
                     lang=lang,
                     min_characters_per_chunk=min_characters_per_chunk,
-                    enable_llm_correction=True,  # Enable parallel quality correction
-                    quality_threshold=quality_threshold  # NEW: Selective correction!
+                    enable_llm_correction=True,
+                    quality_threshold=quality_threshold
                 )
 
                 chunks = flatten_chunks(chunks)
-                logging.info(f"Hybrid processor generated {len(chunks)} quality-corrected chunks")
+                extraction_method = "docchunker_fallback"
+                logging.info(f"✅ DocChunker generated {len(chunks)} chunks")
 
             except Exception as e:
-                logging.warning(f"Hybrid PDF processor failed: {e}, falling back to regular chunking")
+                logging.warning(f"DocChunker also failed: {e}, trying basic chunking")
                 chunks = []
 
-        # Fallback: regular chunking for non-PDFs or if hybrid processor failed
+        # 4. FINAL FALLBACK: Basic chunking for any other format or if all else failed
         if not chunks:
-            logging.info(f"Chunking document (without chapter detection): {file_path}")
+            logging.info(f"📄 Final fallback: Basic chunking for {file_path}")
             chunks = chunk_document(
                 file_path=file_path,
                 chunk_size=chunk_size,
@@ -316,6 +385,7 @@ async def process_document_with_openai(
                 min_characters_per_chunk=min_characters_per_chunk
             )
             chunks = flatten_chunks(chunks)
+            extraction_method = "basic_chunking"
         # print('chunks', chunks)
         
         if not chunks:
@@ -324,18 +394,63 @@ async def process_document_with_openai(
             
         logging.info(f"Generated {len(chunks)} chunks from document")
         
-        # 2. Embed chunks with OpenAI directly
-        logging.info(f"Embedding chunks with OpenAI model: {embedding_model}")
-        embeddings = embed_chunks_v2(chunks, model=embedding_model, batch_size=batch_size)
+        # 2. Embed chunks with multimodal embeddings (Jina CLIP-v2, 1024 dims)
+        logging.info(f"Embedding chunks with Jina CLIP-v2 multimodal model (1024 dims)")
+        embeddings = embed_chunks_multimodal(chunks, batch_size=batch_size)
         
         # Check if embedding service returned an error
         if embeddings and isinstance(embeddings[0], dict) and "message" in embeddings[0] and "status" in embeddings[0]:
-            error_msg = f"OpenAI embedding error: {embeddings[0]['message']}"
+            error_msg = f"Multimodal embedding error: {embeddings[0]['message']}"
             logging.error(error_msg)
             raise ValueError(error_msg)
-        
-        logging.info(f"Successfully embedded {len(embeddings)} chunks with OpenAI")
-        
+
+        logging.info(f"Successfully embedded {len(embeddings)} chunks with Jina CLIP-v2 (1024 dims)")
+
+        # 2.5. Process images if extracted by Mistral OCR
+        images = []
+        image_embeddings = []
+        if extraction_result is not None and extraction_result.get('images'):
+            images = extraction_result.get('images', [])
+            logging.info(f"📷 Found {len(images)} images in document")
+
+            # Filter images that have base64 data
+            images_with_data = [img for img in images if img.get('image_base64')]
+
+            if images_with_data:
+                logging.info(f"🧠 Embedding {len(images_with_data)} images with Jina CLIP-v2")
+
+                try:
+                    from multimodal_embeddings import MultimodalEmbedder
+
+                    # Initialize embedder
+                    embedder = MultimodalEmbedder(model="jina-clip-v2", batch_size=batch_size)
+
+                    # Extract base64 data for embedding
+                    image_data_list = []
+                    for img in images_with_data:
+                        img_base64 = img.get('image_base64', '')
+                        if img_base64:
+                            # Jina expects data URI format
+                            if not img_base64.startswith('data:'):
+                                img_data_uri = f"data:image/jpeg;base64,{img_base64}"
+                            else:
+                                img_data_uri = img_base64
+                            image_data_list.append(img_data_uri)
+
+                    # Embed images
+                    if image_data_list:
+                        image_embeddings = embedder.embed_images(image_data_list, normalize=True)
+                        logging.info(f"✅ Image embedding complete: {len(image_embeddings)} embeddings (1024 dims)")
+                    else:
+                        logging.warning("No valid image data found for embedding")
+
+                except Exception as e:
+                    logging.error(f"❌ Image embedding failed: {e}")
+                    # Continue without images rather than failing the whole pipeline
+                    image_embeddings = []
+            else:
+                logging.info("No images with base64 data found")
+
         # 3. Prepare fields for pdfs table
         file_name = os.path.basename(file_path)
         file_type = os.path.splitext(file_path)[1][1:] or "unknown"
@@ -382,6 +497,22 @@ async def process_document_with_openai(
                 source_file=source_filename
             )
             logging.info(f"Successfully upserted vectors to Pinecone for document: {document_id}")
+
+            # 5.5. Upsert image vectors if we have any
+            if image_embeddings and images_with_data:
+                try:
+                    logging.info(f"📤 Upserting {len(image_embeddings)} image vectors to Pinecone")
+                    upsert_image_vectors(
+                        doc_id=document_id,
+                        space_id=space_id,
+                        images=images_with_data,
+                        embeddings=image_embeddings,
+                        source_file=source_filename
+                    )
+                    logging.info(f"✅ Successfully upserted {len(image_embeddings)} image vectors")
+                except Exception as e:
+                    logging.error(f"❌ Error upserting image vectors: {e}")
+                    # Continue without failing the whole pipeline
         except ValueError as e:
             logging.error(f"Error upserting vectors: {e}")
             raise ValueError(f"Failed to process document embeddings: {str(e)}")
@@ -486,13 +617,11 @@ async def process_drive_files(file_ids: List[str], space_id: str, access_token: 
 # Add caching for query embeddings
 @lru_cache(maxsize=100)
 def get_query_embedding(query: str, use_openai: bool = True):
-    """Cache query embeddings to avoid recalculating for repeated queries."""
+    """Cache query embeddings to avoid recalculating for repeated queries. Now uses multimodal embeddings (Jina CLIP-v2, 1024 dims)."""
     start_time = time.time()
-    if use_openai:
-        result = embed_query_v2(query)
-    else:
-        result = embed_query(query)
-    logging.info(f"Query embedding took {time.time() - start_time:.2f}s")
+    # Use multimodal embeddings (Jina CLIP-v2) for all queries
+    result = embed_query_multimodal(query)
+    logging.info(f"Query embedding (multimodal, 1024 dims) took {time.time() - start_time:.2f}s")
     return result
 
 
@@ -515,11 +644,13 @@ async def answer_query(
     educational_mode: bool = False,  # Enable tutoring/educational approach
     conversation_history: Optional[List[Dict[str, str]]] = None,  # Conversation history for context continuity
     max_history_messages: int = 10,  # Maximum number of history messages to keep
-    return_context: bool = False  # Return context chunks for streaming endpoints
+    return_context: bool = False,  # Return context chunks for streaming endpoints
+    include_diagrams: bool = True,  # Whether to include diagrams in response
+    max_diagrams: int = 3  # Maximum number of diagrams to return
 ) -> Dict[str, Any]:
     """
     Optimized function to answer a user query using hybrid search, rerank, and LLM generation.
-    Returns dict with answer and citations.
+    Returns dict with answer, citations, and optionally diagrams.
 
     Args:
         query: The user's question.
@@ -538,7 +669,11 @@ async def answer_query(
         enrichment_mode: "simple" (default, classic enrichment) or "advanced" (intelligent domain-aware enrichment).
         learning_style: Learning style for personalized educational responses ("academic_focus", "deep_dive", "quick_practical", "exploratory_curious", "narrative_reader", "default", or None).
         educational_mode: If True, enables tutoring/educational approach with context-rich responses.
+        conversation_history: Optional conversation history for context continuity.
+        max_history_messages: Maximum number of history messages to keep.
         return_context: If True, includes context_chunks in the return dict for streaming endpoints.
+        include_diagrams: If True, processes and returns diagrams found in search results.
+        max_diagrams: Maximum number of diagrams to return (default: 3).
     """
     start_time = time.time()
     logging.info(f"Answering query: '{query}' for document {document_id if not search_by_space_only else 'None'} in space {space_id}, allow_general_knowledge: {allow_general_knowledge}, enable_websearch: {enable_websearch}, enrichment_mode: {enrichment_mode}, learning_style: {learning_style}, educational_mode: {educational_mode}")
@@ -909,10 +1044,50 @@ async def answer_query(
     
     logging.info(f"Total query processing took {time.time() - start_time:.2f}s")
 
-    # Return answer and citations, optionally include context chunks for streaming
+    # Process diagrams if requested
+    diagrams = []
+    if include_diagrams and context_chunks:
+        try:
+            diagram_start = time.time()
+
+            # Separate image chunks from text chunks
+            image_chunks = []
+            text_only_chunks = []
+
+            for chunk in context_chunks:
+                chunk_metadata = chunk.get("metadata", {})
+                if chunk_metadata.get("type") == "image":
+                    image_chunks.append(chunk)
+                else:
+                    text_only_chunks.append(chunk)
+
+            # Process diagrams if found
+            if image_chunks:
+                logging.info(f"Found {len(image_chunks)} diagram(s) in search results, processing...")
+
+                # Use diagram explainer to generate descriptions
+                diagrams = explain_diagrams_batch(
+                    diagrams=image_chunks,
+                    query=query,
+                    text_chunks=text_only_chunks,
+                    max_diagrams=max_diagrams
+                )
+
+                logging.info(f"Diagram processing took {time.time() - diagram_start:.2f}s, returned {len(diagrams)} diagrams")
+            else:
+                logging.info("No diagrams found in search results")
+
+        except Exception as e:
+            logging.error(f"Error processing diagrams: {e}")
+            # Continue without diagrams rather than failing the whole request
+            diagrams = []
+
+    # Return answer and citations, optionally include context chunks and diagrams
     result = {"answer": answer, "citations": citations}
     if return_context:
         result["context_chunks"] = context_chunks
+    if include_diagrams:
+        result["diagrams"] = diagrams
     return result
 
 
@@ -1023,13 +1198,13 @@ def process_youtube(
         
         logging.info(f"Cleaned chunks: {len(cleaned_chunks)}")
         
-        # Embed chunks
-        logging.info(f"Embedding chunks with OpenAI model: {embedding_model}")
-        embeddings = embed_chunks_v2(cleaned_chunks, model=embedding_model, batch_size=32)
+        # Embed chunks with multimodal embeddings (Jina CLIP-v2, 1024 dims)
+        logging.info(f"Embedding chunks with Jina CLIP-v2 multimodal model (1024 dims)")
+        embeddings = embed_chunks_multimodal(cleaned_chunks, batch_size=32)
         
         # Check for embedding errors
         if embeddings and isinstance(embeddings[0], dict) and "message" in embeddings[0] and "status" in embeddings[0]:
-            error_msg = f"OpenAI embedding error: {embeddings[0]['message']}"
+            error_msg = f"Multimodal embedding error: {embeddings[0]['message']}"
             logging.error(error_msg)
             raise ValueError(error_msg)
         
@@ -1149,11 +1324,13 @@ async def answer_query_stream_endpoint(
     fast_mode: bool = Form(False),
     allow_general_knowledge: bool = Form(False),
     enable_websearch: bool = Form(False),
-    model: str = Form("openai/gpt-oss-20b"),
+    model: str = Form("openai/gpt-oss-120b"),
     enrichment_mode: str = Form("simple"),
     learning_style: Optional[str] = Form(None),
     educational_mode: bool = Form(False),
-    conversation_history: Optional[str] = Form(None)
+    conversation_history: Optional[str] = Form(None),
+    include_diagrams: bool = Form(True),
+    max_diagrams: int = Form(3)
 ):
     """
     STREAMING endpoint: Returns real-time status updates and progressive answers.
@@ -1204,13 +1381,21 @@ async def answer_query_stream_endpoint(
                 learning_style=learning_style,
                 educational_mode=educational_mode,
                 conversation_history=history_list,
-                return_context=True  # Get context chunks for websearch synthesis
+                return_context=True,  # Get context chunks for websearch synthesis
+                include_diagrams=include_diagrams,
+                max_diagrams=max_diagrams
             )
 
             # Stream RAG answer
             rag_time = int((time.time() - start_time) * 1000)
             yield f"data: {json.dumps({'status': '✅ Document search complete', 'type': 'status'})}\n\n"
             yield f"data: {json.dumps({'answer': rag_result['answer'], 'citations': rag_result['citations'], 'time_ms': rag_time, 'type': 'rag_answer'})}\n\n"
+
+            # Stream diagrams if found
+            if include_diagrams and rag_result.get('diagrams'):
+                diagrams = rag_result['diagrams']
+                yield f"data: {json.dumps({'status': f'📊 Found {len(diagrams)} diagram(s)', 'type': 'status'})}\n\n"
+                yield f"data: {json.dumps({'diagrams': diagrams, 'type': 'diagrams'})}\n\n"
 
             # If websearch is enabled, do it now with progressive updates
             if enable_websearch:
@@ -1343,16 +1528,18 @@ async def answer_query_endpoint(
     fast_mode: bool = Form(False),  # New parameter for faster but potentially lower quality results
     allow_general_knowledge: bool = Form(False),  # New parameter for allowing general knowledge supplementation
     enable_websearch: bool = Form(False),  # New parameter for enabling contextual web search
-    model: str = Form("meta-llama/llama-4-scout-17b-16e-instruct"),  # User-selectable model parameter
+    model: str = Form("openai/gpt-oss-120b"),  # User-selectable model parameter (updated to Groq model)
     enrichment_mode: str = Form("simple"),  # "simple" (default) or "advanced" for intelligent enrichment
     learning_style: Optional[str] = Form(None),  # Learning style for personalized educational responses
     educational_mode: bool = Form(False),  # Enable tutoring/educational approach
-    conversation_history: Optional[str] = Form(None)  # JSON string: "[{role, content}, ...]"
+    conversation_history: Optional[str] = Form(None),  # JSON string: "[{role, content}, ...]"
+    include_diagrams: bool = Form(True),  # Whether to include diagrams in response
+    max_diagrams: int = Form(3)  # Maximum number of diagrams to return
 ) -> JSONResponse:
     """
     Optimized endpoint to answer a query using the RAG pipeline.
-    Returns the answer and citations.
-    
+    Returns the answer, citations, and optionally diagrams.
+
     Args:
         query: User's question
         document_id: Document ID to search within
@@ -1365,10 +1552,13 @@ async def answer_query_endpoint(
         fast_mode: If True, uses optimized settings for faster response time
         allow_general_knowledge: If True, allows LLM to enrich answers with general knowledge, expanding beyond documents with additional insights and context
         enable_websearch: If True, performs contextual web search to supplement RAG results
-        model: The model to use for generation. Auto-switches to GPT-4o when websearch is enabled.
+        model: The model to use for generation (default: openai/gpt-oss-120b from Groq)
         enrichment_mode: "simple" (default, classic enrichment) or "advanced" (intelligent domain-aware enrichment)
         learning_style: Learning style for personalized educational responses ("academic_focus", "deep_dive", "quick_practical", "exploratory_curious", "narrative_reader", "default", or None)
         educational_mode: If True, enables tutoring/educational approach with context-rich responses
+        conversation_history: JSON string of conversation history for context continuity
+        include_diagrams: If True, processes and returns diagrams found in search results
+        max_diagrams: Maximum number of diagrams to return (default: 3)
     """
     start_time = time.time()
     acl_list = [tag.strip() for tag in acl_tags.split(",")] if acl_tags else None
@@ -1406,7 +1596,9 @@ async def answer_query_endpoint(
             enrichment_mode=enrichment_mode,
             learning_style=learning_style,
             educational_mode=educational_mode,
-            conversation_history=history_list
+            conversation_history=history_list,
+            include_diagrams=include_diagrams,
+            max_diagrams=max_diagrams
         )
         result["time_ms"] = int((time.time() - start_time) * 1000)  # Add time taken in ms
         return JSONResponse(result)
