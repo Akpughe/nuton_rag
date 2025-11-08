@@ -9,11 +9,12 @@ from chonkie_client import embed_query, embed_query_v2, embed_query_multimodal
 from pinecone_client import hybrid_search
 from pinecone_client import rerank_results
 import openai_client
-from supabase_client import update_generated_content, get_generated_content_id, insert_flashcard_set, get_existing_flashcards
+from supabase_client import update_generated_content, get_generated_content_id, insert_flashcard_set, get_existing_flashcards, determine_shared_status
 
 def generate_flashcards(
     document_id: str,
     space_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     num_questions: Optional[int] = None,
     acl_tags: Optional[List[str]] = None,
     rerank_top_n: int = 50,
@@ -25,6 +26,7 @@ def generate_flashcards(
     Args:
         document_id: Filter results to this document ID.
         space_id: Filter results to this space ID.
+        user_id: UUID of the user creating flashcards (for ownership tracking).
         num_questions: Optional number of flashcards to generate.
         acl_tags: Optional list of ACL tags to filter by.
         rerank_top_n: Number of results to rerank.
@@ -33,7 +35,7 @@ def generate_flashcards(
     Returns:
         Dict with flashcards and status.
     """
-    logging.info(f"Generating flashcards for document {document_id}, space_id: {space_id}")
+    logging.info(f"Generating flashcards for document {document_id}, space_id: {space_id}, user_id: {user_id}")
     
     # Initialize status in database with empty set
     update_generated_content(
@@ -129,9 +131,12 @@ def generate_flashcards(
             # Get content_id for this document
             content_id = get_generated_content_id(document_id)
             
+            # Determine if this flashcard set should be shared based on user ownership
+            is_shared = determine_shared_status(user_id, content_id)
+            
             # Insert the complete set
-            logging.info(f"Inserting complete flashcard set with {len(flashcards)} cards")
-            insert_flashcard_set(content_id, flashcards, shared_state["set_id"])
+            logging.info(f"Inserting complete flashcard set with {len(flashcards)} cards, created_by: {user_id}, is_shared: {is_shared}")
+            insert_flashcard_set(content_id, flashcards, shared_state["set_id"], created_by=user_id, is_shared=is_shared)
         except Exception as e:
             logging.error(f"Error storing complete flashcard set: {e}")
         
@@ -715,6 +720,7 @@ def is_duplicate_of_existing(card: Dict[str, str], existing_cards: List[Dict[str
 def regenerate_flashcards(
     document_id: str,
     space_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     num_questions: Optional[int] = None,
     acl_tags: Optional[List[str]] = None,
     rerank_top_n: int = 50,
@@ -726,6 +732,7 @@ def regenerate_flashcards(
     Args:
         document_id: Filter results to this document ID.
         space_id: Filter results to this space ID.
+        user_id: UUID of the user creating flashcards (for ownership tracking).
         num_questions: Optional number of additional flashcards to generate.
         acl_tags: Optional list of ACL tags to filter by.
         rerank_top_n: Number of results to rerank.
@@ -734,7 +741,7 @@ def regenerate_flashcards(
     Returns:
         Dict with new flashcards and status.
     """
-    logging.info(f"Regenerating flashcards for document {document_id}, space_id: {space_id}")
+    logging.info(f"Regenerating flashcards for document {document_id}, space_id: {space_id}, user_id: {user_id}")
     
     # Get content_id for this document
     content_id = get_generated_content_id(document_id)
@@ -853,8 +860,11 @@ def regenerate_flashcards(
         
         # Insert the new set to flashcard_sets
         try:
-            logging.info(f"Inserting new flashcard set #{next_set_number} with {len(new_flashcards)} cards")
-            insert_flashcard_set(content_id, new_flashcards, next_set_number)
+            # Determine if this flashcard set should be shared based on user ownership
+            is_shared = determine_shared_status(user_id, content_id)
+            
+            logging.info(f"Inserting new flashcard set #{next_set_number} with {len(new_flashcards)} cards, created_by: {user_id}, is_shared: {is_shared}")
+            insert_flashcard_set(content_id, new_flashcards, next_set_number, created_by=user_id, is_shared=is_shared)
         except Exception as e:
             logging.error(f"Error storing new flashcard set: {e}")
         

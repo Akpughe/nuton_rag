@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from datetime import datetime
@@ -74,7 +74,13 @@ def update_generated_content_quiz(document_id: str, content: Dict[str, Any]) -> 
 
     print('added to supabase')
 
-def insert_flashcard_set(content_id: str, flashcards: List[Dict[str, Any]], set_number: int) -> str:
+def insert_flashcard_set(
+    content_id: str, 
+    flashcards: List[Dict[str, Any]], 
+    set_number: int,
+    created_by: Optional[str] = None,
+    is_shared: bool = False
+) -> str:
     """
     Insert or update a batch of flashcards in the 'flashcard_sets' table.
     If a record with the same content_id and set_number exists, it will update the flashcards.
@@ -84,6 +90,8 @@ def insert_flashcard_set(content_id: str, flashcards: List[Dict[str, Any]], set_
         content_id: UUID of the generated_content record
         flashcards: List of flashcard objects to insert
         set_number: Batch number for this set of flashcards
+        created_by: UUID of the user who created this set (for ownership tracking)
+        is_shared: Boolean indicating if set is shared with all space members or private to creator
         
     Returns:
         The id of the inserted/updated flashcard set as a string
@@ -97,28 +105,45 @@ def insert_flashcard_set(content_id: str, flashcards: List[Dict[str, Any]], set_
     if check_response.data and len(check_response.data) > 0:
         # Record exists, update it
         existing_id = check_response.data[0]["id"]
-        print(f"Updating existing flashcard set {existing_id} (content_id: {content_id}, set: {set_number})")
+        logging.info(f"Updating existing flashcard set {existing_id} (content_id: {content_id}, set: {set_number})")
         
-        response = supabase.table("flashcard_sets").update({
+        update_data = {
             "flashcards": flashcards,
-        }).eq("id", existing_id).execute()
+        }
+        # Always update created_by if provided (don't use conditional)
+        if created_by is not None:
+            update_data["created_by"] = created_by
+        # Always update is_shared if provided (explicit not None check)
+        if is_shared is not None:
+            update_data["is_shared"] = is_shared
+        
+        response = supabase.table("flashcard_sets").update(update_data).eq("id", existing_id).execute()
         
         if not response.data or len(response.data) == 0:
             raise Exception(f"Flashcard set update failed: {response}")
             
+        logging.info(f"Flashcard set updated successfully with created_by: {created_by}, is_shared: {is_shared}")
         return existing_id
     else:
         # No existing record, insert a new one
-        print(f"Creating new flashcard set (content_id: {content_id}, set: {set_number})")
-        response = supabase.table("flashcard_sets").insert({
+        logging.info(f"Creating new flashcard set (content_id: {content_id}, set: {set_number}, created_by: {created_by}, is_shared: {is_shared})")
+        insert_data = {
             "content_id": content_id,
             "flashcards": flashcards,
             "set_number": set_number
-        }).execute()
+        }
+        # Always set created_by if provided (don't use conditional)
+        if created_by is not None:
+            insert_data["created_by"] = created_by
+        # Always set is_shared (don't use conditional)
+        insert_data["is_shared"] = is_shared if is_shared is not None else False
+        
+        response = supabase.table("flashcard_sets").insert(insert_data).execute()
         
         if not response.data or "id" not in response.data[0]:
             raise Exception(f"Flashcard set insertion failed: {response}")
-            
+        
+        logging.info(f"Flashcard set created successfully with id: {response.data[0]['id']}, created_by: {created_by}, is_shared: {is_shared}")
         return str(response.data[0]["id"])
 
 def get_existing_flashcards(content_id: str) -> List[Dict[str, Any]]:
@@ -144,6 +169,53 @@ def get_existing_flashcards(content_id: str) -> List[Dict[str, Any]]:
         return existing_flashcards
     except Exception as e:
         logging.error(f"Error retrieving existing flashcards: {e}")
+        return []
+
+def get_visible_flashcard_sets(content_id: str, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Retrieves flashcard sets with visibility filtering based on user ownership and sharing status.
+    
+    A user can see:
+    - All sets where is_shared=true (shared with all space members)
+    - All sets where created_by matches the user_id (their own sets)
+    
+    Args:
+        content_id: The content ID to retrieve flashcards for.
+        user_id: Optional UUID of the user requesting the flashcards. If None, only shared sets are returned.
+        
+    Returns:
+        List of visible flashcard sets with their cards.
+    """
+    try:
+        # Query flashcard_sets table with content_id
+        response = supabase.table("flashcard_sets")\
+            .select("set_number, flashcards, created_by, is_shared")\
+            .eq("content_id", content_id)\
+            .order("set_number")\
+            .execute()
+        
+        if not response.data or len(response.data) == 0:
+            return []
+        
+        visible_sets = []
+        for row in response.data:
+            is_shared = row.get("is_shared", False)
+            created_by = row.get("created_by")
+            
+            # Include if shared OR if user is the creator
+            if is_shared or (user_id and created_by and created_by == user_id):
+                visible_sets.append({
+                    "set_id": row.get("set_number"),
+                    "cards": row.get("flashcards", []),
+                    "created_by": created_by,
+                    "is_shared": is_shared
+                })
+        
+        logging.info(f"Retrieved {len(visible_sets)} visible flashcard sets for user {user_id} (total available: {len(response.data)})")
+        return visible_sets
+        
+    except Exception as e:
+        logging.error(f"Error retrieving visible flashcard sets: {e}")
         return []
 
 def get_existing_quizzes(content_id: str) -> List[Dict[str, Any]]:
@@ -183,7 +255,68 @@ def get_existing_quizzes(content_id: str) -> List[Dict[str, Any]]:
         logging.error(f"Error retrieving existing quizzes from quiz_sets table: {e}")
         return []
 
-def insert_quiz_set(content_id: str, quiz_obj: Dict[str, Any], set_number: int, title: str = None, description: str = None) -> str:
+def get_visible_quiz_sets(content_id: str, user_id: Optional[str] = None) -> List[Dict[str, Any]]:
+    """
+    Retrieves quiz sets with visibility filtering based on user ownership and sharing status.
+    
+    A user can see:
+    - All sets where is_shared=true (shared with all space members)
+    - All sets where created_by matches the user_id (their own sets)
+    
+    Args:
+        content_id: The content ID to retrieve quizzes for.
+        user_id: Optional UUID of the user requesting the quizzes. If None, only shared sets are returned.
+        
+    Returns:
+        List of visible quiz sets with their questions.
+    """
+    try:
+        # Query quiz_sets table with content_id
+        response = supabase.table("quiz_sets")\
+            .select("quiz, set_number, title, description, created_by, is_shared")\
+            .eq("content_id", content_id)\
+            .order("set_number")\
+            .execute()
+        
+        if not response.data or len(response.data) == 0:
+            return []
+        
+        visible_sets = []
+        for row in response.data:
+            is_shared = row.get("is_shared", False)
+            created_by = row.get("created_by")
+            
+            # Include if shared OR if user is the creator
+            if is_shared or (user_id and created_by and created_by == user_id):
+                quiz_data = row.get("quiz", {})
+                if quiz_data and isinstance(quiz_data, dict):
+                    questions = quiz_data.get("questions", [])
+                    visible_sets.append({
+                        "set_number": row.get("set_number"),
+                        "title": row.get("title"),
+                        "description": row.get("description"),
+                        "questions": questions,
+                        "total_questions": len(questions),
+                        "created_by": created_by,
+                        "is_shared": is_shared
+                    })
+        
+        logging.info(f"Retrieved {len(visible_sets)} visible quiz sets for user {user_id} (total available: {len(response.data)})")
+        return visible_sets
+        
+    except Exception as e:
+        logging.error(f"Error retrieving visible quiz sets: {e}")
+        return []
+
+def insert_quiz_set(
+    content_id: str, 
+    quiz_obj: Dict[str, Any], 
+    set_number: int, 
+    title: str = None, 
+    description: str = None,
+    created_by: Optional[str] = None,
+    is_shared: bool = False
+) -> str:
     """
     Insert or update a quiz in the 'quiz_sets' table.
     If a record with the same content_id and set_number exists, it will update the quiz.
@@ -195,6 +328,8 @@ def insert_quiz_set(content_id: str, quiz_obj: Dict[str, Any], set_number: int, 
         set_number: Set number for this quiz
         title: Optional title for the quiz
         description: Optional description for the quiz
+        created_by: UUID of the user who created this set (for ownership tracking)
+        is_shared: Boolean indicating if set is shared with all space members or private to creator
         
     Returns:
         The id of the inserted/updated quiz set as a string
@@ -217,16 +352,23 @@ def insert_quiz_set(content_id: str, quiz_obj: Dict[str, Any], set_number: int, 
             update_data["title"] = title
         if description:
             update_data["description"] = description
+        # Always update created_by if provided (don't use conditional)
+        if created_by is not None:
+            update_data["created_by"] = created_by
+        # Always update is_shared if provided
+        if is_shared is not None:
+            update_data["is_shared"] = is_shared
             
         response = supabase.table("quiz_sets").update(update_data).eq("id", existing_id).execute()
         
         if not response.data or len(response.data) == 0:
             raise Exception(f"Quiz set update failed: {response}")
-            
+        
+        logging.info(f"Quiz set updated successfully with created_by: {created_by}, is_shared: {is_shared}")
         return existing_id
     else:
         # No existing record, insert a new one
-        logging.info(f"Creating new quiz set (content_id: {content_id}, set: {set_number})")
+        logging.info(f"Creating new quiz set (content_id: {content_id}, set: {set_number}, created_by: {created_by}, is_shared: {is_shared})")
         insert_data = {
             "content_id": content_id,
             "quiz": quiz_obj,
@@ -236,13 +378,75 @@ def insert_quiz_set(content_id: str, quiz_obj: Dict[str, Any], set_number: int, 
             insert_data["title"] = title
         if description:
             insert_data["description"] = description
+        # Always set created_by if provided (don't use conditional)
+        if created_by is not None:
+            insert_data["created_by"] = created_by
+        # Always set is_shared
+        insert_data["is_shared"] = is_shared if is_shared is not None else False
             
         response = supabase.table("quiz_sets").insert(insert_data).execute()
         
         if not response.data or "id" not in response.data[0]:
             raise Exception(f"Quiz set insertion failed: {response}")
+        
+        logging.info(f"Quiz set created successfully with id: {response.data[0]['id']}, created_by: {created_by}, is_shared: {is_shared}")
             
         return str(response.data[0]["id"])
+
+def determine_shared_status(user_id: str, content_id: str) -> bool:
+    """
+    Determines if content (flashcards/quiz) should be shared based on ownership.
+    
+    Returns True if user is space owner (shared with all space members).
+    Returns False if user is not owner (private to user only).
+    
+    Args:
+        user_id: UUID of the user creating the content
+        content_id: UUID of the generated_content record
+        
+    Returns:
+        bool: True if shared, False if private
+    """
+    try:
+        if not user_id:
+            return False  # Safe default if no user provided
+        
+        # Get space_id from generated_content
+        content_response = supabase.table('generated_content')\
+            .select('space_id')\
+            .eq('id', content_id)\
+            .execute()
+        
+        if not content_response.data or len(content_response.data) == 0:
+            logging.warning(f"Could not find generated_content with id {content_id}")
+            return False
+        
+        space_id = content_response.data[0]['space_id']
+        
+        # Get space owner info
+        space_response = supabase.table('spaces')\
+            .select('user_id, created_by')\
+            .eq('id', space_id)\
+            .execute()
+        
+        if not space_response.data or len(space_response.data) == 0:
+            logging.warning(f"Could not find space with id {space_id}")
+            return False
+        
+        space_data = space_response.data[0]
+        space_owner_id = space_data.get('user_id') or space_data.get('created_by')
+        
+        # Check if user is the space owner
+        is_owner = (user_id == space_owner_id)
+        
+        logging.info(f"Ownership check: user={user_id}, owner={space_owner_id}, is_owner={is_owner}")
+        
+        return is_owner
+        
+    except Exception as e:
+        logging.error(f"Error determining shared status for user {user_id} and content {content_id}: {e}")
+        return False  # Safe default on error
+
 
 # update flashcard
 

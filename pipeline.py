@@ -60,6 +60,7 @@ logger = logging.getLogger(__name__)
 class FlashcardRequest(BaseModel):
     document_id: str
     space_id: Optional[str] = None
+    user_id: str
     num_questions: Optional[int] = None
     acl_tags: Optional[List[str]] = None
 
@@ -67,6 +68,7 @@ class FlashcardRequest(BaseModel):
 class QuizRequest(BaseModel):
     document_id: str
     space_id: Optional[str] = None
+    user_id: str
     question_type: str = "both"
     num_questions: int = 30
     acl_tags: Optional[str] = None
@@ -1934,17 +1936,18 @@ async def generate_flashcards_endpoint(
     Endpoint to generate flashcards from a document.
     
     Args:
-        request: FlashcardRequest with document_id, space_id, etc.
+        request: FlashcardRequest with document_id, space_id, user_id, etc.
         
     Returns:
         JSON response with flashcards or error message.
     """
-    logging.info(f"Generate flashcards endpoint called for document: {request.document_id}")
+    logging.info(f"Generate flashcards endpoint called for document: {request.document_id}, user: {request.user_id}")
     
     try:
         result = generate_flashcards(
             document_id=request.document_id,
             space_id=request.space_id,
+            user_id=request.user_id,
             num_questions=request.num_questions,
             acl_tags=request.acl_tags
         )
@@ -1960,27 +1963,28 @@ async def regenerate_flashcards_endpoint(
     request: FlashcardRequest
 ) -> JSONResponse:
     """
-    Endpoint to generate flashcards from a document.
+    Endpoint to regenerate flashcards from a document.
     
     Args:
-        request: FlashcardRequest with document_id, space_id, etc.
+        request: FlashcardRequest with document_id, space_id, user_id, etc.
         
     Returns:
         JSON response with flashcards or error message.
     """
-    logging.info(f"Re-Generate flashcards endpoint called for document: {request.document_id}")
+    logging.info(f"Re-Generate flashcards endpoint called for document: {request.document_id}, user: {request.user_id}")
     
     try:
         result = regenerate_flashcards(
             document_id=request.document_id,
             space_id=request.space_id,
+            user_id=request.user_id,
             num_questions=request.num_questions,
             acl_tags=request.acl_tags
         )
         
         return JSONResponse(result)
     except Exception as e:
-        logging.exception(f"Error in generate_flashcards_endpoint: {e}")
+        logging.exception(f"Error in regenerate_flashcards_endpoint: {e}")
         return JSONResponse({"error": str(e)}, status_code=500) 
 
 
@@ -1994,6 +1998,7 @@ async def generate_quiz_endpoint(
         request: QuizRequest containing parameters:
             - document_id: The document to generate the quiz from.
             - space_id: Optional space ID.
+            - user_id: UUID of the user creating the quiz.
             - question_type: Type of questions to generate ("mcq", "true_false", or "both").
             - num_questions: Total number of questions to generate.
             - acl_tags: Optional comma-separated ACL tags.
@@ -2014,6 +2019,7 @@ async def generate_quiz_endpoint(
         result = generate_quiz(
             document_id=request.document_id,
             space_id=request.space_id,
+            user_id=request.user_id,
             question_type=request.question_type,
             num_questions=request.num_questions,
             acl_tags=acl_list,
@@ -2037,6 +2043,7 @@ async def regenerate_quiz_endpoint(
         request: QuizRequest containing parameters:
             - document_id: The document to regenerate the quiz from.
             - space_id: Optional space ID.
+            - user_id: UUID of the user creating the quiz.
             - question_type: Type of questions to generate ("mcq", "true_false", or "both").
             - num_questions: Total number of questions to generate.
             - acl_tags: Optional comma-separated ACL tags.
@@ -2057,6 +2064,7 @@ async def regenerate_quiz_endpoint(
         result = regenerate_quiz(
             document_id=request.document_id,
             space_id=request.space_id,
+            user_id=request.user_id,
             question_type=request.question_type,
             num_questions=request.num_questions,
             acl_tags=acl_list,
