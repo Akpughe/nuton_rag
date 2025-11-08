@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from datetime import datetime
@@ -245,6 +245,105 @@ def insert_quiz_set(content_id: str, quiz_obj: Dict[str, Any], set_number: int, 
         return str(response.data[0]["id"])
 
 # update flashcard
+
+def check_document_type(document_id: str) -> Tuple[str, str]:
+    """
+    Check if a document_id exists in pdfs or yts table and return its type.
+    
+    Args:
+        document_id: The document ID to check
+        
+    Returns:
+        Tuple of (document_type, document_id) where document_type is "pdf" or "youtube"
+        
+    Raises:
+        Exception if document is not found in either table
+    """
+    try:
+        # Check if document exists in pdfs table
+        pdf_response = supabase.table("pdfs").select("id").eq("id", document_id).execute()
+        if pdf_response.data and len(pdf_response.data) > 0:
+            return ("pdf", document_id)
+        
+        # Check if document exists in yts table
+        yts_response = supabase.table("yts").select("id").eq("id", document_id).execute()
+        if yts_response.data and len(yts_response.data) > 0:
+            return ("youtube", document_id)
+        
+        # Document not found in either table
+        raise Exception(f"Document {document_id} not found in pdfs or yts table")
+        
+    except Exception as e:
+        logging.error(f"Error checking document type for {document_id}: {e}")
+        raise
+
+def upsert_generated_content_notes(document_id: str, notes_markdown: str, space_id: str, is_youtube: bool) -> str:
+    """
+    Upsert notes to the generated_content table.
+    If a record exists (by pdf_id or yts_id), update it. Otherwise, insert a new record.
+    
+    Args:
+        document_id: The document ID (from pdfs or yts table)
+        notes_markdown: The generated notes markdown content
+        space_id: The space ID
+        is_youtube: True if document is a YouTube video, False if PDF
+        
+    Returns:
+        The id of the generated_content record (existing or newly created)
+    """
+    try:
+        # Determine which column to use for lookup and insertion
+        if is_youtube:
+            lookup_column = "yts_id"
+            insert_data = {
+                "yts_id": document_id,
+                "space_id": space_id,
+                "new_note": notes_markdown,
+                "updated_at": datetime.now().isoformat()
+            }
+        else:
+            lookup_column = "pdf_id"
+            insert_data = {
+                "pdf_id": document_id,
+                "space_id": space_id,
+                "new_note": notes_markdown,
+                "updated_at": datetime.now().isoformat()
+            }
+        
+        # Check if record already exists
+        check_response = supabase.table("generated_content").select("id").eq(lookup_column, document_id).execute()
+        
+        if check_response.data and len(check_response.data) > 0:
+            # Record exists, update it
+            existing_id = check_response.data[0]["id"]
+            logging.info(f"Updating existing generated_content record {existing_id} for document {document_id}")
+            
+            update_data = {
+                "new_note": notes_markdown,
+                "updated_at": datetime.now().isoformat()
+            }
+            
+            response = supabase.table("generated_content").update(update_data).eq("id", existing_id).execute()
+            
+            if not response.data or len(response.data) == 0:
+                raise Exception(f"Failed to update generated_content record: {response}")
+            
+            return existing_id
+        else:
+            # Record doesn't exist, insert new one
+            logging.info(f"Creating new generated_content record for document {document_id}")
+            insert_data["created_at"] = datetime.now().isoformat()
+            
+            response = supabase.table("generated_content").insert(insert_data).execute()
+            
+            if not response.data or "id" not in response.data[0]:
+                raise Exception(f"Failed to insert generated_content record: {response}")
+            
+            return str(response.data[0]["id"])
+            
+    except Exception as e:
+        logging.error(f"Error upserting notes to generated_content for document {document_id}: {e}")
+        raise
 
 def get_documents_in_space(space_id: str) -> Dict[str, List[Dict[str, Any]]]:
     """

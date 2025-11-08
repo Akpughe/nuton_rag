@@ -5,7 +5,7 @@ import asyncio
 import concurrent.futures
 from functools import partial
 
-from chonkie_client import embed_query, embed_query_v2
+from chonkie_client import embed_query, embed_query_v2, embed_query_multimodal
 from pinecone_client import hybrid_search
 from pinecone_client import rerank_results
 import openai_client
@@ -17,7 +17,7 @@ def generate_flashcards(
     num_questions: Optional[int] = None,
     acl_tags: Optional[List[str]] = None,
     rerank_top_n: int = 50,
-    use_openai_embeddings: bool = True
+    use_openai_embeddings: bool = False
 ) -> Dict[str, Any]:
     """
     Generates flashcards from a document using hybrid search, rerank, and GPT-4o.
@@ -40,15 +40,15 @@ def generate_flashcards(
         document_id,
         {"flashcards": [{"set_id": 1, "cards": []}], "status": "processing", "updated_at": datetime.now().isoformat()}
     )
-    
+
     try:
         start_time = datetime.now()
-        
+
         # Create a query to gather content for flashcards
         query = "Extract comprehensive information from this document including all key concepts, facts, definitions, examples, relationships between topics, methodologies, processes, theories, historical context, practical applications, edge cases, and underlying principles. Cover all sections and subtopics thoroughly to ensure complete coverage of the material for high-quality and diverse flashcard generation."
-        
-        # Embed query using OpenAI directly
-        query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query(query)
+
+        # Embed query using multimodal embeddings (1024 dims) by default, or OpenAI (1536 dims) if specified
+        query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query_multimodal(query)
         
         # Check for embedding errors
         if isinstance(query_embedded, dict) and "message" in query_embedded and "status" in query_embedded:
@@ -718,7 +718,7 @@ def regenerate_flashcards(
     num_questions: Optional[int] = None,
     acl_tags: Optional[List[str]] = None,
     rerank_top_n: int = 50,
-    use_openai_embeddings: bool = True
+    use_openai_embeddings: bool = False
 ) -> Dict[str, Any]:
     """
     Generates additional flashcards from a document, avoiding duplicates from previous sets.
@@ -767,13 +767,13 @@ def regenerate_flashcards(
     
     try:
         start_time = datetime.now()
-        
+
         # Create a query to gather content for flashcards
         query = "Extract comprehensive information from this document including all key concepts, facts, definitions, examples, relationships between topics, methodologies, processes, theories, historical context, practical applications, edge cases, and underlying principles. Cover all sections and subtopics thoroughly to ensure complete coverage of the material for high-quality and diverse flashcard generation."
-        
-        # Embed query using OpenAI directly
-        query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query(query)
-        
+
+        # Embed query using multimodal embeddings (1024 dims) by default, or OpenAI (1536 dims) if specified
+        query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query_multimodal(query)
+
         # Check for embedding errors
         if isinstance(query_embedded, dict) and "message" in query_embedded and "status" in query_embedded:
             error_msg = f"Query embedding failed: {query_embedded['message']}"

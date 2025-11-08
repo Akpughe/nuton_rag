@@ -5,7 +5,7 @@ import concurrent.futures
 from functools import partial
 import random
 
-from chonkie_client import embed_query, embed_query_v2
+from chonkie_client import embed_query, embed_query_v2, embed_query_multimodal
 from pinecone_client import hybrid_search, rerank_results
 import openai_client
 from supabase_client import update_generated_content, get_generated_content_id, insert_quiz_set, update_generated_content_quiz, get_existing_quizzes
@@ -157,7 +157,7 @@ def generate_quiz(
     num_questions: int = 10,
     acl_tags: Optional[List[str]] = None,
     rerank_top_n: int = 50,
-    use_openai_embeddings: bool = True,
+    use_openai_embeddings: bool = False,
     set_id: int = 1,
     title: Optional[str] = None,
     description: Optional[str] = None
@@ -197,9 +197,9 @@ def generate_quiz(
     try:
         start_time = datetime.now()
         
-        # Embed query using OpenAI directly
+        # Embed query using multimodal embeddings (1024 dims) by default, or OpenAI (1536 dims) if specified
         query = "Extract all key concepts, facts, and relationships from this document for quiz generation."
-        query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query(query)
+        query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query_multimodal(query)
         if isinstance(query_embedded, dict) and "message" in query_embedded and "status" in query_embedded:
             error_msg = f"Query embedding failed: {query_embedded['message']}"
             logging.error(error_msg)
@@ -637,7 +637,7 @@ def regenerate_quiz(
     num_questions: int = 10,
     acl_tags: Optional[List[str]] = None,
     rerank_top_n: int = 50,
-    use_openai_embeddings: bool = True,
+    use_openai_embeddings: bool = False,
     title: Optional[str] = None,
     description: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -711,8 +711,8 @@ def regenerate_quiz(
         
         all_hits = []
         for query in enhanced_queries:
-            # Embed query using OpenAI directly
-            query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query(query)
+            # Embed query using multimodal embeddings (1024 dims) by default, or OpenAI (1536 dims) if specified
+            query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query_multimodal(query)
             if isinstance(query_embedded, dict) and "message" in query_embedded and "status" in query_embedded:
                 continue  # Skip this query if embedding fails
             

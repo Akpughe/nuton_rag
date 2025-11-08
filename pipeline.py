@@ -12,7 +12,7 @@ from functools import lru_cache
 
 from chonkie_client import chunk_document, embed_chunks, embed_chunks_v2, embed_query, embed_query_v2, embed_chunks_multimodal, embed_query_multimodal
 from pinecone_client import upsert_vectors, upsert_image_vectors, hybrid_search, hybrid_search_parallel, rerank_results, hybrid_search_document_aware, rerank_results_document_aware
-from supabase_client import insert_pdf_record, insert_yts_record, get_documents_in_space
+from supabase_client import insert_pdf_record, insert_yts_record, get_documents_in_space, check_document_type, upsert_generated_content_notes
 from groq_client import generate_answer, generate_answer_document_aware
 import openai_client
 from services.wetrocloud_youtube import WetroCloudYouTubeService
@@ -2159,6 +2159,31 @@ async def generate_notes_endpoint(
             return JSONResponse(result, status_code=500)
 
         logger.info(f"✅ Notes generated successfully: {len(result.get('notes_markdown', ''))} characters")
+
+        # Save notes to database (generated_content table)
+        try:
+            # Check document type (PDF or YouTube)
+            doc_type, _ = check_document_type(document_id)
+            is_youtube = (doc_type == "youtube")
+            
+            # Ensure space_id is available
+            if not space_id:
+                logger.warning(f"No space_id provided for document {document_id}, cannot save to database")
+            else:
+                # Upsert notes to generated_content table
+                content_id = upsert_generated_content_notes(
+                    document_id=document_id,
+                    notes_markdown=result.get("notes_markdown", ""),
+                    space_id=space_id,
+                    is_youtube=is_youtube
+                )
+                logger.info(f"💾 Notes saved to generated_content table with ID: {content_id}")
+                result["saved_to_database"] = True
+                result["content_id"] = content_id
+        except Exception as db_error:
+            logger.error(f"⚠️ Failed to save notes to database: {db_error}")
+            result["database_save_error"] = str(db_error)
+            # Don't fail the endpoint, just log the error
 
         # Save notes to file in note/ folder
         try:
