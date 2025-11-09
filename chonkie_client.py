@@ -375,4 +375,134 @@ def embed_query_v2(
     except Exception as e:
         error_msg = f"Error calling OpenAI API: {str(e)}"
         logging.error(error_msg)
-        return {"message": error_msg, "status": 500} 
+        return {"message": error_msg, "status": 500}
+
+
+def embed_chunks_multimodal(
+    chunks: List[Dict[str, Any]],
+    batch_size: int = 32
+) -> List[Dict[str, Any]]:
+    """
+    Embed a list of chunks using Jina CLIP-v2 multimodal embeddings (1024 dimensions).
+
+    Args:
+        chunks: List of chunk dicts (must include 'text').
+        batch_size: Number of chunks per API call.
+
+    Returns:
+        List of chunk dicts, each with an added 'embedding' field (1024-dim vectors).
+
+    Raises:
+        Exception if API call fails or API key is missing.
+    """
+    try:
+        from multimodal_embeddings import MultimodalEmbedder
+    except ImportError as e:
+        error_msg = f"MultimodalEmbedder not available: {str(e)}"
+        logging.error(error_msg)
+        return [{"message": error_msg, "status": 500}]
+
+    logging.info(f"Embedding {len(chunks)} chunks with Jina CLIP-v2 (multimodal, 1024 dims)")
+
+    try:
+        # Initialize multimodal embedder
+        embedder = MultimodalEmbedder(
+            model="jina-clip-v2",
+            batch_size=batch_size
+        )
+
+        # Extract texts from chunks
+        texts = []
+        for chunk in chunks:
+            if isinstance(chunk, dict) and 'text' in chunk:
+                texts.append(chunk['text'])
+            elif isinstance(chunk, str):
+                texts.append(chunk)
+            else:
+                logging.warning(f"Skipping invalid chunk: {chunk}")
+                continue
+
+        if not texts:
+            error_msg = "No valid texts found in chunks"
+            logging.error(error_msg)
+            return [{"message": error_msg, "status": 400}]
+
+        # Embed with Jina CLIP-v2
+        embeddings = embedder.embed_texts(texts, normalize=True)
+
+        # Combine original chunks with embeddings
+        results = []
+        for chunk, embedding in zip(chunks, embeddings):
+            if isinstance(chunk, str):
+                # Convert string chunk to dict
+                formatted_chunk = {
+                    "text": chunk,
+                    "start_index": 0,
+                    "end_index": len(chunk),
+                    "token_count": 0,  # Token count not available without tokenizer
+                    "embedding": embedding
+                }
+            else:
+                # Use existing chunk dict and add the embedding
+                formatted_chunk = chunk.copy()
+                formatted_chunk["embedding"] = embedding
+
+            results.append(formatted_chunk)
+
+        logging.info(f"Successfully embedded {len(results)} chunks with Jina CLIP-v2 (1024 dims)")
+        return results
+
+    except Exception as e:
+        error_msg = f"Error calling Jina CLIP-v2 API: {str(e)}"
+        logging.error(error_msg)
+        return [{"message": error_msg, "status": 500}]
+
+
+def embed_query_multimodal(
+    query: str
+) -> Dict[str, Any]:
+    """
+    Embed a single query string using Jina CLIP-v2 multimodal embeddings (1024 dimensions).
+
+    Args:
+        query: The query string.
+
+    Returns:
+        Dict with 'embedding' field (1024-dim vector).
+
+    Raises:
+        Exception if API call fails or API key is missing.
+    """
+    try:
+        from multimodal_embeddings import MultimodalEmbedder
+    except ImportError as e:
+        error_msg = f"MultimodalEmbedder not available: {str(e)}"
+        logging.error(error_msg)
+        return {"message": error_msg, "status": 500}
+
+    logging.info(f"Embedding query with Jina CLIP-v2 (multimodal, 1024 dims): {query[:50]}...")
+
+    try:
+        # Initialize multimodal embedder
+        embedder = MultimodalEmbedder(model="jina-clip-v2")
+
+        # Embed the query
+        embeddings = embedder.embed_texts([query], normalize=True)
+
+        if not embeddings or len(embeddings) == 0:
+            error_msg = "Jina CLIP-v2 API returned empty response"
+            logging.error(error_msg)
+            return {"message": error_msg, "status": 500}
+
+        # Return the embedding in the expected format
+        result = {
+            "embedding": embeddings[0]
+        }
+
+        logging.info(f"Successfully embedded query with Jina CLIP-v2 (1024 dims)")
+        return result
+
+    except Exception as e:
+        error_msg = f"Error calling Jina CLIP-v2 API: {str(e)}"
+        logging.error(error_msg)
+        return {"message": error_msg, "status": 500}

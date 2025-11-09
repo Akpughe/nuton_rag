@@ -1,0 +1,22 @@
+{
+  "document_id": "feee1513a581c714fa2df038c919d2b1",
+  "source": "https://nutonai.s3.us-east-1.amazonaws.com/253fa8964c019b24dfa6e80c3e2e9137.pdf",
+  "extraction": {
+    "method": "mistral_ocr",
+    "pages": 92,
+    "chapters": 0,
+    "images": 28
+  },
+  "chunking": {
+    "total_chunks": 212,
+    "avg_tokens": 449.89622641509436
+  },
+  "embedding": {
+    "model": "jina-clip-v2",
+    "dimension": 1024
+  },
+  "pinecone": {
+    "index_name": "nuton-index-multi-modal",
+    "vectors_upserted": 212
+  }
+}

@@ -5,10 +5,10 @@ import concurrent.futures
 from functools import partial
 import random
 
-from chonkie_client import embed_query, embed_query_v2
+from chonkie_client import embed_query, embed_query_v2, embed_query_multimodal
 from pinecone_client import hybrid_search, rerank_results
 import openai_client
-from supabase_client import update_generated_content, get_generated_content_id, insert_quiz_set, update_generated_content_quiz, get_existing_quizzes
+from supabase_client import update_generated_content, get_generated_content_id, insert_quiz_set, update_generated_content_quiz, get_existing_quizzes, determine_shared_status
 
 # Define the quiz prompt template once
 QUIZ_PROMPT_TEMPLATE = '''
@@ -153,11 +153,12 @@ def get_question_distribution_text(mcq_count: int, tf_count: int) -> str:
 def generate_quiz(
     document_id: str,
     space_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     question_type: str = "both",  # one of "mcq", "true_false", or "both"
     num_questions: int = 10,
     acl_tags: Optional[List[str]] = None,
     rerank_top_n: int = 50,
-    use_openai_embeddings: bool = True,
+    use_openai_embeddings: bool = False,
     set_id: int = 1,
     title: Optional[str] = None,
     description: Optional[str] = None
@@ -167,6 +168,7 @@ def generate_quiz(
     Args:
         document_id: Filter results to this document ID.
         space_id: Filter results to this space ID.
+        user_id: UUID of the user creating the quiz (for ownership tracking).
         question_type: Type of questions to generate ("mcq", "true_false", or "both").
         num_questions: Total number of questions to generate.
         acl_tags: Optional list of ACL tags to filter by.
@@ -189,7 +191,7 @@ def generate_quiz(
     # Determine number of each question type
     mcq_count, tf_count = get_question_counts(question_type, num_questions)
     
-    logging.info(f"Generating quiz for document {document_id}, space_id: {space_id}, type: {question_type} ({mcq_count} MCQ, {tf_count} TF)")
+    logging.info(f"Generating quiz for document {document_id}, space_id: {space_id}, user_id: {user_id}, type: {question_type} ({mcq_count} MCQ, {tf_count} TF)")
     
     # Log the start of processing (no need to update generated_content.quiz since we're using quiz_sets)
     logging.info(f"Starting quiz generation for document {document_id}, set #{set_id}")
@@ -197,9 +199,9 @@ def generate_quiz(
     try:
         start_time = datetime.now()
         
-        # Embed query using OpenAI directly
+        # Embed query using multimodal embeddings (1024 dims) by default, or OpenAI (1536 dims) if specified
         query = "Extract all key concepts, facts, and relationships from this document for quiz generation."
-        query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query(query)
+        query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query_multimodal(query)
         if isinstance(query_embedded, dict) and "message" in query_embedded and "status" in query_embedded:
             error_msg = f"Query embedding failed: {query_embedded['message']}"
             logging.error(error_msg)
@@ -255,7 +257,12 @@ def generate_quiz(
         # Insert into quiz_sets table (primary storage)
         try:
             content_id = get_generated_content_id(document_id)
-            insert_quiz_set(content_id, quiz_obj, set_id, title, description)
+            
+            # Determine if this quiz set should be shared based on user ownership
+            is_shared = determine_shared_status(user_id, content_id)
+            
+            logging.info(f"Saving quiz set #{set_id} to quiz_sets table, created_by: {user_id}, is_shared: {is_shared}")
+            insert_quiz_set(content_id, quiz_obj, set_id, title, description, created_by=user_id, is_shared=is_shared)
             logging.info(f"Successfully saved quiz set #{set_id} to quiz_sets table")
         except Exception as e:
             logging.error(f"Error storing quiz set: {e}")
@@ -633,11 +640,12 @@ def is_duplicate_quiz_question(question: Dict[str, Any], existing_questions: Lis
 def regenerate_quiz(
     document_id: str,
     space_id: Optional[str] = None,
+    user_id: Optional[str] = None,
     question_type: str = "both",
     num_questions: int = 10,
     acl_tags: Optional[List[str]] = None,
     rerank_top_n: int = 50,
-    use_openai_embeddings: bool = True,
+    use_openai_embeddings: bool = False,
     title: Optional[str] = None,
     description: Optional[str] = None
 ) -> Dict[str, Any]:
@@ -647,6 +655,7 @@ def regenerate_quiz(
     Args:
         document_id: Filter results to this document ID.
         space_id: Filter results to this space ID.
+        user_id: UUID of the user creating the quiz (for ownership tracking).
         question_type: Type of questions to generate ("mcq", "true_false", or "both").
         num_questions: Number of additional questions to generate.
         acl_tags: Optional list of ACL tags to filter by.
@@ -669,7 +678,7 @@ def regenerate_quiz(
     # Determine number of each question type
     mcq_count, tf_count = get_question_counts(question_type, num_questions)
     
-    logging.info(f"Regenerating quiz for document {document_id}, space_id: {space_id}, type: {question_type} ({mcq_count} MCQ, {tf_count} TF)")
+    logging.info(f"Regenerating quiz for document {document_id}, space_id: {space_id}, user_id: {user_id}, type: {question_type} ({mcq_count} MCQ, {tf_count} TF)")
     
     # Get content_id for this document
     content_id = get_generated_content_id(document_id)
@@ -711,8 +720,8 @@ def regenerate_quiz(
         
         all_hits = []
         for query in enhanced_queries:
-            # Embed query using OpenAI directly
-            query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query(query)
+            # Embed query using multimodal embeddings (1024 dims) by default, or OpenAI (1536 dims) if specified
+            query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query_multimodal(query)
             if isinstance(query_embedded, dict) and "message" in query_embedded and "status" in query_embedded:
                 continue  # Skip this query if embedding fails
             
@@ -779,8 +788,11 @@ def regenerate_quiz(
         
         # Insert the new set to quiz_sets table
         try:
-            logging.info(f"Inserting new quiz set #{next_set_number} with {len(new_questions)} questions")
-            insert_quiz_set(content_id, quiz_obj, next_set_number, title, description)
+            # Determine if this quiz set should be shared based on user ownership
+            is_shared = determine_shared_status(user_id, content_id)
+            
+            logging.info(f"Inserting new quiz set #{next_set_number} with {len(new_questions)} questions, created_by: {user_id}, is_shared: {is_shared}")
+            insert_quiz_set(content_id, quiz_obj, next_set_number, title, description, created_by=user_id, is_shared=is_shared)
         except Exception as e:
             logging.error(f"Error storing new quiz set: {e}")
         
