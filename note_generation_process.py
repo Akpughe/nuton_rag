@@ -204,14 +204,6 @@ async def process_chunks_sequentially(
     markdown_parts = []
     context_memory = []  # Track previous sections for continuity
 
-    # Add document header
-    doc_header = generate_document_header(
-        organized_structure=organized_structure,
-        academic_level=academic_level,
-        doc_analysis=doc_analysis
-    )
-    markdown_parts.append(doc_header)
-
     # Process each chapter
     chapters = organized_structure.get("chapters", [])
 
