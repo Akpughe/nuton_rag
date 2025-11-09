@@ -199,9 +199,10 @@ def generate_quiz(
     try:
         start_time = datetime.now()
         
-        # Embed query using multimodal embeddings (1024 dims) by default, or OpenAI (1536 dims) if specified
+        # ALWAYS use multimodal embeddings (1024 dims) to match the document embeddings in Pinecone
+        # The use_openai_embeddings parameter is deprecated but kept for backwards compatibility
         query = "Extract all key concepts, facts, and relationships from this document for quiz generation."
-        query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query_multimodal(query)
+        query_embedded = embed_query_multimodal(query)
         if isinstance(query_embedded, dict) and "message" in query_embedded and "status" in query_embedded:
             error_msg = f"Query embedding failed: {query_embedded['message']}"
             logging.error(error_msg)
@@ -720,8 +721,9 @@ def regenerate_quiz(
         
         all_hits = []
         for query in enhanced_queries:
-            # Embed query using multimodal embeddings (1024 dims) by default, or OpenAI (1536 dims) if specified
-            query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query_multimodal(query)
+            # ALWAYS use multimodal embeddings (1024 dims) to match the document embeddings in Pinecone
+            # The use_openai_embeddings parameter is deprecated but kept for backwards compatibility
+            query_embedded = embed_query_multimodal(query)
             if isinstance(query_embedded, dict) and "message" in query_embedded and "status" in query_embedded:
                 continue  # Skip this query if embedding fails
             

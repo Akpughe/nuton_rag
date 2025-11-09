@@ -73,7 +73,7 @@ class QuizRequest(BaseModel):
     num_questions: int = 30
     acl_tags: Optional[str] = None
     rerank_top_n: int = 50
-    use_openai_embeddings: bool = True
+    use_openai_embeddings: bool = False  # Deprecated: Always uses multimodal embeddings (1024 dims) to match Pinecone index
     set_id: int = 1
     title: Optional[str] = None
     description: Optional[str] = None
