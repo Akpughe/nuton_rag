@@ -403,9 +403,6 @@ async def generate_chapter_notes(
     # Get level instructions
     level_instructions = get_level_instructions(academic_level)
 
-    # Generate chapter header
-    chapter_header = f"## 🔍 Chapter {chapter_num}: {chapter_title}\n\n"
-
     # Generate main chapter content using LLM
     try:
         logger.info(
@@ -449,7 +446,7 @@ async def generate_chapter_notes(
             diagram_section = str(diagram_section) if not isinstance(diagram_section, str) else diagram_section
             notes_content += "\n\n" + diagram_section
 
-    return chapter_header + notes_content
+    return notes_content
 
 
 async def generate_section_content(
