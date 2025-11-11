@@ -7,8 +7,15 @@ import random
 
 from chonkie_client import embed_query, embed_query_v2, embed_query_multimodal
 from pinecone_client import hybrid_search, rerank_results
-import openai_client
+from groq import Groq
+import os
+from dotenv import load_dotenv
 from supabase_client import update_generated_content, get_generated_content_id, insert_quiz_set, update_generated_content_quiz, get_existing_quizzes, determine_shared_status
+
+load_dotenv()
+
+# Initialize Groq client
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # Define the quiz prompt template once
 QUIZ_PROMPT_TEMPLATE = '''
@@ -463,9 +470,9 @@ def generate_quiz_batch(context: str, mcq_count: int, tf_count: int) -> List[Dic
         context=context
     )
     
-    # Call LLM
-    response = openai_client.client.chat.completions.create(
-        model="gpt-4o-mini",
+    # Call LLM with Groq
+    response = groq_client.chat.completions.create(
+        model="openai/gpt-oss-120b",
         messages=[
             {"role": "system", "content": "You are an expert quiz generator."},
             {"role": "user", "content": prompt}
@@ -969,9 +976,9 @@ def generate_quiz_batch_with_existing(
         context=context
     )
     
-    # Call LLM with enhanced instructions
-    response = openai_client.client.chat.completions.create(
-        model="gpt-4o-mini",
+    # Call LLM with enhanced instructions using Groq
+    response = groq_client.chat.completions.create(
+        model="openai/gpt-oss-120b",
         messages=[
             {"role": "system", "content": "You are an expert quiz generator specializing in creating unique, non-duplicate questions."},
             {"role": "user", "content": prompt}

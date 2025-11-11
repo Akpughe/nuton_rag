@@ -8,8 +8,15 @@ from functools import partial
 from chonkie_client import embed_query, embed_query_v2, embed_query_multimodal
 from pinecone_client import hybrid_search
 from pinecone_client import rerank_results
-import openai_client
+from groq import Groq
+import os
+from dotenv import load_dotenv
 from supabase_client import update_generated_content, get_generated_content_id, insert_flashcard_set, get_existing_flashcards, determine_shared_status
+
+load_dotenv()
+
+# Initialize Groq client
+groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 def generate_flashcards(
     document_id: str,
@@ -354,9 +361,6 @@ def process_batch(
                 except Exception as e:
                     logging.error(f"Error during incremental database update: {e}")
     
-    # Generate flashcards using the streaming API
-    from openai import Stream
-    
     # Add additional instruction if we have existing flashcards
     duplicate_avoidance_prompt = ""
     if existing_flashcards:
@@ -425,9 +429,9 @@ INPUT MATERIAL:
     card_count = 0
     pending_batch = []
     
-    # Start the streaming generation
-    response = openai_client.client.chat.completions.create(
-        model="gpt-4o",
+    # Start the streaming generation with Groq
+    response = groq_client.chat.completions.create(
+        model="openai/gpt-oss-120b",
         messages=[
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": FLASHCARD_PROMPT}
@@ -471,7 +475,7 @@ INPUT MATERIAL:
         card_callback(pending_batch)
     
     # Final parsing of the complete response to ensure we catch everything
-    all_cards = openai_client.parse_flashcards(response_text)
+    all_cards = parse_flashcards_response(response_text)
     
     # Filter out duplicates of existing flashcards if needed
     if existing_flashcards:
@@ -479,6 +483,55 @@ INPUT MATERIAL:
     
     logging.info(f"Generated {len(all_cards)} flashcards from batch {batch_number}")
     return all_cards
+
+
+def parse_flashcards_response(response_text: str) -> List[Dict[str, str]]:
+    """
+    Parse the raw text response from Groq into structured flashcard objects.
+    
+    Args:
+        response_text: The raw text response from Groq.
+        
+    Returns:
+        List of flashcard objects with question, answer, hint, and explanation.
+    """
+    flashcards = []
+    # Split by the flashcard separator (triple dash)
+    cards_raw = response_text.split("---")
+    
+    current_card = {}
+    for section in cards_raw:
+        section = section.strip()
+        if not section:
+            continue
+            
+        # Check if this section has flashcard fields
+        has_question = "Question:" in section
+        has_answer = "Answer:" in section
+        
+        if has_question and has_answer:
+            current_card = {}
+            
+            # Extract each field
+            for line in section.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                    
+                if line.startswith("Question:"):
+                    current_card["question"] = line.replace("Question:", "", 1).strip()
+                elif line.startswith("Answer:"):
+                    current_card["answer"] = line.replace("Answer:", "", 1).strip()
+                elif line.startswith("Hint:"):
+                    current_card["hint"] = line.replace("Hint:", "", 1).strip()
+                elif line.startswith("Explanation:"):
+                    current_card["explanation"] = line.replace("Explanation:", "", 1).strip()
+            
+            # Only add complete cards
+            if all(k in current_card for k in ["question", "answer", "hint", "explanation"]):
+                flashcards.append(current_card)
+    
+    return flashcards
 
 
 def parse_streaming_content(text: str) -> List[Dict[str, str]]:
