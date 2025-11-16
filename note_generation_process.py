@@ -39,16 +39,18 @@ async def generate_comprehensive_notes(
     include_diagrams: bool = True,
     include_mermaid: bool = True,
     max_chunks: int = 2000,
+    target_coverage: float = 0.85,
+    enable_gap_filling: bool = True,
     acl_tags: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     """
     Generate comprehensive study notes from a document.
 
     This is the main entry point for note generation. It orchestrates the entire process:
-    1. Fetch all document chunks
+    1. Fetch all document chunks with intelligent gap-filling
     2. Organize chunks by hierarchy
     3. Analyze document structure
-    4. Generate notes section by section
+    4. Generate notes section by section (handles large sections via chunking)
     5. Add diagrams and visualizations
     6. Validate and format output
 
@@ -60,6 +62,8 @@ async def generate_comprehensive_notes(
         include_diagrams: Whether to include PDF diagrams
         include_mermaid: Whether to generate mermaid diagrams
         max_chunks: Maximum chunks to retrieve
+        target_coverage: Target coverage percentage (0.0-1.0, default: 0.85)
+        enable_gap_filling: Enable intelligent gap-filling (default: True)
         acl_tags: Optional ACL tags
 
     Returns:
@@ -70,22 +74,25 @@ async def generate_comprehensive_notes(
                 "academic_level": "graduate",
                 "total_pages": 120,
                 "total_chapters": 8,
+                "text_coverage_percentage": 0.95,
                 ...
             },
             "status": "success"
         }
     """
     start_time = time.time()
-    logger.info(f"🚀 Starting note generation for document {document_id}, level={academic_level}")
+    logger.info(f"🚀 Starting note generation for document {document_id}, level={academic_level}, target_coverage={target_coverage:.0%}")
 
     try:
-        # Phase 1: Fetch all chunks
-        logger.info("📥 Gathering every snippet from the document...")
+        # Phase 1: Fetch all chunks with gap-filling for comprehensive coverage
+        logger.info("📥 Gathering every snippet from the document with gap-filling...")
         chunks = fetch_all_document_chunks(
             document_id=document_id,
             space_id=space_id,
             max_chunks=max_chunks,
-            acl_tags=acl_tags
+            acl_tags=acl_tags,
+            target_coverage=target_coverage,
+            enable_gap_filling=enable_gap_filling
         )
 
         if not chunks:
@@ -153,13 +160,19 @@ async def generate_comprehensive_notes(
             "diagrams_included": len(diagrams) if include_diagrams else 0,
             "generation_time_seconds": round(generation_time, 2),
             "coverage_score": validation_result.get("coverage_score", 0.0),
+            "text_coverage_percentage": validation_result.get("text_coverage_percentage", 0.0),
+            "coverage_gaps": len(validation_result.get("text_coverage_details", {}).get("gaps", [])),
             "notes_length_chars": len(notes_markdown),
+            "target_coverage": target_coverage,
+            "gap_filling_enabled": enable_gap_filling,
             "generated_at": datetime.now().isoformat()
         }
 
         logger.info(f"✅ Note generation complete in {generation_time:.2f}s")
         logger.info(f"   - Length: {len(notes_markdown)} characters")
         logger.info(f"   - Coverage score: {validation_result.get('coverage_score', 0):.0%}")
+        logger.info(f"   - Text coverage: {validation_result.get('text_coverage_percentage', 0):.0%}")
+        logger.info(f"   - Coverage gaps: {len(validation_result.get('text_coverage_details', {}).get('gaps', []))}")
 
         return {
             "notes_markdown": notes_markdown,
@@ -458,6 +471,7 @@ async def generate_section_content(
 ) -> str:
     """
     Generate detailed notes for a section using LLM.
+    Handles large content by intelligently chunking when necessary.
 
     Args:
         content: Section content text
@@ -469,23 +483,62 @@ async def generate_section_content(
     Returns:
         Generated markdown notes
     """
+    # Smart chunking for very large content (>80k chars)
+    # This ensures complete coverage while respecting LLM context limits
+    max_chunk_size = 80000  # Increased from 15,000 to 80,000 for better coverage
+
+    if len(content) <= max_chunk_size:
+        # Content fits in single request - process normally
+        return await _generate_single_section(
+            content=content,
+            section_title=section_title,
+            academic_level=academic_level,
+            level_instructions=level_instructions,
+            previous_context=previous_context
+        )
+    else:
+        # Large content - split intelligently and process in parts
+        logger.info(f"   📏 Large section ({len(content):,} chars) - processing in multiple parts...")
+        return await _generate_large_section_in_parts(
+            content=content,
+            section_title=section_title,
+            academic_level=academic_level,
+            level_instructions=level_instructions,
+            previous_context=previous_context,
+            max_chunk_size=max_chunk_size
+        )
+
+
+async def _generate_single_section(
+    content: str,
+    section_title: str,
+    academic_level: str,
+    level_instructions: str,
+    previous_context: str
+) -> str:
+    """Generate notes for a single section that fits in one LLM call."""
     # Build prompt
     prompt = get_prompt(
         "section_notes",
         section_title=section_title,
         academic_level=academic_level,
-        section_content=content[:15000],  # Limit for LLM context
+        section_content=content,  # NO TRUNCATION - send full content
         previous_context=previous_context,
         level_instructions=level_instructions
     )
 
     # Try Groq first (faster)
     try:
+        # Note: groq_generate takes (query, context_chunks, system_prompt, model)
+        # For note generation, we pass the full prompt as query with empty context
         result = await asyncio.to_thread(
             groq_generate,
-            prompt,
-            "You are an expert academic note-taker creating comprehensive study notes.",
-            "openai/gpt-oss-120b"
+            prompt,  # query
+            [],  # context_chunks (empty - prompt contains all context)
+            "You are an expert academic note-taker creating comprehensive study notes.",  # system_prompt
+            "openai/gpt-oss-120b",  # model
+            None,  # conversation_history
+            16000  # max_tokens - increased for comprehensive coverage
         )
         # Ensure result is a string (groq might return tuple)
         if isinstance(result, tuple):
@@ -503,13 +556,121 @@ async def generate_section_content(
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.3,
-                max_tokens=4000
+                max_tokens=16000  # Increased from 4,000 to 16,000 for comprehensive coverage
             )
             return response.choices[0].message.content
         except Exception as e2:
             logger.error(f"OpenAI also failed: {e2}")
             # Last resort: return formatted content
             return f"### 📖 {section_title}\n\n{content}\n"
+
+
+async def _generate_large_section_in_parts(
+    content: str,
+    section_title: str,
+    academic_level: str,
+    level_instructions: str,
+    previous_context: str,
+    max_chunk_size: int
+) -> str:
+    """
+    Process very large sections by splitting into logical parts.
+    Maintains context across parts for coherent notes.
+    """
+    # Split content into manageable chunks (aim for paragraph boundaries)
+    chunks = _split_content_intelligently(content, max_chunk_size)
+    logger.info(f"   🔀 Split into {len(chunks)} parts for processing")
+
+    # Process each chunk sequentially, maintaining context
+    part_notes = []
+    cumulative_context = previous_context
+
+    for idx, chunk in enumerate(chunks, 1):
+        logger.info(f"   📝 Processing part {idx}/{len(chunks)} ({len(chunk):,} chars)...")
+
+        # Generate notes for this part
+        part_title = f"{section_title} (Part {idx}/{len(chunks)})" if len(chunks) > 1 else section_title
+
+        part_note = await _generate_single_section(
+            content=chunk,
+            section_title=part_title,
+            academic_level=academic_level,
+            level_instructions=level_instructions,
+            previous_context=cumulative_context
+        )
+
+        part_notes.append(part_note)
+
+        # Update context for next part (keep it concise)
+        cumulative_context += f"\n[Previous part: {part_title} covered...]"
+
+    # Combine all parts
+    combined_notes = "\n\n".join(part_notes)
+    logger.info(f"   ✅ Combined {len(chunks)} parts into {len(combined_notes):,} chars of notes")
+
+    return combined_notes
+
+
+def _split_content_intelligently(content: str, max_chunk_size: int) -> list[str]:
+    """
+    Split large content into chunks at natural boundaries (paragraphs).
+
+    Args:
+        content: Text to split
+        max_chunk_size: Maximum size per chunk
+
+    Returns:
+        List of content chunks
+    """
+    if len(content) <= max_chunk_size:
+        return [content]
+
+    # Split by double newlines (paragraph boundaries)
+    paragraphs = content.split('\n\n')
+
+    chunks = []
+    current_chunk = []
+    current_size = 0
+
+    for para in paragraphs:
+        para_size = len(para)
+
+        # If single paragraph is larger than max_chunk_size, split it by sentences
+        if para_size > max_chunk_size:
+            # If we have accumulated content, save it first
+            if current_chunk:
+                chunks.append('\n\n'.join(current_chunk))
+                current_chunk = []
+                current_size = 0
+
+            # Split large paragraph by sentences
+            sentences = para.split('. ')
+            for sentence in sentences:
+                if current_size + len(sentence) > max_chunk_size and current_chunk:
+                    chunks.append('\n\n'.join(current_chunk))
+                    current_chunk = [sentence]
+                    current_size = len(sentence)
+                else:
+                    current_chunk.append(sentence)
+                    current_size += len(sentence)
+
+        # Normal case: add paragraph if it fits
+        elif current_size + para_size <= max_chunk_size:
+            current_chunk.append(para)
+            current_size += para_size + 2  # +2 for \n\n
+
+        # Paragraph doesn't fit - start new chunk
+        else:
+            if current_chunk:
+                chunks.append('\n\n'.join(current_chunk))
+            current_chunk = [para]
+            current_size = para_size
+
+    # Add remaining content
+    if current_chunk:
+        chunks.append('\n\n'.join(current_chunk))
+
+    return chunks
 
 
 def build_context_string(context_memory: List[Dict]) -> str:
@@ -693,9 +854,12 @@ async def generate_mermaid_for_content(content: str, academic_level: str) -> Lis
         try:
             result = await asyncio.to_thread(
                 groq_generate,
-                prompt,
-                "You are a diagram expert. Generate mermaid diagram code or return NO_DIAGRAM.",
-                "openai/gpt-oss-120b"
+                prompt,  # query
+                [],  # context_chunks
+                "You are a diagram expert. Generate mermaid diagram code or return NO_DIAGRAM.",  # system_prompt
+                "openai/gpt-oss-120b",  # model
+                None,  # conversation_history
+                2000  # max_tokens - sufficient for diagrams
             )
             # Ensure result is a string (groq might return tuple)
             if isinstance(result, tuple):
@@ -710,7 +874,7 @@ async def generate_mermaid_for_content(content: str, academic_level: str) -> Lis
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.2,
-                max_tokens=800
+                max_tokens=2000  # Increased from 800 for complex diagrams
             )
             result = response.choices[0].message.content
 

@@ -2186,6 +2186,8 @@ async def generate_notes_endpoint(
     include_diagrams: bool = Form(True),
     include_mermaid: bool = Form(True),
     max_chunks: int = Form(2000),
+    target_coverage: float = Form(0.85),
+    enable_gap_filling: bool = Form(True),
     acl_tags: Optional[str] = Form(None)
 ) -> JSONResponse:
     """
@@ -2206,6 +2208,9 @@ async def generate_notes_endpoint(
         include_diagrams: Whether to include diagrams from PDF (default: True)
         include_mermaid: Whether to generate mermaid diagrams (default: True)
         max_chunks: Maximum number of chunks to retrieve (default: 2000)
+        target_coverage: Target coverage percentage for document (default: 0.85 = 85%)
+            Higher values ensure more complete coverage but take longer
+        enable_gap_filling: Whether to enable intelligent gap-filling to reach target coverage (default: True)
         acl_tags: Optional comma-separated ACL tags
 
     Returns:
@@ -2220,6 +2225,7 @@ async def generate_notes_endpoint(
                 "diagrams_included": 12,
                 "generation_time_seconds": 145.2,
                 "coverage_score": 0.98,
+                "text_coverage_percentage": 0.95,
                 "notes_length_chars": 50000,
                 "generated_at": "2025-11-04T..."
             },
@@ -2233,6 +2239,7 @@ async def generate_notes_endpoint(
             academic_level=graduate
             include_diagrams=true
             include_mermaid=true
+            target_coverage=0.90
     """
     from note_generation_process import generate_comprehensive_notes
 
@@ -2244,11 +2251,18 @@ async def generate_notes_endpoint(
             "status": "error"
         }, status_code=400)
 
+    # Validate target_coverage
+    if not 0.0 <= target_coverage <= 1.0:
+        return JSONResponse({
+            "error": f"Invalid target_coverage. Must be between 0.0 and 1.0 (got {target_coverage})",
+            "status": "error"
+        }, status_code=400)
+
     # Parse ACL tags
     acl_list = [tag.strip() for tag in acl_tags.split(",")] if acl_tags else None
 
     try:
-        logger.info(f"🚀 Generating notes for document {document_id}, level={academic_level}")
+        logger.info(f"🚀 Generating notes for document {document_id}, level={academic_level}, target_coverage={target_coverage:.0%}")
 
         # Generate notes
         result = await generate_comprehensive_notes(
@@ -2259,6 +2273,8 @@ async def generate_notes_endpoint(
             include_diagrams=include_diagrams,
             include_mermaid=include_mermaid,
             max_chunks=max_chunks,
+            target_coverage=target_coverage,
+            enable_gap_filling=enable_gap_filling,
             acl_tags=acl_list
         )
 
