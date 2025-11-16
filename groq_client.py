@@ -12,7 +12,8 @@ def generate_answer(
     context_chunks: List[Dict],
     system_prompt: str,
     model: str = "meta-llama/llama-4-scout-17b-16e-instruct",
-    conversation_history: Optional[List[Dict[str, str]]] = None
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+    max_tokens: Optional[int] = None
 ) -> Tuple[str, List[Dict]]:
     """
     Generate an answer using Groq Llama 4, given a query and context chunks.
@@ -21,13 +22,14 @@ def generate_answer(
         context_chunks: List of dicts with 'text' and citation info.
         system_prompt: System prompt for LLM.
         model: Model name (default: Llama 4 Scout).
+        max_tokens: Maximum tokens to generate (default: None for model's max).
     Returns:
         Tuple of (answer string, list of cited chunks/passages).
     Raises:
         Exception if the API call fails.
     """
     client = Groq(api_key=GROQ_API_KEY)
-    
+
     # Extract text from either direct "text" field or from "metadata.text"
     context_texts = []
     for chunk in context_chunks:
@@ -38,7 +40,7 @@ def generate_answer(
         else:
             # Add an empty string as fallback to avoid breaking the joining operation
             context_texts.append("")
-    
+
     context = "\n\n".join(context_texts)
 
     # Build messages array with conversation history
@@ -50,13 +52,20 @@ def generate_answer(
 
     # Add current query with RAG context
     messages.append({"role": "user", "content": f"{query}\n\nContext:\n{context}"})
-    
+
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            stream=False
-        )
+        # Build completion parameters
+        completion_params = {
+            "model": model,
+            "messages": messages,
+            "stream": False
+        }
+
+        # Add max_tokens if specified
+        if max_tokens is not None:
+            completion_params["max_tokens"] = max_tokens
+
+        response = client.chat.completions.create(**completion_params)
         answer = response.choices[0].message.content
         return answer, context_chunks
     except Exception as e:

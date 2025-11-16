@@ -126,9 +126,12 @@ def sort_chunks_by_position(chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 page_num = 0
 
         # Get start index (for chunks within same page)
-        start_idx = chunk.get("start_index", 0)
+        start_idx = metadata.get("start_index", 0)
         if not isinstance(start_idx, (int, float)):
-            start_idx = 0
+            try:
+                start_idx = int(start_idx)
+            except (ValueError, TypeError):
+                start_idx = 0
 
         return (chapter_num, page_num, start_idx)
 
