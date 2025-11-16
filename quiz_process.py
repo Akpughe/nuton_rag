@@ -6,7 +6,7 @@ from functools import partial
 import random
 
 from chonkie_client import embed_query, embed_query_v2, embed_query_multimodal
-from pinecone_client import hybrid_search, rerank_results
+from pinecone_client import hybrid_search, fetch_all_document_chunks, rerank_results
 from groq import Groq
 import os
 from dotenv import load_dotenv
@@ -164,6 +164,9 @@ def generate_quiz(
     question_type: str = "both",  # one of "mcq", "true_false", or "both"
     num_questions: int = 10,
     acl_tags: Optional[List[str]] = None,
+    max_chunks: int = 1000,
+    target_coverage: float = 0.80,
+    enable_gap_filling: bool = True,
     rerank_top_n: int = 50,
     use_openai_embeddings: bool = False,
     set_id: int = 1,
@@ -171,7 +174,11 @@ def generate_quiz(
     description: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Generates a quiz from a document using hybrid search, rerank, and GPT-4o.
+    Generates a quiz from a document with comprehensive coverage across the entire document.
+
+    Uses fetch_all_document_chunks with gap-filling to ensure quiz questions are distributed
+    throughout the document, not just from semantically similar sections.
+
     Args:
         document_id: Filter results to this document ID.
         space_id: Filter results to this space ID.
@@ -179,13 +186,16 @@ def generate_quiz(
         question_type: Type of questions to generate ("mcq", "true_false", or "both").
         num_questions: Total number of questions to generate.
         acl_tags: Optional list of ACL tags to filter by.
-        rerank_top_n: Number of results to rerank.
-        use_openai_embeddings: Whether to use OpenAI directly for embeddings.
+        max_chunks: Maximum chunks to retrieve (default: 1000).
+        target_coverage: Target coverage percentage (0.0-1.0, default: 0.80).
+        enable_gap_filling: Enable intelligent gap-filling (default: True).
+        rerank_top_n: Number of results to rerank (deprecated).
+        use_openai_embeddings: Whether to use OpenAI directly for embeddings (deprecated).
         set_id: Quiz set number.
         title: Optional quiz title.
         description: Optional quiz description.
     Returns:
-        Dict with quiz and status.
+        Dict with quiz, status, and coverage metadata.
     """
     # Validate question_type
     if question_type not in ["mcq", "true_false", "both"]:
@@ -198,46 +208,49 @@ def generate_quiz(
     # Determine number of each question type
     mcq_count, tf_count = get_question_counts(question_type, num_questions)
     
-    logging.info(f"Generating quiz for document {document_id}, space_id: {space_id}, user_id: {user_id}, type: {question_type} ({mcq_count} MCQ, {tf_count} TF)")
-    
+    logging.info(f"Generating quiz for document {document_id}, space_id: {space_id}, user_id: {user_id}, type: {question_type} ({mcq_count} MCQ, {tf_count} TF), target_coverage: {target_coverage:.0%}")
+
     # Log the start of processing (no need to update generated_content.quiz since we're using quiz_sets)
     logging.info(f"Starting quiz generation for document {document_id}, set #{set_id}")
-    
+
     try:
         start_time = datetime.now()
-        
-        # ALWAYS use multimodal embeddings (1024 dims) to match the document embeddings in Pinecone
-        # The use_openai_embeddings parameter is deprecated but kept for backwards compatibility
-        query = "Extract all key concepts, facts, and relationships from this document for quiz generation."
-        query_embedded = embed_query_multimodal(query)
-        if isinstance(query_embedded, dict) and "message" in query_embedded and "status" in query_embedded:
-            error_msg = f"Query embedding failed: {query_embedded['message']}"
-            logging.error(error_msg)
-            return {"quiz": [], "status": "error", "message": error_msg}
-        query_emb = query_embedded["embedding"]
-        query_sparse = query_embedded.get("sparse")
-        
-        # Search using hybrid search to gather relevant content
-        hits = hybrid_search(
-            query_emb=query_emb,
-            query_sparse=query_sparse,
-            top_k=rerank_top_n,
-            doc_id=document_id,
+
+        # Fetch all chunks with gap-filling for comprehensive coverage
+        # This ensures quiz questions are distributed throughout the document
+        logging.info(f"Fetching all chunks with target coverage: {target_coverage:.0%}, gap_filling: {enable_gap_filling}")
+
+        chunks = fetch_all_document_chunks(
+            document_id=document_id,
             space_id=space_id,
-            acl_tags=acl_tags
+            max_chunks=max_chunks,
+            acl_tags=acl_tags,
+            target_coverage=target_coverage,
+            enable_gap_filling=enable_gap_filling
         )
-        if not hits:
-            error_msg = "No relevant content found."
+
+        if not chunks:
+            error_msg = "No chunks found for document."
             return {"quiz": [], "status": "error", "message": error_msg}
-        
-        reranked = rerank_results(query, hits, top_n=rerank_top_n)
+
+        logging.info(f"Retrieved {len(chunks)} chunks (target coverage: {target_coverage:.0%})")
+
+        # Calculate actual coverage from chunks
+        from pinecone_client import calculate_coverage_from_chunks
+        coverage_result = calculate_coverage_from_chunks(chunks)
+        actual_coverage = coverage_result.get("coverage_percentage", 0.0)
+        coverage_gaps = len(coverage_result.get("gaps", []))
+
+        logging.info(f"Actual coverage: {actual_coverage:.0%}, gaps: {coverage_gaps}")
+
+        # Extract text from chunks (already sorted by position: chapter→page→start_index)
         context_chunks = []
-        for item in reranked:
-            if "metadata" in item and "text" in item["metadata"]:
-                context_chunks.append(item["metadata"]["text"])
-        
+        for chunk in chunks:
+            if "metadata" in chunk and "text" in chunk["metadata"]:
+                context_chunks.append(chunk["metadata"]["text"])
+
         if not context_chunks:
-            error_msg = "No text content found in search results."
+            error_msg = "No text content found in chunks."
             return {"quiz": [], "status": "error", "message": error_msg}
         
         # Generate quiz questions in parallel batches
@@ -278,7 +291,8 @@ def generate_quiz(
         
         elapsed_time = (datetime.now() - start_time).total_seconds()
         logging.info(f"Quiz generation completed in {elapsed_time:.2f} seconds. Generated {len(quiz_questions)} questions.")
-        
+        logging.info(f"Coverage: {actual_coverage:.0%}, chunks processed: {len(chunks)}, gaps: {coverage_gaps}")
+
         return {
             "quiz": quiz_obj,
             "status": "success",
@@ -287,7 +301,14 @@ def generate_quiz(
             "question_type": question_type,
             "mcq_count": mcq_count,
             "tf_count": tf_count,
-            "set_number": set_id
+            "set_number": set_id,
+            "coverage_metadata": {
+                "chunks_processed": len(chunks),
+                "text_coverage_percentage": actual_coverage,
+                "coverage_gaps": coverage_gaps,
+                "target_coverage": target_coverage,
+                "gap_filling_enabled": enable_gap_filling
+            }
         }
     except Exception as e:
         logging.exception(f"Error generating quiz: {e}")
