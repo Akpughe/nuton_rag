@@ -540,7 +540,8 @@ def parse_quiz_questions(text: str) -> List[Dict[str, Any]]:
         qtype = type_match.group(1).lower() if type_match else None
 
         # Parse question - use DOTALL to match multiline content, strip markdown
-        q_match = re.search(r'Question:\s*(.+?)(?=\n[A-D]\.|Answer:|Explanation:|Type:|$)', block, re.DOTALL)
+        # Handle both uppercase and lowercase option letters in boundary
+        q_match = re.search(r'Question:\s*(.+?)(?=\n[A-Da-d]\.|Answer:|Explanation:|Type:|Options:|$)', block, re.DOTALL | re.IGNORECASE)
         if q_match:
             question_text = q_match.group(1).strip().replace('\n', ' ')
             # Strip markdown formatting from content
@@ -549,12 +550,14 @@ def parse_quiz_questions(text: str) -> List[Dict[str, Any]]:
             question_text = None
 
         # Parse options (for MCQ) - handle multiline options, strip markdown
+        # Case-insensitive to handle both A./a., B./b., etc.
         options = []
         if qtype == 'mcq':
             for opt in ['A', 'B', 'C', 'D']:
                 # Match from option letter to next option, Answer, or Explanation
-                opt_pattern = rf'{opt}\.\s*(.+?)(?=\n[A-D]\.|Answer:|Explanation:|Type:|$)'
-                opt_match = re.search(opt_pattern, block, re.DOTALL)
+                # Case-insensitive to handle lowercase option letters
+                opt_pattern = rf'{opt}\.\s*(.+?)(?=\n[A-Da-d]\.|Answer:|Explanation:|Type:|$)'
+                opt_match = re.search(opt_pattern, block, re.DOTALL | re.IGNORECASE)
                 if opt_match:
                     opt_text = opt_match.group(1).strip().replace('\n', ' ')
                     # Strip markdown formatting
@@ -563,7 +566,19 @@ def parse_quiz_questions(text: str) -> List[Dict[str, Any]]:
 
         # Parse answer - keep this single line as answers should be short
         ans_match = re.search(r'Answer:\s*([A-D]|True|False)', block, re.IGNORECASE)
-        correct_option = ans_match.group(1) if ans_match else None
+        if ans_match:
+            raw_answer = ans_match.group(1)
+            # Normalize answer format for consistency
+            if raw_answer.upper() in ['A', 'B', 'C', 'D']:
+                correct_option = raw_answer.upper()  # MCQ: always uppercase
+            elif raw_answer.lower() == 'true':
+                correct_option = 'True'  # Boolean: capitalize
+            elif raw_answer.lower() == 'false':
+                correct_option = 'False'  # Boolean: capitalize
+            else:
+                correct_option = raw_answer  # Fallback: keep as-is
+        else:
+            correct_option = None
 
         # Parse explanation - handle multiline explanations, strip markdown
         exp_match = re.search(r'Explanation:\s*(.+?)(?=\n(?:Type:|Question:|---)|$)', block, re.DOTALL)
@@ -576,6 +591,20 @@ def parse_quiz_questions(text: str) -> List[Dict[str, Any]]:
 
         # Create question object if we have minimum required fields
         if qtype and question_text and correct_option:
+            # Additional validation for MCQ questions
+            if qtype == 'mcq':
+                # Ensure we have at least 2 options (ideally 4)
+                if len(options) < 2:
+                    logging.warning(f"Skipping MCQ question with insufficient options ({len(options)}): {question_text[:50]}...")
+                    continue
+
+                # Verify correct_option exists in options
+                correct_key = correct_option.lower()
+                option_keys = [list(opt.keys())[0] for opt in options]
+                if correct_key not in option_keys:
+                    logging.warning(f"Skipping MCQ question - correct answer '{correct_option}' not in options {option_keys}: {question_text[:50]}...")
+                    continue
+
             # Fill in explanation if missing
             if not explanation:
                 explanation = "Review the material for context."
