@@ -6,7 +6,7 @@ import concurrent.futures
 from functools import partial
 
 from chonkie_client import embed_query, embed_query_v2, embed_query_multimodal
-from pinecone_client import hybrid_search
+from pinecone_client import hybrid_search, fetch_all_document_chunks
 from pinecone_client import rerank_results
 from groq import Groq
 import os
@@ -24,25 +24,34 @@ def generate_flashcards(
     user_id: Optional[str] = None,
     num_questions: Optional[int] = None,
     acl_tags: Optional[List[str]] = None,
+    max_chunks: int = 1000,
+    target_coverage: float = 0.80,
+    enable_gap_filling: bool = True,
     rerank_top_n: int = 50,
     use_openai_embeddings: bool = False
 ) -> Dict[str, Any]:
     """
-    Generates flashcards from a document using hybrid search, rerank, and GPT-4o.
-    
+    Generates flashcards from a document with comprehensive coverage across the entire document.
+
+    Uses fetch_all_document_chunks with gap-filling to ensure flashcards are generated
+    from throughout the document, not just semantically similar sections.
+
     Args:
         document_id: Filter results to this document ID.
         space_id: Filter results to this space ID.
         user_id: UUID of the user creating flashcards (for ownership tracking).
         num_questions: Optional number of flashcards to generate.
         acl_tags: Optional list of ACL tags to filter by.
-        rerank_top_n: Number of results to rerank.
-        use_openai_embeddings: Whether to use OpenAI directly for embeddings.
-    
+        max_chunks: Maximum chunks to retrieve (default: 1000).
+        target_coverage: Target coverage percentage (0.0-1.0, default: 0.80).
+        enable_gap_filling: Enable intelligent gap-filling (default: True).
+        rerank_top_n: Number of results to rerank (deprecated, kept for compatibility).
+        use_openai_embeddings: Whether to use OpenAI directly for embeddings (deprecated).
+
     Returns:
-        Dict with flashcards and status.
+        Dict with flashcards, status, and coverage metadata.
     """
-    logging.info(f"Generating flashcards for document {document_id}, space_id: {space_id}, user_id: {user_id}")
+    logging.info(f"Generating flashcards for document {document_id}, space_id: {space_id}, user_id: {user_id}, target_coverage: {target_coverage:.0%}")
     
     # Initialize status in database with empty set
     update_generated_content(
@@ -53,48 +62,42 @@ def generate_flashcards(
     try:
         start_time = datetime.now()
 
-        # Create a query to gather content for flashcards
-        query = "Extract comprehensive information from this document including all key concepts, facts, definitions, examples, relationships between topics, methodologies, processes, theories, historical context, practical applications, edge cases, and underlying principles. Cover all sections and subtopics thoroughly to ensure complete coverage of the material for high-quality and diverse flashcard generation."
+        # Fetch all chunks with gap-filling for comprehensive coverage
+        # This ensures flashcards cover the entire document, not just semantically similar sections
+        logging.info(f"Fetching all chunks with target coverage: {target_coverage:.0%}, gap_filling: {enable_gap_filling}")
 
-        # Embed query using multimodal embeddings (1024 dims) by default, or OpenAI (1536 dims) if specified
-        query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query_multimodal(query)
-        
-        # Check for embedding errors
-        if isinstance(query_embedded, dict) and "message" in query_embedded and "status" in query_embedded:
-            error_msg = f"Query embedding failed: {query_embedded['message']}"
-            logging.error(error_msg)
-            update_error_status(document_id, error_msg)
-            return {"flashcards": [], "status": "error", "message": error_msg}
-        
-        query_emb = query_embedded["embedding"]
-        query_sparse = query_embedded.get("sparse")
-        
-        # Search using hybrid search to gather relevant content
-        hits = hybrid_search(
-            query_emb=query_emb,
-            query_sparse=query_sparse,
-            top_k=rerank_top_n,
-            doc_id=document_id,
+        chunks = fetch_all_document_chunks(
+            document_id=document_id,
             space_id=space_id,
-            acl_tags=acl_tags
+            max_chunks=max_chunks,
+            acl_tags=acl_tags,
+            target_coverage=target_coverage,
+            enable_gap_filling=enable_gap_filling
         )
-        
-        if not hits:
-            error_msg = "No relevant content found."
+
+        if not chunks:
+            error_msg = "No chunks found for document."
             update_error_status(document_id, error_msg)
             return {"flashcards": [], "status": "error", "message": error_msg}
-        
-        # Rerank results to get most relevant content
-        reranked = rerank_results(query, hits, top_n=rerank_top_n)
-        
-        # Prepare context for flashcard generation
+
+        logging.info(f"Retrieved {len(chunks)} chunks (target coverage: {target_coverage:.0%})")
+
+        # Calculate actual coverage from chunks
+        from pinecone_client import calculate_coverage_from_chunks
+        coverage_result = calculate_coverage_from_chunks(chunks)
+        actual_coverage = coverage_result.get("coverage_percentage", 0.0)
+        coverage_gaps = len(coverage_result.get("gaps", []))
+
+        logging.info(f"Actual coverage: {actual_coverage:.0%}, gaps: {coverage_gaps}")
+
+        # Extract text from chunks (already sorted by position: chapter→page→start_index)
         context_chunks = []
-        for item in reranked:
-            if "metadata" in item and "text" in item["metadata"]:
-                context_chunks.append(item["metadata"]["text"])
-        
+        for chunk in chunks:
+            if "metadata" in chunk and "text" in chunk["metadata"]:
+                context_chunks.append(chunk["metadata"]["text"])
+
         if not context_chunks:
-            error_msg = "No text content found in search results."
+            error_msg = "No text content found in chunks."
             update_error_status(document_id, error_msg)
             return {"flashcards": [], "status": "error", "message": error_msg}
         
@@ -149,18 +152,26 @@ def generate_flashcards(
         
         elapsed_time = (datetime.now() - start_time).total_seconds()
         logging.info(f"Flashcard generation completed in {elapsed_time:.2f} seconds. Generated {len(flashcards)} flashcards.")
-        
+        logging.info(f"Coverage: {actual_coverage:.0%}, chunks processed: {len(chunks)}, gaps: {coverage_gaps}")
+
         return {
             "flashcards": [
                 {
                     "set_id": shared_state["set_id"],
                     "cards": flashcards
                 }
-            ], 
-            "status": "success", 
-            "elapsed_seconds": elapsed_time, 
-            "total_flashcards": len(flashcards), 
-            "num_questions": num_questions
+            ],
+            "status": "success",
+            "elapsed_seconds": elapsed_time,
+            "total_flashcards": len(flashcards),
+            "num_questions": num_questions,
+            "coverage_metadata": {
+                "chunks_processed": len(chunks),
+                "text_coverage_percentage": actual_coverage,
+                "coverage_gaps": coverage_gaps,
+                "target_coverage": target_coverage,
+                "gap_filling_enabled": enable_gap_filling
+            }
         }
         
     except Exception as e:
@@ -476,11 +487,22 @@ INPUT MATERIAL:
     
     # Final parsing of the complete response to ensure we catch everything
     all_cards = parse_flashcards_response(response_text)
-    
+
+    # DIAGNOSTIC: Log raw response if we got 0 cards to debug parsing issues
+    if len(all_cards) == 0:
+        logging.warning(f"⚠️ Batch {batch_number} generated 0 flashcards. Raw response preview:")
+        logging.warning(f"Response length: {len(response_text)} chars")
+        logging.warning(f"First 800 chars:\n{response_text[:800]}")
+        logging.warning(f"Contains '---': {response_text.count('---')} times")
+        logging.warning(f"Contains 'Question:': {response_text.count('Question:')}")
+        logging.warning(f"Contains 'Answer:': {response_text.count('Answer:')}")
+        logging.warning(f"Contains 'Hint:': {response_text.count('Hint:')}")
+        logging.warning(f"Contains 'Explanation:': {response_text.count('Explanation:')}")
+
     # Filter out duplicates of existing flashcards if needed
     if existing_flashcards:
         all_cards = [card for card in all_cards if not is_duplicate_of_existing(card, existing_flashcards)]
-    
+
     logging.info(f"Generated {len(all_cards)} flashcards from batch {batch_number}")
     return all_cards
 
@@ -488,104 +510,143 @@ INPUT MATERIAL:
 def parse_flashcards_response(response_text: str) -> List[Dict[str, str]]:
     """
     Parse the raw text response from Groq into structured flashcard objects.
-    
+    Supports multiline field values.
+
     Args:
         response_text: The raw text response from Groq.
-        
+
     Returns:
         List of flashcard objects with question, answer, hint, and explanation.
     """
     flashcards = []
     # Split by the flashcard separator (triple dash)
     cards_raw = response_text.split("---")
-    
-    current_card = {}
+
     for section in cards_raw:
         section = section.strip()
         if not section:
             continue
-            
+
         # Check if this section has flashcard fields
         has_question = "Question:" in section
         has_answer = "Answer:" in section
-        
+
         if has_question and has_answer:
             current_card = {}
-            
-            # Extract each field
-            for line in section.split("\n"):
-                line = line.strip()
-                if not line:
+            current_field = None
+
+            # Extract each field - supports multiline content
+            lines = section.split("\n")
+            for line in lines:
+                line_stripped = line.strip()
+                if not line_stripped:
                     continue
-                    
-                if line.startswith("Question:"):
-                    current_card["question"] = line.replace("Question:", "", 1).strip()
-                elif line.startswith("Answer:"):
-                    current_card["answer"] = line.replace("Answer:", "", 1).strip()
-                elif line.startswith("Hint:"):
-                    current_card["hint"] = line.replace("Hint:", "", 1).strip()
-                elif line.startswith("Explanation:"):
-                    current_card["explanation"] = line.replace("Explanation:", "", 1).strip()
-            
-            # Only add complete cards
-            if all(k in current_card for k in ["question", "answer", "hint", "explanation"]):
+
+                # Strip markdown formatting (**, *, etc.) for field detection
+                line_normalized = line_stripped.lstrip('*').lstrip('#').strip()
+
+                # Check if this line starts a new field
+                if line_normalized.startswith("Question:"):
+                    current_field = "question"
+                    # Extract content after the field label, removing markdown
+                    content = line_normalized.replace("Question:", "", 1).strip()
+                    current_card[current_field] = content.strip('*').strip()
+                elif line_normalized.startswith("Answer:"):
+                    current_field = "answer"
+                    content = line_normalized.replace("Answer:", "", 1).strip()
+                    current_card[current_field] = content.strip('*').strip()
+                elif line_normalized.startswith("Hint:"):
+                    current_field = "hint"
+                    content = line_normalized.replace("Hint:", "", 1).strip()
+                    current_card[current_field] = content.strip('*').strip()
+                elif line_normalized.startswith("Explanation:"):
+                    current_field = "explanation"
+                    content = line_normalized.replace("Explanation:", "", 1).strip()
+                    current_card[current_field] = content.strip('*').strip()
+                elif current_field:
+                    # This is a continuation of the current field (multiline content)
+                    current_card[current_field] += " " + line_stripped
+
+            # Add card if it has at least Question and Answer (make Hint/Explanation optional)
+            if "question" in current_card and "answer" in current_card:
+                # Fill in missing optional fields
+                current_card.setdefault("hint", "Review the material carefully")
+                current_card.setdefault("explanation", current_card["answer"])
                 flashcards.append(current_card)
-    
+
     return flashcards
 
 
 def parse_streaming_content(text: str) -> List[Dict[str, str]]:
     """
     Parse streaming content to extract complete flashcards.
-    
+    Supports multiline field values.
+
     Args:
         text: The accumulated text from streaming.
-        
+
     Returns:
         List of complete flashcard objects.
     """
     # Split by the "---" marker
     parts = text.split("---")
-    
+
     # Skip the first part (it's usually empty or intro text)
     parts = parts[1:] if len(parts) > 1 else []
-    
+
     flashcards = []
-    
+
     for i in range(len(parts) - 1):  # Skip the last part as it might be incomplete
         card_text = parts[i].strip()
         if not card_text:
             continue
-            
+
         card = {}
-        
+        current_field = None
+
         # Check for required fields
         has_question = "Question:" in card_text
         has_answer = "Answer:" in card_text
-        has_hint = "Hint:" in card_text
-        has_explanation = "Explanation:" in card_text
-        
-        if has_question and has_answer and has_hint and has_explanation:
-            # Extract fields
+
+        if has_question and has_answer:
+            # Extract fields - supports multiline content
             lines = card_text.split("\n")
             for line in lines:
-                line = line.strip()
-                if not line:
+                line_stripped = line.strip()
+                if not line_stripped:
                     continue
-                    
-                if line.startswith("Question:"):
-                    card["question"] = line.replace("Question:", "", 1).strip()
-                elif line.startswith("Answer:"):
-                    card["answer"] = line.replace("Answer:", "", 1).strip()
-                elif line.startswith("Hint:"):
-                    card["hint"] = line.replace("Hint:", "", 1).strip()
-                elif line.startswith("Explanation:"):
-                    card["explanation"] = line.replace("Explanation:", "", 1).strip()
-            
-            # Only add complete cards
-            if all(k in card for k in ["question", "answer", "hint", "explanation"]):
+
+                # Strip markdown formatting (**, *, etc.) for field detection
+                line_normalized = line_stripped.lstrip('*').lstrip('#').strip()
+
+                # Check if this line starts a new field
+                if line_normalized.startswith("Question:"):
+                    current_field = "question"
+                    content = line_normalized.replace("Question:", "", 1).strip()
+                    card[current_field] = content.strip('*').strip()
+                elif line_normalized.startswith("Answer:"):
+                    current_field = "answer"
+                    content = line_normalized.replace("Answer:", "", 1).strip()
+                    card[current_field] = content.strip('*').strip()
+                elif line_normalized.startswith("Hint:"):
+                    current_field = "hint"
+                    content = line_normalized.replace("Hint:", "", 1).strip()
+                    card[current_field] = content.strip('*').strip()
+                elif line_normalized.startswith("Explanation:"):
+                    current_field = "explanation"
+                    content = line_normalized.replace("Explanation:", "", 1).strip()
+                    card[current_field] = content.strip('*').strip()
+                elif current_field:
+                    # This is a continuation of the current field (multiline content)
+                    card[current_field] += " " + line_stripped
+
+            # Add card if it has at least Question and Answer
+            if "question" in card and "answer" in card:
+                # Fill in missing optional fields
+                card.setdefault("hint", "Review the material carefully")
+                card.setdefault("explanation", card["answer"])
                 flashcards.append(card)
-    
+
     return flashcards
 
 
@@ -776,25 +837,33 @@ def regenerate_flashcards(
     user_id: Optional[str] = None,
     num_questions: Optional[int] = None,
     acl_tags: Optional[List[str]] = None,
+    max_chunks: int = 1000,
+    target_coverage: float = 0.80,
+    enable_gap_filling: bool = True,
     rerank_top_n: int = 50,
     use_openai_embeddings: bool = False
 ) -> Dict[str, Any]:
     """
-    Generates additional flashcards from a document, avoiding duplicates from previous sets.
-    
+    Generates additional flashcards from a document with comprehensive coverage, avoiding duplicates.
+
+    Uses fetch_all_document_chunks to ensure new flashcards cover different parts of the document.
+
     Args:
         document_id: Filter results to this document ID.
         space_id: Filter results to this space ID.
         user_id: UUID of the user creating flashcards (for ownership tracking).
         num_questions: Optional number of additional flashcards to generate.
         acl_tags: Optional list of ACL tags to filter by.
-        rerank_top_n: Number of results to rerank.
-        use_openai_embeddings: Whether to use OpenAI directly for embeddings.
-    
+        max_chunks: Maximum chunks to retrieve (default: 1000).
+        target_coverage: Target coverage percentage (0.0-1.0, default: 0.80).
+        enable_gap_filling: Enable intelligent gap-filling (default: True).
+        rerank_top_n: Number of results to rerank (deprecated).
+        use_openai_embeddings: Whether to use OpenAI directly for embeddings (deprecated).
+
     Returns:
-        Dict with new flashcards and status.
+        Dict with new flashcards, status, and coverage metadata.
     """
-    logging.info(f"Regenerating flashcards for document {document_id}, space_id: {space_id}, user_id: {user_id}")
+    logging.info(f"Regenerating flashcards for document {document_id}, space_id: {space_id}, user_id: {user_id}, target_coverage: {target_coverage:.0%}")
     
     # Get content_id for this document
     content_id = get_generated_content_id(document_id)
@@ -828,48 +897,41 @@ def regenerate_flashcards(
     try:
         start_time = datetime.now()
 
-        # Create a query to gather content for flashcards
-        query = "Extract comprehensive information from this document including all key concepts, facts, definitions, examples, relationships between topics, methodologies, processes, theories, historical context, practical applications, edge cases, and underlying principles. Cover all sections and subtopics thoroughly to ensure complete coverage of the material for high-quality and diverse flashcard generation."
+        # Fetch all chunks with gap-filling for comprehensive coverage
+        logging.info(f"Fetching all chunks with target coverage: {target_coverage:.0%}, gap_filling: {enable_gap_filling}")
 
-        # Embed query using multimodal embeddings (1024 dims) by default, or OpenAI (1536 dims) if specified
-        query_embedded = embed_query_v2(query) if use_openai_embeddings else embed_query_multimodal(query)
-
-        # Check for embedding errors
-        if isinstance(query_embedded, dict) and "message" in query_embedded and "status" in query_embedded:
-            error_msg = f"Query embedding failed: {query_embedded['message']}"
-            logging.error(error_msg)
-            update_error_status(document_id, error_msg)
-            return {"flashcards": [], "status": "error", "message": error_msg}
-        
-        query_emb = query_embedded["embedding"]
-        query_sparse = query_embedded.get("sparse")
-        
-        # Search using hybrid search to gather relevant content
-        hits = hybrid_search(
-            query_emb=query_emb,
-            query_sparse=query_sparse,
-            top_k=rerank_top_n,
-            doc_id=document_id,
+        chunks = fetch_all_document_chunks(
+            document_id=document_id,
             space_id=space_id,
-            acl_tags=acl_tags
+            max_chunks=max_chunks,
+            acl_tags=acl_tags,
+            target_coverage=target_coverage,
+            enable_gap_filling=enable_gap_filling
         )
-        
-        if not hits:
-            error_msg = "No relevant content found."
+
+        if not chunks:
+            error_msg = "No chunks found for document."
             update_error_status(document_id, error_msg)
             return {"flashcards": [], "status": "error", "message": error_msg}
-        
-        # Rerank results to get most relevant content
-        reranked = rerank_results(query, hits, top_n=rerank_top_n)
-        
-        # Prepare context for flashcard generation
+
+        logging.info(f"Retrieved {len(chunks)} chunks for regeneration (target coverage: {target_coverage:.0%})")
+
+        # Calculate actual coverage from chunks
+        from pinecone_client import calculate_coverage_from_chunks
+        coverage_result = calculate_coverage_from_chunks(chunks)
+        actual_coverage = coverage_result.get("coverage_percentage", 0.0)
+        coverage_gaps = len(coverage_result.get("gaps", []))
+
+        logging.info(f"Actual coverage: {actual_coverage:.0%}, gaps: {coverage_gaps}")
+
+        # Extract text from chunks (already sorted by position)
         context_chunks = []
-        for item in reranked:
-            if "metadata" in item and "text" in item["metadata"]:
-                context_chunks.append(item["metadata"]["text"])
-        
+        for chunk in chunks:
+            if "metadata" in chunk and "text" in chunk["metadata"]:
+                context_chunks.append(chunk["metadata"]["text"])
+
         if not context_chunks:
-            error_msg = "No text content found in search results."
+            error_msg = "No text content found in chunks."
             update_error_status(document_id, error_msg)
             return {"flashcards": [], "status": "error", "message": error_msg}
         
@@ -923,13 +985,21 @@ def regenerate_flashcards(
         
         elapsed_time = (datetime.now() - start_time).total_seconds()
         logging.info(f"Additional flashcard generation completed in {elapsed_time:.2f} seconds. Generated {len(new_flashcards)} new flashcards.")
-        
+        logging.info(f"Coverage: {actual_coverage:.0%}, chunks processed: {len(chunks)}, gaps: {coverage_gaps}")
+
         return {
             "flashcards": final_flashcards,
-            "status": "success", 
-            "elapsed_seconds": elapsed_time, 
-            "total_flashcards": len(new_flashcards), 
-            "num_questions": num_questions
+            "status": "success",
+            "elapsed_seconds": elapsed_time,
+            "total_flashcards": len(new_flashcards),
+            "num_questions": num_questions,
+            "coverage_metadata": {
+                "chunks_processed": len(chunks),
+                "text_coverage_percentage": actual_coverage,
+                "coverage_gaps": coverage_gaps,
+                "target_coverage": target_coverage,
+                "gap_filling_enabled": enable_gap_filling
+            }
         }
         
     except Exception as e:

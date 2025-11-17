@@ -63,6 +63,9 @@ class FlashcardRequest(BaseModel):
     user_id: str
     num_questions: Optional[int] = None
     acl_tags: Optional[List[str]] = None
+    max_chunks: int = 1000
+    target_coverage: float = 0.80
+    enable_gap_filling: bool = True
 
 
 class QuizRequest(BaseModel):
@@ -72,6 +75,9 @@ class QuizRequest(BaseModel):
     question_type: str = "both"
     num_questions: int = 30
     acl_tags: Optional[str] = None
+    max_chunks: int = 1000
+    target_coverage: float = 0.80
+    enable_gap_filling: bool = True
     rerank_top_n: int = 50
     use_openai_embeddings: bool = False  # Deprecated: Always uses multimodal embeddings (1024 dims) to match Pinecone index
     set_id: int = 1
@@ -2033,25 +2039,31 @@ async def generate_flashcards_endpoint(
     request: FlashcardRequest
 ) -> JSONResponse:
     """
-    Endpoint to generate flashcards from a document.
-    
+    Endpoint to generate flashcards from a document with comprehensive coverage.
+
+    Uses fetch_all_document_chunks with gap-filling to ensure flashcards are generated
+    from throughout the document, not just semantically similar sections.
+
     Args:
-        request: FlashcardRequest with document_id, space_id, user_id, etc.
-        
+        request: FlashcardRequest with document_id, space_id, user_id, coverage params, etc.
+
     Returns:
-        JSON response with flashcards or error message.
+        JSON response with flashcards, coverage metadata, or error message.
     """
-    logging.info(f"Generate flashcards endpoint called for document: {request.document_id}, user: {request.user_id}")
-    
+    logging.info(f"Generate flashcards endpoint called for document: {request.document_id}, user: {request.user_id}, target_coverage: {request.target_coverage:.0%}")
+
     try:
         result = generate_flashcards(
             document_id=request.document_id,
             space_id=request.space_id,
             user_id=request.user_id,
             num_questions=request.num_questions,
-            acl_tags=request.acl_tags
+            acl_tags=request.acl_tags,
+            max_chunks=request.max_chunks,
+            target_coverage=request.target_coverage,
+            enable_gap_filling=request.enable_gap_filling
         )
-        
+
         return JSONResponse(result)
     except Exception as e:
         logging.exception(f"Error in generate_flashcards_endpoint: {e}")
@@ -2063,25 +2075,30 @@ async def regenerate_flashcards_endpoint(
     request: FlashcardRequest
 ) -> JSONResponse:
     """
-    Endpoint to regenerate flashcards from a document.
-    
+    Endpoint to regenerate flashcards from a document with comprehensive coverage.
+
+    Uses fetch_all_document_chunks to ensure new flashcards cover different parts of the document.
+
     Args:
-        request: FlashcardRequest with document_id, space_id, user_id, etc.
-        
+        request: FlashcardRequest with document_id, space_id, user_id, coverage params, etc.
+
     Returns:
-        JSON response with flashcards or error message.
+        JSON response with flashcards, coverage metadata, or error message.
     """
-    logging.info(f"Re-Generate flashcards endpoint called for document: {request.document_id}, user: {request.user_id}")
-    
+    logging.info(f"Re-Generate flashcards endpoint called for document: {request.document_id}, user: {request.user_id}, target_coverage: {request.target_coverage:.0%}")
+
     try:
         result = regenerate_flashcards(
             document_id=request.document_id,
             space_id=request.space_id,
             user_id=request.user_id,
             num_questions=request.num_questions,
-            acl_tags=request.acl_tags
+            acl_tags=request.acl_tags,
+            max_chunks=request.max_chunks,
+            target_coverage=request.target_coverage,
+            enable_gap_filling=request.enable_gap_filling
         )
-        
+
         return JSONResponse(result)
     except Exception as e:
         logging.exception(f"Error in regenerate_flashcards_endpoint: {e}")
@@ -2093,7 +2110,11 @@ async def generate_quiz_endpoint(
     request: QuizRequest
 ) -> JSONResponse:
     """
-    Endpoint to generate a quiz from a document.
+    Endpoint to generate a quiz from a document with comprehensive coverage.
+
+    Uses fetch_all_document_chunks with gap-filling to ensure quiz questions are distributed
+    throughout the document, not just from semantically similar sections.
+
     Args:
         request: QuizRequest containing parameters:
             - document_id: The document to generate the quiz from.
@@ -2102,18 +2123,21 @@ async def generate_quiz_endpoint(
             - question_type: Type of questions to generate ("mcq", "true_false", or "both").
             - num_questions: Total number of questions to generate.
             - acl_tags: Optional comma-separated ACL tags.
-            - rerank_top_n: Number of results to rerank.
-            - use_openai_embeddings: Whether to use OpenAI for embeddings.
+            - max_chunks: Maximum chunks to retrieve (default: 1000).
+            - target_coverage: Target coverage percentage (0.0-1.0, default: 0.80).
+            - enable_gap_filling: Enable intelligent gap-filling (default: True).
+            - rerank_top_n: Number of results to rerank (deprecated).
+            - use_openai_embeddings: Whether to use OpenAI for embeddings (deprecated).
             - set_id: Quiz set number.
             - title: Optional quiz title.
             - description: Optional quiz description.
     Returns:
-        JSON response with quiz or error message.
+        JSON response with quiz, coverage metadata, or error message.
     """
     # Validate question_type
     if request.question_type not in ["mcq", "true_false", "both"]:
         return JSONResponse({"error": "question_type must be one of 'mcq', 'true_false', or 'both'"}, status_code=400)
-        
+
     acl_list = [tag.strip() for tag in request.acl_tags.split(",")] if request.acl_tags else None
     try:
         result = generate_quiz(
@@ -2123,6 +2147,9 @@ async def generate_quiz_endpoint(
             question_type=request.question_type,
             num_questions=request.num_questions,
             acl_tags=acl_list,
+            max_chunks=request.max_chunks,
+            target_coverage=request.target_coverage,
+            enable_gap_filling=request.enable_gap_filling,
             rerank_top_n=request.rerank_top_n,
             use_openai_embeddings=request.use_openai_embeddings,
             set_id=request.set_id,
