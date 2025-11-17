@@ -542,19 +542,27 @@ def parse_flashcards_response(response_text: str) -> List[Dict[str, str]]:
                 if not line_stripped:
                     continue
 
+                # Strip markdown formatting (**, *, etc.) for field detection
+                line_normalized = line_stripped.lstrip('*').lstrip('#').strip()
+
                 # Check if this line starts a new field
-                if line_stripped.startswith("Question:"):
+                if line_normalized.startswith("Question:"):
                     current_field = "question"
-                    current_card[current_field] = line_stripped.replace("Question:", "", 1).strip()
-                elif line_stripped.startswith("Answer:"):
+                    # Extract content after the field label, removing markdown
+                    content = line_normalized.replace("Question:", "", 1).strip()
+                    current_card[current_field] = content.strip('*').strip()
+                elif line_normalized.startswith("Answer:"):
                     current_field = "answer"
-                    current_card[current_field] = line_stripped.replace("Answer:", "", 1).strip()
-                elif line_stripped.startswith("Hint:"):
+                    content = line_normalized.replace("Answer:", "", 1).strip()
+                    current_card[current_field] = content.strip('*').strip()
+                elif line_normalized.startswith("Hint:"):
                     current_field = "hint"
-                    current_card[current_field] = line_stripped.replace("Hint:", "", 1).strip()
-                elif line_stripped.startswith("Explanation:"):
+                    content = line_normalized.replace("Hint:", "", 1).strip()
+                    current_card[current_field] = content.strip('*').strip()
+                elif line_normalized.startswith("Explanation:"):
                     current_field = "explanation"
-                    current_card[current_field] = line_stripped.replace("Explanation:", "", 1).strip()
+                    content = line_normalized.replace("Explanation:", "", 1).strip()
+                    current_card[current_field] = content.strip('*').strip()
                 elif current_field:
                     # This is a continuation of the current field (multiline content)
                     current_card[current_field] += " " + line_stripped
@@ -608,19 +616,26 @@ def parse_streaming_content(text: str) -> List[Dict[str, str]]:
                 if not line_stripped:
                     continue
 
+                # Strip markdown formatting (**, *, etc.) for field detection
+                line_normalized = line_stripped.lstrip('*').lstrip('#').strip()
+
                 # Check if this line starts a new field
-                if line_stripped.startswith("Question:"):
+                if line_normalized.startswith("Question:"):
                     current_field = "question"
-                    card[current_field] = line_stripped.replace("Question:", "", 1).strip()
-                elif line_stripped.startswith("Answer:"):
+                    content = line_normalized.replace("Question:", "", 1).strip()
+                    card[current_field] = content.strip('*').strip()
+                elif line_normalized.startswith("Answer:"):
                     current_field = "answer"
-                    card[current_field] = line_stripped.replace("Answer:", "", 1).strip()
-                elif line_stripped.startswith("Hint:"):
+                    content = line_normalized.replace("Answer:", "", 1).strip()
+                    card[current_field] = content.strip('*').strip()
+                elif line_normalized.startswith("Hint:"):
                     current_field = "hint"
-                    card[current_field] = line_stripped.replace("Hint:", "", 1).strip()
-                elif line_stripped.startswith("Explanation:"):
+                    content = line_normalized.replace("Hint:", "", 1).strip()
+                    card[current_field] = content.strip('*').strip()
+                elif line_normalized.startswith("Explanation:"):
                     current_field = "explanation"
-                    card[current_field] = line_stripped.replace("Explanation:", "", 1).strip()
+                    content = line_normalized.replace("Explanation:", "", 1).strip()
+                    card[current_field] = content.strip('*').strip()
                 elif current_field:
                     # This is a continuation of the current field (multiline content)
                     card[current_field] += " " + line_stripped
