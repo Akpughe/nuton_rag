@@ -487,11 +487,22 @@ INPUT MATERIAL:
     
     # Final parsing of the complete response to ensure we catch everything
     all_cards = parse_flashcards_response(response_text)
-    
+
+    # DIAGNOSTIC: Log raw response if we got 0 cards to debug parsing issues
+    if len(all_cards) == 0:
+        logging.warning(f"⚠️ Batch {batch_number} generated 0 flashcards. Raw response preview:")
+        logging.warning(f"Response length: {len(response_text)} chars")
+        logging.warning(f"First 800 chars:\n{response_text[:800]}")
+        logging.warning(f"Contains '---': {response_text.count('---')} times")
+        logging.warning(f"Contains 'Question:': {response_text.count('Question:')}")
+        logging.warning(f"Contains 'Answer:': {response_text.count('Answer:')}")
+        logging.warning(f"Contains 'Hint:': {response_text.count('Hint:')}")
+        logging.warning(f"Contains 'Explanation:': {response_text.count('Explanation:')}")
+
     # Filter out duplicates of existing flashcards if needed
     if existing_flashcards:
         all_cards = [card for card in all_cards if not is_duplicate_of_existing(card, existing_flashcards)]
-    
+
     logging.info(f"Generated {len(all_cards)} flashcards from batch {batch_number}")
     return all_cards
 
@@ -499,104 +510,128 @@ INPUT MATERIAL:
 def parse_flashcards_response(response_text: str) -> List[Dict[str, str]]:
     """
     Parse the raw text response from Groq into structured flashcard objects.
-    
+    Supports multiline field values.
+
     Args:
         response_text: The raw text response from Groq.
-        
+
     Returns:
         List of flashcard objects with question, answer, hint, and explanation.
     """
     flashcards = []
     # Split by the flashcard separator (triple dash)
     cards_raw = response_text.split("---")
-    
-    current_card = {}
+
     for section in cards_raw:
         section = section.strip()
         if not section:
             continue
-            
+
         # Check if this section has flashcard fields
         has_question = "Question:" in section
         has_answer = "Answer:" in section
-        
+
         if has_question and has_answer:
             current_card = {}
-            
-            # Extract each field
-            for line in section.split("\n"):
-                line = line.strip()
-                if not line:
+            current_field = None
+
+            # Extract each field - supports multiline content
+            lines = section.split("\n")
+            for line in lines:
+                line_stripped = line.strip()
+                if not line_stripped:
                     continue
-                    
-                if line.startswith("Question:"):
-                    current_card["question"] = line.replace("Question:", "", 1).strip()
-                elif line.startswith("Answer:"):
-                    current_card["answer"] = line.replace("Answer:", "", 1).strip()
-                elif line.startswith("Hint:"):
-                    current_card["hint"] = line.replace("Hint:", "", 1).strip()
-                elif line.startswith("Explanation:"):
-                    current_card["explanation"] = line.replace("Explanation:", "", 1).strip()
-            
-            # Only add complete cards
-            if all(k in current_card for k in ["question", "answer", "hint", "explanation"]):
+
+                # Check if this line starts a new field
+                if line_stripped.startswith("Question:"):
+                    current_field = "question"
+                    current_card[current_field] = line_stripped.replace("Question:", "", 1).strip()
+                elif line_stripped.startswith("Answer:"):
+                    current_field = "answer"
+                    current_card[current_field] = line_stripped.replace("Answer:", "", 1).strip()
+                elif line_stripped.startswith("Hint:"):
+                    current_field = "hint"
+                    current_card[current_field] = line_stripped.replace("Hint:", "", 1).strip()
+                elif line_stripped.startswith("Explanation:"):
+                    current_field = "explanation"
+                    current_card[current_field] = line_stripped.replace("Explanation:", "", 1).strip()
+                elif current_field:
+                    # This is a continuation of the current field (multiline content)
+                    current_card[current_field] += " " + line_stripped
+
+            # Add card if it has at least Question and Answer (make Hint/Explanation optional)
+            if "question" in current_card and "answer" in current_card:
+                # Fill in missing optional fields
+                current_card.setdefault("hint", "Review the material carefully")
+                current_card.setdefault("explanation", current_card["answer"])
                 flashcards.append(current_card)
-    
+
     return flashcards
 
 
 def parse_streaming_content(text: str) -> List[Dict[str, str]]:
     """
     Parse streaming content to extract complete flashcards.
-    
+    Supports multiline field values.
+
     Args:
         text: The accumulated text from streaming.
-        
+
     Returns:
         List of complete flashcard objects.
     """
     # Split by the "---" marker
     parts = text.split("---")
-    
+
     # Skip the first part (it's usually empty or intro text)
     parts = parts[1:] if len(parts) > 1 else []
-    
+
     flashcards = []
-    
+
     for i in range(len(parts) - 1):  # Skip the last part as it might be incomplete
         card_text = parts[i].strip()
         if not card_text:
             continue
-            
+
         card = {}
-        
+        current_field = None
+
         # Check for required fields
         has_question = "Question:" in card_text
         has_answer = "Answer:" in card_text
-        has_hint = "Hint:" in card_text
-        has_explanation = "Explanation:" in card_text
-        
-        if has_question and has_answer and has_hint and has_explanation:
-            # Extract fields
+
+        if has_question and has_answer:
+            # Extract fields - supports multiline content
             lines = card_text.split("\n")
             for line in lines:
-                line = line.strip()
-                if not line:
+                line_stripped = line.strip()
+                if not line_stripped:
                     continue
-                    
-                if line.startswith("Question:"):
-                    card["question"] = line.replace("Question:", "", 1).strip()
-                elif line.startswith("Answer:"):
-                    card["answer"] = line.replace("Answer:", "", 1).strip()
-                elif line.startswith("Hint:"):
-                    card["hint"] = line.replace("Hint:", "", 1).strip()
-                elif line.startswith("Explanation:"):
-                    card["explanation"] = line.replace("Explanation:", "", 1).strip()
-            
-            # Only add complete cards
-            if all(k in card for k in ["question", "answer", "hint", "explanation"]):
+
+                # Check if this line starts a new field
+                if line_stripped.startswith("Question:"):
+                    current_field = "question"
+                    card[current_field] = line_stripped.replace("Question:", "", 1).strip()
+                elif line_stripped.startswith("Answer:"):
+                    current_field = "answer"
+                    card[current_field] = line_stripped.replace("Answer:", "", 1).strip()
+                elif line_stripped.startswith("Hint:"):
+                    current_field = "hint"
+                    card[current_field] = line_stripped.replace("Hint:", "", 1).strip()
+                elif line_stripped.startswith("Explanation:"):
+                    current_field = "explanation"
+                    card[current_field] = line_stripped.replace("Explanation:", "", 1).strip()
+                elif current_field:
+                    # This is a continuation of the current field (multiline content)
+                    card[current_field] += " " + line_stripped
+
+            # Add card if it has at least Question and Answer
+            if "question" in card and "answer" in card:
+                # Fill in missing optional fields
+                card.setdefault("hint", "Review the material carefully")
+                card.setdefault("explanation", card["answer"])
                 flashcards.append(card)
-    
+
     return flashcards
 
 
