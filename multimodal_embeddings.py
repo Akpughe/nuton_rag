@@ -269,11 +269,12 @@ class MultimodalEmbedder:
                 "Authorization": f"Bearer {self.api_key}"
             }
 
+            # Note: Jina CLIP v2 API does not support 'normalized' and 'embedding_type'
+            # parameters for image inputs (only for text). Sending these params with
+            # images causes 400 Bad Request error.
             payload = {
                 "model": "jina-clip-v2",
-                "input": batch,
-                "normalized": normalize,
-                "embedding_type": "float"
+                "input": batch
             }
 
             try:
