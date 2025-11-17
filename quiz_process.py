@@ -6,7 +6,7 @@ from functools import partial
 import random
 
 from chonkie_client import embed_query, embed_query_v2, embed_query_multimodal
-from pinecone_client import hybrid_search, rerank_results
+from pinecone_client import hybrid_search, fetch_all_document_chunks, rerank_results
 from groq import Groq
 import os
 from dotenv import load_dotenv
@@ -164,6 +164,9 @@ def generate_quiz(
     question_type: str = "both",  # one of "mcq", "true_false", or "both"
     num_questions: int = 10,
     acl_tags: Optional[List[str]] = None,
+    max_chunks: int = 1000,
+    target_coverage: float = 0.80,
+    enable_gap_filling: bool = True,
     rerank_top_n: int = 50,
     use_openai_embeddings: bool = False,
     set_id: int = 1,
@@ -171,7 +174,11 @@ def generate_quiz(
     description: Optional[str] = None
 ) -> Dict[str, Any]:
     """
-    Generates a quiz from a document using hybrid search, rerank, and GPT-4o.
+    Generates a quiz from a document with comprehensive coverage across the entire document.
+
+    Uses fetch_all_document_chunks with gap-filling to ensure quiz questions are distributed
+    throughout the document, not just from semantically similar sections.
+
     Args:
         document_id: Filter results to this document ID.
         space_id: Filter results to this space ID.
@@ -179,13 +186,16 @@ def generate_quiz(
         question_type: Type of questions to generate ("mcq", "true_false", or "both").
         num_questions: Total number of questions to generate.
         acl_tags: Optional list of ACL tags to filter by.
-        rerank_top_n: Number of results to rerank.
-        use_openai_embeddings: Whether to use OpenAI directly for embeddings.
+        max_chunks: Maximum chunks to retrieve (default: 1000).
+        target_coverage: Target coverage percentage (0.0-1.0, default: 0.80).
+        enable_gap_filling: Enable intelligent gap-filling (default: True).
+        rerank_top_n: Number of results to rerank (deprecated).
+        use_openai_embeddings: Whether to use OpenAI directly for embeddings (deprecated).
         set_id: Quiz set number.
         title: Optional quiz title.
         description: Optional quiz description.
     Returns:
-        Dict with quiz and status.
+        Dict with quiz, status, and coverage metadata.
     """
     # Validate question_type
     if question_type not in ["mcq", "true_false", "both"]:
@@ -198,46 +208,49 @@ def generate_quiz(
     # Determine number of each question type
     mcq_count, tf_count = get_question_counts(question_type, num_questions)
     
-    logging.info(f"Generating quiz for document {document_id}, space_id: {space_id}, user_id: {user_id}, type: {question_type} ({mcq_count} MCQ, {tf_count} TF)")
-    
+    logging.info(f"Generating quiz for document {document_id}, space_id: {space_id}, user_id: {user_id}, type: {question_type} ({mcq_count} MCQ, {tf_count} TF), target_coverage: {target_coverage:.0%}")
+
     # Log the start of processing (no need to update generated_content.quiz since we're using quiz_sets)
     logging.info(f"Starting quiz generation for document {document_id}, set #{set_id}")
-    
+
     try:
         start_time = datetime.now()
-        
-        # ALWAYS use multimodal embeddings (1024 dims) to match the document embeddings in Pinecone
-        # The use_openai_embeddings parameter is deprecated but kept for backwards compatibility
-        query = "Extract all key concepts, facts, and relationships from this document for quiz generation."
-        query_embedded = embed_query_multimodal(query)
-        if isinstance(query_embedded, dict) and "message" in query_embedded and "status" in query_embedded:
-            error_msg = f"Query embedding failed: {query_embedded['message']}"
-            logging.error(error_msg)
-            return {"quiz": [], "status": "error", "message": error_msg}
-        query_emb = query_embedded["embedding"]
-        query_sparse = query_embedded.get("sparse")
-        
-        # Search using hybrid search to gather relevant content
-        hits = hybrid_search(
-            query_emb=query_emb,
-            query_sparse=query_sparse,
-            top_k=rerank_top_n,
-            doc_id=document_id,
+
+        # Fetch all chunks with gap-filling for comprehensive coverage
+        # This ensures quiz questions are distributed throughout the document
+        logging.info(f"Fetching all chunks with target coverage: {target_coverage:.0%}, gap_filling: {enable_gap_filling}")
+
+        chunks = fetch_all_document_chunks(
+            document_id=document_id,
             space_id=space_id,
-            acl_tags=acl_tags
+            max_chunks=max_chunks,
+            acl_tags=acl_tags,
+            target_coverage=target_coverage,
+            enable_gap_filling=enable_gap_filling
         )
-        if not hits:
-            error_msg = "No relevant content found."
+
+        if not chunks:
+            error_msg = "No chunks found for document."
             return {"quiz": [], "status": "error", "message": error_msg}
-        
-        reranked = rerank_results(query, hits, top_n=rerank_top_n)
+
+        logging.info(f"Retrieved {len(chunks)} chunks (target coverage: {target_coverage:.0%})")
+
+        # Calculate actual coverage from chunks
+        from pinecone_client import calculate_coverage_from_chunks
+        coverage_result = calculate_coverage_from_chunks(chunks)
+        actual_coverage = coverage_result.get("coverage_percentage", 0.0)
+        coverage_gaps = len(coverage_result.get("gaps", []))
+
+        logging.info(f"Actual coverage: {actual_coverage:.0%}, gaps: {coverage_gaps}")
+
+        # Extract text from chunks (already sorted by position: chapter→page→start_index)
         context_chunks = []
-        for item in reranked:
-            if "metadata" in item and "text" in item["metadata"]:
-                context_chunks.append(item["metadata"]["text"])
-        
+        for chunk in chunks:
+            if "metadata" in chunk and "text" in chunk["metadata"]:
+                context_chunks.append(chunk["metadata"]["text"])
+
         if not context_chunks:
-            error_msg = "No text content found in search results."
+            error_msg = "No text content found in chunks."
             return {"quiz": [], "status": "error", "message": error_msg}
         
         # Generate quiz questions in parallel batches
@@ -278,7 +291,8 @@ def generate_quiz(
         
         elapsed_time = (datetime.now() - start_time).total_seconds()
         logging.info(f"Quiz generation completed in {elapsed_time:.2f} seconds. Generated {len(quiz_questions)} questions.")
-        
+        logging.info(f"Coverage: {actual_coverage:.0%}, chunks processed: {len(chunks)}, gaps: {coverage_gaps}")
+
         return {
             "quiz": quiz_obj,
             "status": "success",
@@ -287,7 +301,14 @@ def generate_quiz(
             "question_type": question_type,
             "mcq_count": mcq_count,
             "tf_count": tf_count,
-            "set_number": set_id
+            "set_number": set_id,
+            "coverage_metadata": {
+                "chunks_processed": len(chunks),
+                "text_coverage_percentage": actual_coverage,
+                "coverage_gaps": coverage_gaps,
+                "target_coverage": target_coverage,
+                "gap_filling_enabled": enable_gap_filling
+            }
         }
     except Exception as e:
         logging.exception(f"Error generating quiz: {e}")
@@ -422,27 +443,35 @@ def generate_quiz_from_chunks_parallel(
     # This is a last resort to ensure we return exactly the requested number
     if len(mcq_questions) < mcq_count:
         orig_mcq = mcq_questions.copy()
-        while len(mcq_questions) < mcq_count:
-            # Take a random question and create a variation
-            source_q = random.choice(orig_mcq)
-            new_q = source_q.copy()
-            new_q["question_id"] = f"q{len(deduped) + 1}"
-            # Add a prefix to make it unique
-            new_q["question_text"] = f"Regarding the same topic: {source_q['question_text']}"
-            mcq_questions.append(new_q)
-            deduped.append(new_q)
-    
+        # Only duplicate if we have at least one question to work with
+        if orig_mcq:
+            while len(mcq_questions) < mcq_count:
+                # Take a random question and create a variation
+                source_q = random.choice(orig_mcq)
+                new_q = source_q.copy()
+                new_q["question_id"] = f"q{len(deduped) + 1}"
+                # Add a prefix to make it unique
+                new_q["question_text"] = f"Regarding the same topic: {source_q['question_text']}"
+                mcq_questions.append(new_q)
+                deduped.append(new_q)
+        else:
+            logging.warning(f"Cannot generate {mcq_count} MCQ questions - no MCQ questions were parsed from LLM responses")
+
     if len(tf_questions) < tf_count:
         orig_tf = tf_questions.copy()
-        while len(tf_questions) < tf_count:
-            # Take a random question and create a variation
-            source_q = random.choice(orig_tf)
-            new_q = source_q.copy()
-            new_q["question_id"] = f"q{len(deduped) + 1}"
-            # Add a prefix to make it unique
-            new_q["question_text"] = f"Regarding the same concept: {source_q['question_text']}"
-            tf_questions.append(new_q)
-            deduped.append(new_q)
+        # Only duplicate if we have at least one question to work with
+        if orig_tf:
+            while len(tf_questions) < tf_count:
+                # Take a random question and create a variation
+                source_q = random.choice(orig_tf)
+                new_q = source_q.copy()
+                new_q["question_id"] = f"q{len(deduped) + 1}"
+                # Add a prefix to make it unique
+                new_q["question_text"] = f"Regarding the same concept: {source_q['question_text']}"
+                tf_questions.append(new_q)
+                deduped.append(new_q)
+        else:
+            logging.warning(f"Cannot generate {tf_count} True/False questions - no T/F questions were parsed from LLM responses")
     
     # Trim to requested counts (in case we have extras)
     final_mcq = mcq_questions[:mcq_count]
@@ -463,13 +492,13 @@ def generate_quiz_batch(context: str, mcq_count: int, tf_count: int) -> List[Dic
     """
     # Create the question distribution text
     question_distribution = get_question_distribution_text(mcq_count, tf_count)
-    
+
     # Generate the prompt for this batch
     prompt = QUIZ_PROMPT_TEMPLATE.format(
         question_distribution=question_distribution,
         context=context
     )
-    
+
     # Call LLM with Groq
     response = groq_client.chat.completions.create(
         model="openai/gpt-oss-120b",
@@ -481,48 +510,113 @@ def generate_quiz_batch(context: str, mcq_count: int, tf_count: int) -> List[Dic
         max_tokens=2048
     )
     text = response.choices[0].message.content
-    
+
     # Parse questions
-    return parse_quiz_questions(text)
+    questions = parse_quiz_questions(text)
+
+    # DIAGNOSTIC: Log if we got 0 questions to debug parsing issues
+    if len(questions) == 0:
+        import re
+        logging.warning(f"⚠️ Quiz batch generated 0 questions. Diagnostic info:")
+        logging.warning(f"Response length: {len(text)} chars")
+        logging.warning(f"First 600 chars:\n{text[:600]}")
+        logging.warning(f"Contains '---': {len(re.findall(r'---+', text))} separators")
+        logging.warning(f"Contains 'Type:': {len(re.findall(r'Type:', text, re.I))}")
+        logging.warning(f"Contains 'Question:': {len(re.findall(r'Question:', text, re.I))}")
+        logging.warning(f"Contains 'Answer:': {len(re.findall(r'Answer:', text, re.I))}")
+        logging.warning(f"Contains 'Explanation:': {len(re.findall(r'Explanation:', text, re.I))}")
+
+    return questions
 
 def parse_quiz_questions(text: str) -> List[Dict[str, Any]]:
     """
     Parse quiz questions from LLM output.
+    Supports multiline field values for better LLM response handling.
     """
     questions = []
     import re
     blocks = re.split(r'---+', text)
     qid = 1
+
     for block in blocks:
         block = block.strip()
         if not block:
             continue
-        
-        # Parse type
-        type_match = re.search(r'Type:\s*(mcq|true_false)', block, re.IGNORECASE)
+
+        # Parse type using case-insensitive regex
+        type_match = re.search(r'Type:\s*(mcq|true_false)', block, re.IGNORECASE | re.DOTALL)
         qtype = type_match.group(1).lower() if type_match else None
-        
-        # Parse question
-        q_match = re.search(r'Question:\s*(.+)', block)
-        question_text = q_match.group(1).strip() if q_match else None
-        
-        # Parse options (for MCQ)
+
+        # Parse question - use DOTALL to match multiline content, strip markdown
+        # Handle both uppercase and lowercase option letters in boundary
+        q_match = re.search(r'Question:\s*(.+?)(?=\n[A-Da-d]\.|Answer:|Explanation:|Type:|Options:|$)', block, re.DOTALL | re.IGNORECASE)
+        if q_match:
+            question_text = q_match.group(1).strip().replace('\n', ' ')
+            # Strip markdown formatting from content
+            question_text = re.sub(r'^\*+|\*+$', '', question_text).strip()
+        else:
+            question_text = None
+
+        # Parse options (for MCQ) - handle multiline options, strip markdown
+        # Case-insensitive to handle both A./a., B./b., etc.
         options = []
         if qtype == 'mcq':
             for opt in ['A', 'B', 'C', 'D']:
-                opt_match = re.search(rf'{opt}\.\s*(.+)', block)
+                # Match from option letter to next option, Answer, or Explanation
+                # Case-insensitive to handle lowercase option letters
+                opt_pattern = rf'{opt}\.\s*(.+?)(?=\n[A-Da-d]\.|Answer:|Explanation:|Type:|$)'
+                opt_match = re.search(opt_pattern, block, re.DOTALL | re.IGNORECASE)
                 if opt_match:
-                    options.append({opt.lower(): opt_match.group(1).strip()})
-        
-        # Parse answer
-        ans_match = re.search(r'Answer:\s*([A-D]|True|False)', block)
-        correct_option = ans_match.group(1) if ans_match else None
-        
-        # Parse explanation
-        exp_match = re.search(r'Explanation:\s*(.+)', block)
-        explanation = exp_match.group(1).strip() if exp_match else None
-        
-        if qtype and question_text and correct_option and explanation:
+                    opt_text = opt_match.group(1).strip().replace('\n', ' ')
+                    # Strip markdown formatting
+                    opt_text = re.sub(r'^\*+|\*+$', '', opt_text).strip()
+                    options.append({opt.lower(): opt_text})
+
+        # Parse answer - keep this single line as answers should be short
+        ans_match = re.search(r'Answer:\s*([A-D]|True|False)', block, re.IGNORECASE)
+        if ans_match:
+            raw_answer = ans_match.group(1)
+            # Normalize answer format for consistency
+            if raw_answer.upper() in ['A', 'B', 'C', 'D']:
+                correct_option = raw_answer.upper()  # MCQ: always uppercase
+            elif raw_answer.lower() == 'true':
+                correct_option = 'True'  # Boolean: capitalize
+            elif raw_answer.lower() == 'false':
+                correct_option = 'False'  # Boolean: capitalize
+            else:
+                correct_option = raw_answer  # Fallback: keep as-is
+        else:
+            correct_option = None
+
+        # Parse explanation - handle multiline explanations, strip markdown
+        exp_match = re.search(r'Explanation:\s*(.+?)(?=\n(?:Type:|Question:|---)|$)', block, re.DOTALL)
+        if exp_match:
+            explanation = exp_match.group(1).strip().replace('\n', ' ')
+            # Strip markdown formatting
+            explanation = re.sub(r'^\*+|\*+$', '', explanation).strip()
+        else:
+            explanation = None
+
+        # Create question object if we have minimum required fields
+        if qtype and question_text and correct_option:
+            # Additional validation for MCQ questions
+            if qtype == 'mcq':
+                # Ensure we have at least 2 options (ideally 4)
+                if len(options) < 2:
+                    logging.warning(f"Skipping MCQ question with insufficient options ({len(options)}): {question_text[:50]}...")
+                    continue
+
+                # Verify correct_option exists in options
+                correct_key = correct_option.lower()
+                option_keys = [list(opt.keys())[0] for opt in options]
+                if correct_key not in option_keys:
+                    logging.warning(f"Skipping MCQ question - correct answer '{correct_option}' not in options {option_keys}: {question_text[:50]}...")
+                    continue
+
+            # Fill in explanation if missing
+            if not explanation:
+                explanation = "Review the material for context."
+
             q = {
                 "type": qtype,
                 "question_id": f"q{qid}",
@@ -534,7 +628,7 @@ def parse_quiz_questions(text: str) -> List[Dict[str, Any]]:
                 q["options"] = options
             questions.append(q)
             qid += 1
-    
+
     return questions
 
 def simplify_quiz_text(text: str) -> str:
