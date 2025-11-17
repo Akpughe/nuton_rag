@@ -284,6 +284,15 @@ class MultimodalEmbedder:
                     json=payload,
                     timeout=30
                 )
+
+                # Log detailed error if request fails
+                if response.status_code != 200:
+                    logger.error(f"Jina API error {response.status_code}: {response.text}")
+                    logger.error(f"Request payload: model={payload['model']}, batch_size={len(batch)}")
+                    # Log first image data URI prefix to debug format issues
+                    if batch:
+                        logger.error(f"First image prefix: {batch[0][:100]}...")
+
                 response.raise_for_status()
 
                 result = response.json()
