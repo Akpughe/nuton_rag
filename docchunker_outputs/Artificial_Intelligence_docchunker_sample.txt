@@ -1,0 +1,176 @@
+================================================================================
+DocChunker Extraction Results
+Source: /Users/davak/Documents/_study/anatomy+phys+vol2a.pdf
+Total Chunks: 9491
+================================================================================
+
+
+================================================================================
+CHUNK 1/9491
+================================================================================
+METADATA:
+  Node Type: paragraph
+  Headings: ['7PMVNF\x012\x01PG\x01\x14\x1b\x01$IBQUFST\x0112\x01\x0e\x0121\x01PG\x01\x13\x19', '', '', '-JDFOTF\x1b\x01$$\x0e#: *4#/\x1b\x01\x01978-1-304-84002-8', '', 'OpenStax College']
+  Chars: 171
+
+TEXT:
+--------------------------------------------------------------------------------
+H1: 7PMVNF2PG$IBQUFST1221PG
+H4: -JDFOTF$$#: *4#/978-1-304-84002-8
+H6: OpenStax College
+---
+Rice University 6100 Main Street MS-380 Houston, Texas 77005
+--------------------------------------------------------------------------------
+
+================================================================================
+CHUNK 2/9491
+================================================================================
+METADATA:
+  Node Type: paragraph
+  Headings: ['7PMVNF\x012\x01PG\x01\x14\x1b\x01$IBQUFST\x0112\x01\x0e\x0121\x01PG\x01\x13\x19', '', '', '-JDFOTF\x1b\x01$$\x0e#: *4#/\x1b\x01\x01978-1-304-84002-8', '', 'OpenStax College']
+  Chars: 182
+
+TEXT:
+--------------------------------------------------------------------------------
+H1: 7PMVNF2PG$IBQUFST1221PG
+H4: -JDFOTF$$#: *4#/978-1-304-84002-8
+H6: OpenStax College
+---
+To learn more about OpenStax College, visit http://openstaxcollege.org.
+--------------------------------------------------------------------------------
+
+================================================================================
+CHUNK 3/9491
+================================================================================
+METADATA:
+  Node Type: paragraph
+  Headings: ['7PMVNF\x012\x01PG\x01\x14\x1b\x01$IBQUFST\x0112\x01\x0e\x0121\x01PG\x01\x13\x19', '', '', '-JDFOTF\x1b\x01$$\x0e#: *4#/\x1b\x01\x01978-1-304-84002-8', '', 'OpenStax College']
+  Chars: 188
+
+TEXT:
+--------------------------------------------------------------------------------
+H1: 7PMVNF2PG$IBQUFST1221PG
+H4: -JDFOTF$$#: *4#/978-1-304-84002-8
+H6: OpenStax College
+---
+Individual print copies and bulk orders can be purchased through our website.
+--------------------------------------------------------------------------------
+
+================================================================================
+CHUNK 4/9491
+================================================================================
+METADATA:
+  Node Type: paragraph
+  Headings: ['7PMVNF\x012\x01PG\x01\x14\x1b\x01$IBQUFST\x0112\x01\x0e\x0121\x01PG\x01\x13\x19', '', '', '-JDFOTF\x1b\x01$$\x0e#: *4#/\x1b\x01\x01978-1-304-84002-8', '', 'OpenStax College']
+  Chars: 373
+
+TEXT:
+--------------------------------------------------------------------------------
+H1: 7PMVNF2PG$IBQUFST1221PG
+H4: -JDFOTF$$#: *4#/978-1-304-84002-8
+H6: OpenStax College
+---
+© 2013 Rice University. Textbook content produced by OpenStax College is licensed under a Creative Commons Attribution 3.0 Unported License. Under this license, any user of this textbook or the textbook contents herein must provide proper attribution as follows:
+--------------------------------------------------------------------------------
+
+================================================================================
+CHUNK 5/9491
+================================================================================
+METADATA:
+  Node Type: paragraph
+  Headings: ['7PMVNF\x012\x01PG\x01\x14\x1b\x01$IBQUFST\x0112\x01\x0e\x0121\x01PG\x01\x13\x19', '', '', '-JDFOTF\x1b\x01$$\x0e#: *4#/\x1b\x01\x01978-1-304-84002-8', '', 'OpenStax College']
+  Chars: 112
+
+TEXT:
+--------------------------------------------------------------------------------
+H1: 7PMVNF2PG$IBQUFST1221PG
+H4: -JDFOTF$$#: *4#/978-1-304-84002-8
+H6: OpenStax College
+---
+-
+--------------------------------------------------------------------------------
+
+================================================================================
+CHUNK 6/9491
+================================================================================
+METADATA:
+  Node Type: paragraph
+  Headings: ['7PMVNF\x012\x01PG\x01\x14\x1b\x01$IBQUFST\x0112\x01\x0e\x0121\x01PG\x01\x13\x19', '', '', '-JDFOTF\x1b\x01$$\x0e#: *4#/\x1b\x01\x01978-1-304-84002-8', '', 'OpenStax College']
+  Chars: 344
+
+TEXT:
+--------------------------------------------------------------------------------
+H1: 7PMVNF2PG$IBQUFST1221PG
+H4: -JDFOTF$$#: *4#/978-1-304-84002-8
+H6: OpenStax College
+---
+If you redistribute this textbook in a digital format (including but not limited to EPUB, PDF, and HTML), then you must retain on every page the following attribution: “Download for free at http://cnx.org/content/col11496/latest/.” -
+--------------------------------------------------------------------------------
+
+================================================================================
+CHUNK 7/9491
+================================================================================
+METADATA:
+  Node Type: paragraph
+  Headings: ['7PMVNF\x012\x01PG\x01\x14\x1b\x01$IBQUFST\x0112\x01\x0e\x0121\x01PG\x01\x13\x19', '', '', '-JDFOTF\x1b\x01$$\x0e#: *4#/\x1b\x01\x01978-1-304-84002-8', '', 'OpenStax College']
+  Chars: 301
+
+TEXT:
+--------------------------------------------------------------------------------
+H1: 7PMVNF2PG$IBQUFST1221PG
+H4: -JDFOTF$$#: *4#/978-1-304-84002-8
+H6: OpenStax College
+---
+If you redistribute this textbook in a print format, then you must include on every physical page the following attribution: “Download for free at http://cnx.org/content/col11496/latest/.” -
+--------------------------------------------------------------------------------
+
+================================================================================
+CHUNK 8/9491
+================================================================================
+METADATA:
+  Node Type: paragraph
+  Headings: ['7PMVNF\x012\x01PG\x01\x14\x1b\x01$IBQUFST\x0112\x01\x0e\x0121\x01PG\x01\x13\x19', '', '', '-JDFOTF\x1b\x01$$\x0e#: *4#/\x1b\x01\x01978-1-304-84002-8', '', 'OpenStax College']
+  Chars: 386
+
+TEXT:
+--------------------------------------------------------------------------------
+H1: 7PMVNF2PG$IBQUFST1221PG
+H4: -JDFOTF$$#: *4#/978-1-304-84002-8
+H6: OpenStax College
+---
+If you redistribute part of this textbook, then you must retain in every digital format page view (including but not limited to EPUB, PDF, and HTML) and on every physical printed page the following attribution: “Download for free at http://cnx.org/content/col11496/latest/” -
+--------------------------------------------------------------------------------
+
+================================================================================
+CHUNK 9/9491
+================================================================================
+METADATA:
+  Node Type: paragraph
+  Headings: ['7PMVNF\x012\x01PG\x01\x14\x1b\x01$IBQUFST\x0112\x01\x0e\x0121\x01PG\x01\x13\x19', '', '', '-JDFOTF\x1b\x01$$\x0e#: *4#/\x1b\x01\x01978-1-304-84002-8', '', 'OpenStax College']
+  Chars: 229
+
+TEXT:
+--------------------------------------------------------------------------------
+H1: 7PMVNF2PG$IBQUFST1221PG
+H4: -JDFOTF$$#: *4#/978-1-304-84002-8
+H6: OpenStax College
+---
+If you use this textbook as a bibliographic reference, then you should cite it as follows: OpenStax College, Anatomy &
+--------------------------------------------------------------------------------
+
+================================================================================
+CHUNK 10/9491
+================================================================================
+METADATA:
+  Node Type: paragraph
+  Headings: ['7PMVNF\x012\x01PG\x01\x14\x1b\x01$IBQUFST\x0112\x01\x0e\x0121\x01PG\x01\x13\x19', '', '', '-JDFOTF\x1b\x01$$\x0e#: *4#/\x1b\x01\x01978-1-304-84002-8', '', 'OpenStax College']
+  Chars: 198
+
+TEXT:
+--------------------------------------------------------------------------------
+H1: 7PMVNF2PG$IBQUFST1221PG
+H4: -JDFOTF$$#: *4#/978-1-304-84002-8
+H6: OpenStax College
+---
+Physiology. OpenStax College. 19 June 2013. < http://cnx.org/content/col11496/latest/>.
+--------------------------------------------------------------------------------
