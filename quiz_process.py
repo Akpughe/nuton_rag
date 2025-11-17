@@ -484,13 +484,13 @@ def generate_quiz_batch(context: str, mcq_count: int, tf_count: int) -> List[Dic
     """
     # Create the question distribution text
     question_distribution = get_question_distribution_text(mcq_count, tf_count)
-    
+
     # Generate the prompt for this batch
     prompt = QUIZ_PROMPT_TEMPLATE.format(
         question_distribution=question_distribution,
         context=context
     )
-    
+
     # Call LLM with Groq
     response = groq_client.chat.completions.create(
         model="openai/gpt-oss-120b",
@@ -502,48 +502,72 @@ def generate_quiz_batch(context: str, mcq_count: int, tf_count: int) -> List[Dic
         max_tokens=2048
     )
     text = response.choices[0].message.content
-    
+
     # Parse questions
-    return parse_quiz_questions(text)
+    questions = parse_quiz_questions(text)
+
+    # DIAGNOSTIC: Log if we got 0 questions to debug parsing issues
+    if len(questions) == 0:
+        import re
+        logging.warning(f"⚠️ Quiz batch generated 0 questions. Diagnostic info:")
+        logging.warning(f"Response length: {len(text)} chars")
+        logging.warning(f"First 600 chars:\n{text[:600]}")
+        logging.warning(f"Contains '---': {len(re.findall(r'---+', text))} separators")
+        logging.warning(f"Contains 'Type:': {len(re.findall(r'Type:', text, re.I))}")
+        logging.warning(f"Contains 'Question:': {len(re.findall(r'Question:', text, re.I))}")
+        logging.warning(f"Contains 'Answer:': {len(re.findall(r'Answer:', text, re.I))}")
+        logging.warning(f"Contains 'Explanation:': {len(re.findall(r'Explanation:', text, re.I))}")
+
+    return questions
 
 def parse_quiz_questions(text: str) -> List[Dict[str, Any]]:
     """
     Parse quiz questions from LLM output.
+    Supports multiline field values for better LLM response handling.
     """
     questions = []
     import re
     blocks = re.split(r'---+', text)
     qid = 1
+
     for block in blocks:
         block = block.strip()
         if not block:
             continue
-        
-        # Parse type
-        type_match = re.search(r'Type:\s*(mcq|true_false)', block, re.IGNORECASE)
+
+        # Parse type using case-insensitive regex
+        type_match = re.search(r'Type:\s*(mcq|true_false)', block, re.IGNORECASE | re.DOTALL)
         qtype = type_match.group(1).lower() if type_match else None
-        
-        # Parse question
-        q_match = re.search(r'Question:\s*(.+)', block)
-        question_text = q_match.group(1).strip() if q_match else None
-        
-        # Parse options (for MCQ)
+
+        # Parse question - use DOTALL to match multiline content
+        q_match = re.search(r'Question:\s*(.+?)(?=\n[A-D]\.|Answer:|Explanation:|$)', block, re.DOTALL)
+        question_text = q_match.group(1).strip().replace('\n', ' ') if q_match else None
+
+        # Parse options (for MCQ) - handle multiline options
         options = []
         if qtype == 'mcq':
             for opt in ['A', 'B', 'C', 'D']:
-                opt_match = re.search(rf'{opt}\.\s*(.+)', block)
+                # Match from option letter to next option, Answer, or Explanation
+                opt_pattern = rf'{opt}\.\s*(.+?)(?=\n[A-D]\.|Answer:|Explanation:|$)'
+                opt_match = re.search(opt_pattern, block, re.DOTALL)
                 if opt_match:
-                    options.append({opt.lower(): opt_match.group(1).strip()})
-        
-        # Parse answer
-        ans_match = re.search(r'Answer:\s*([A-D]|True|False)', block)
+                    opt_text = opt_match.group(1).strip().replace('\n', ' ')
+                    options.append({opt.lower(): opt_text})
+
+        # Parse answer - keep this single line as answers should be short
+        ans_match = re.search(r'Answer:\s*([A-D]|True|False)', block, re.IGNORECASE)
         correct_option = ans_match.group(1) if ans_match else None
-        
-        # Parse explanation
-        exp_match = re.search(r'Explanation:\s*(.+)', block)
-        explanation = exp_match.group(1).strip() if exp_match else None
-        
-        if qtype and question_text and correct_option and explanation:
+
+        # Parse explanation - handle multiline explanations
+        exp_match = re.search(r'Explanation:\s*(.+?)(?=\n(?:Type:|Question:|---)|$)', block, re.DOTALL)
+        explanation = exp_match.group(1).strip().replace('\n', ' ') if exp_match else None
+
+        # Create question object if we have minimum required fields
+        if qtype and question_text and correct_option:
+            # Fill in explanation if missing
+            if not explanation:
+                explanation = "Review the material for context."
+
             q = {
                 "type": qtype,
                 "question_id": f"q{qid}",
@@ -555,7 +579,7 @@ def parse_quiz_questions(text: str) -> List[Dict[str, Any]]:
                 q["options"] = options
             questions.append(q)
             qid += 1
-    
+
     return questions
 
 def simplify_quiz_text(text: str) -> str:
