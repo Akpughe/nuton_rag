@@ -259,9 +259,14 @@ class MultimodalEmbedder:
             else:
                 raise ValueError(f"Unsupported image type: {type(img)}")
 
+        # IMPORTANT: Use smaller batch size for images to avoid payload size limits
+        # Base64-encoded images can be very large (50-500KB each)
+        # Large batches can exceed API payload limits causing 400 errors
+        image_batch_size = 5  # Conservative limit to keep requests under ~2-3MB
+
         # Process in batches
-        for i in range(0, len(processed_images), self.batch_size):
-            batch = processed_images[i:i + self.batch_size]
+        for i in range(0, len(processed_images), image_batch_size):
+            batch = processed_images[i:i + image_batch_size]
 
             # Call Jina API
             headers = {
@@ -301,7 +306,7 @@ class MultimodalEmbedder:
                 batch_embeddings = [item['embedding'] for item in result['data']]
                 all_embeddings.extend(batch_embeddings)
 
-                logger.info(f"Embedded image batch {i // self.batch_size + 1}/{(len(processed_images) + self.batch_size - 1) // self.batch_size}")
+                logger.info(f"Embedded image batch {i // image_batch_size + 1}/{(len(processed_images) + image_batch_size - 1) // image_batch_size}")
 
             except Exception as e:
                 logger.error(f"Error embedding image batch with Jina: {e}")
