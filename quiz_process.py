@@ -539,28 +539,40 @@ def parse_quiz_questions(text: str) -> List[Dict[str, Any]]:
         type_match = re.search(r'Type:\s*(mcq|true_false)', block, re.IGNORECASE | re.DOTALL)
         qtype = type_match.group(1).lower() if type_match else None
 
-        # Parse question - use DOTALL to match multiline content
-        q_match = re.search(r'Question:\s*(.+?)(?=\n[A-D]\.|Answer:|Explanation:|$)', block, re.DOTALL)
-        question_text = q_match.group(1).strip().replace('\n', ' ') if q_match else None
+        # Parse question - use DOTALL to match multiline content, strip markdown
+        q_match = re.search(r'Question:\s*(.+?)(?=\n[A-D]\.|Answer:|Explanation:|Type:|$)', block, re.DOTALL)
+        if q_match:
+            question_text = q_match.group(1).strip().replace('\n', ' ')
+            # Strip markdown formatting from content
+            question_text = re.sub(r'^\*+|\*+$', '', question_text).strip()
+        else:
+            question_text = None
 
-        # Parse options (for MCQ) - handle multiline options
+        # Parse options (for MCQ) - handle multiline options, strip markdown
         options = []
         if qtype == 'mcq':
             for opt in ['A', 'B', 'C', 'D']:
                 # Match from option letter to next option, Answer, or Explanation
-                opt_pattern = rf'{opt}\.\s*(.+?)(?=\n[A-D]\.|Answer:|Explanation:|$)'
+                opt_pattern = rf'{opt}\.\s*(.+?)(?=\n[A-D]\.|Answer:|Explanation:|Type:|$)'
                 opt_match = re.search(opt_pattern, block, re.DOTALL)
                 if opt_match:
                     opt_text = opt_match.group(1).strip().replace('\n', ' ')
+                    # Strip markdown formatting
+                    opt_text = re.sub(r'^\*+|\*+$', '', opt_text).strip()
                     options.append({opt.lower(): opt_text})
 
         # Parse answer - keep this single line as answers should be short
         ans_match = re.search(r'Answer:\s*([A-D]|True|False)', block, re.IGNORECASE)
         correct_option = ans_match.group(1) if ans_match else None
 
-        # Parse explanation - handle multiline explanations
+        # Parse explanation - handle multiline explanations, strip markdown
         exp_match = re.search(r'Explanation:\s*(.+?)(?=\n(?:Type:|Question:|---)|$)', block, re.DOTALL)
-        explanation = exp_match.group(1).strip().replace('\n', ' ') if exp_match else None
+        if exp_match:
+            explanation = exp_match.group(1).strip().replace('\n', ' ')
+            # Strip markdown formatting
+            explanation = re.sub(r'^\*+|\*+$', '', explanation).strip()
+        else:
+            explanation = None
 
         # Create question object if we have minimum required fields
         if qtype and question_text and correct_option:
