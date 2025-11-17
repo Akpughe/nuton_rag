@@ -443,27 +443,35 @@ def generate_quiz_from_chunks_parallel(
     # This is a last resort to ensure we return exactly the requested number
     if len(mcq_questions) < mcq_count:
         orig_mcq = mcq_questions.copy()
-        while len(mcq_questions) < mcq_count:
-            # Take a random question and create a variation
-            source_q = random.choice(orig_mcq)
-            new_q = source_q.copy()
-            new_q["question_id"] = f"q{len(deduped) + 1}"
-            # Add a prefix to make it unique
-            new_q["question_text"] = f"Regarding the same topic: {source_q['question_text']}"
-            mcq_questions.append(new_q)
-            deduped.append(new_q)
-    
+        # Only duplicate if we have at least one question to work with
+        if orig_mcq:
+            while len(mcq_questions) < mcq_count:
+                # Take a random question and create a variation
+                source_q = random.choice(orig_mcq)
+                new_q = source_q.copy()
+                new_q["question_id"] = f"q{len(deduped) + 1}"
+                # Add a prefix to make it unique
+                new_q["question_text"] = f"Regarding the same topic: {source_q['question_text']}"
+                mcq_questions.append(new_q)
+                deduped.append(new_q)
+        else:
+            logging.warning(f"Cannot generate {mcq_count} MCQ questions - no MCQ questions were parsed from LLM responses")
+
     if len(tf_questions) < tf_count:
         orig_tf = tf_questions.copy()
-        while len(tf_questions) < tf_count:
-            # Take a random question and create a variation
-            source_q = random.choice(orig_tf)
-            new_q = source_q.copy()
-            new_q["question_id"] = f"q{len(deduped) + 1}"
-            # Add a prefix to make it unique
-            new_q["question_text"] = f"Regarding the same concept: {source_q['question_text']}"
-            tf_questions.append(new_q)
-            deduped.append(new_q)
+        # Only duplicate if we have at least one question to work with
+        if orig_tf:
+            while len(tf_questions) < tf_count:
+                # Take a random question and create a variation
+                source_q = random.choice(orig_tf)
+                new_q = source_q.copy()
+                new_q["question_id"] = f"q{len(deduped) + 1}"
+                # Add a prefix to make it unique
+                new_q["question_text"] = f"Regarding the same concept: {source_q['question_text']}"
+                tf_questions.append(new_q)
+                deduped.append(new_q)
+        else:
+            logging.warning(f"Cannot generate {tf_count} True/False questions - no T/F questions were parsed from LLM responses")
     
     # Trim to requested counts (in case we have extras)
     final_mcq = mcq_questions[:mcq_count]
