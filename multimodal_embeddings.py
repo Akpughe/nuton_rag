@@ -242,77 +242,45 @@ class MultimodalEmbedder:
         return all_embeddings
 
     def _embed_images_jina(self, images: List[Union[str, bytes]], normalize: bool = True) -> List[List[float]]:
-        """Embed images using Jina CLIP-v2."""
-        all_embeddings = []
+        """
+        Embed images using Jina CLIP-v2.
 
-        # Convert images to proper format
-        processed_images = []
-        for img in images:
-            if isinstance(img, bytes):
-                # Convert bytes to base64 data URI
-                img_base64 = base64.b64encode(img).decode('utf-8')
-                img_data_uri = f"data:image/jpeg;base64,{img_base64}"
-                processed_images.append(img_data_uri)
-            elif isinstance(img, str):
-                # Assume it's already a data URI or URL
-                processed_images.append(img)
-            else:
-                raise ValueError(f"Unsupported image type: {type(img)}")
+        IMPORTANT LIMITATION:
+        The Jina REST API (/v1/embeddings) does NOT support base64-encoded images.
+        When base64 data URIs are sent, the API treats them as text and hits the
+        8194 token limit (from jina-embeddings-v2 text model).
 
-        # IMPORTANT: Use smaller batch size for images to avoid payload size limits
-        # Base64-encoded images can be very large (50-500KB each)
-        # Large batches can exceed API payload limits causing 400 errors
-        image_batch_size = 5  # Conservative limit to keep requests under ~2-3MB
+        The API only supports:
+        - Image URLs (https://...)
+        - NOT base64 data URIs (data:image/...)
 
-        # Process in batches
-        for i in range(0, len(processed_images), image_batch_size):
-            batch = processed_images[i:i + image_batch_size]
+        This method will raise a clear error explaining the limitation and alternatives.
+        """
+        logger.error("=" * 80)
+        logger.error("JINA CLIP v2 API LIMITATION DETECTED")
+        logger.error("=" * 80)
+        logger.error(
+            "The Jina REST API endpoint (/v1/embeddings) does NOT support base64-encoded images.\n"
+            "When base64 data URIs are sent, the API treats them as text and returns:\n"
+            "  'Input text exceeds maximum length of 8194 tokens'\n\n"
+            "The API only supports IMAGE URLS, not base64 data.\n\n"
+            "ALTERNATIVES:\n"
+            "  1. Skip image embeddings (text-only RAG will still work)\n"
+            "  2. Upload images to cloud storage and use URLs\n"
+            "  3. Use HuggingFace transformers to run jina-clip-v2 locally:\n"
+            "     pip install transformers pillow torch\n"
+            "     from transformers import AutoModel\n"
+            "     model = AutoModel.from_pretrained('jinaai/jina-clip-v2', trust_remote_code=True)\n"
+            "  4. Use a different embedding service that supports base64\n\n"
+            f"Current request: {len(images)} images with base64 data\n"
+        )
+        logger.error("=" * 80)
 
-            # Call Jina API
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {self.api_key}"
-            }
-
-            # Note: Jina CLIP v2 API does not support 'normalized' and 'embedding_type'
-            # parameters for image inputs (only for text). Sending these params with
-            # images causes 400 Bad Request error.
-            payload = {
-                "model": "jina-clip-v2",
-                "input": batch
-            }
-
-            try:
-                response = requests.post(
-                    self.jina_endpoint,
-                    headers=headers,
-                    json=payload,
-                    timeout=30
-                )
-
-                # Log detailed error if request fails
-                if response.status_code != 200:
-                    logger.error(f"Jina API error {response.status_code}: {response.text}")
-                    logger.error(f"Request payload: model={payload['model']}, batch_size={len(batch)}")
-                    # Log first image data URI prefix to debug format issues
-                    if batch:
-                        logger.error(f"First image prefix: {batch[0][:100]}...")
-
-                response.raise_for_status()
-
-                result = response.json()
-
-                # Extract embeddings
-                batch_embeddings = [item['embedding'] for item in result['data']]
-                all_embeddings.extend(batch_embeddings)
-
-                logger.info(f"Embedded image batch {i // image_batch_size + 1}/{(len(processed_images) + image_batch_size - 1) // image_batch_size}")
-
-            except Exception as e:
-                logger.error(f"Error embedding image batch with Jina: {e}")
-                raise
-
-        return all_embeddings
+        raise NotImplementedError(
+            "Jina REST API does not support base64 images. "
+            "Only image URLs are supported. "
+            "See logs above for alternatives."
+        )
 
     def _embed_texts_openai(self, texts: List[str]) -> List[List[float]]:
         """Embed texts using OpenAI."""
