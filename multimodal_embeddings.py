@@ -245,42 +245,111 @@ class MultimodalEmbedder:
         """
         Embed images using Jina CLIP-v2.
 
-        IMPORTANT LIMITATION:
-        The Jina REST API (/v1/embeddings) does NOT support base64-encoded images.
-        When base64 data URIs are sent, the API treats them as text and hits the
-        8194 token limit (from jina-embeddings-v2 text model).
+        IMPORTANT: The Jina REST API only supports IMAGE URLS, not base64 data.
 
-        The API only supports:
-        - Image URLs (https://...)
-        - NOT base64 data URIs (data:image/...)
+        Args:
+            images: List of image URLs (https://...) or base64 strings
+                   If base64 is detected, will raise error with alternatives
 
-        This method will raise a clear error explaining the limitation and alternatives.
+        Returns:
+            List of embedding vectors
+
+        Raises:
+            NotImplementedError: If base64 images are provided instead of URLs
         """
-        logger.error("=" * 80)
-        logger.error("JINA CLIP v2 API LIMITATION DETECTED")
-        logger.error("=" * 80)
-        logger.error(
-            "The Jina REST API endpoint (/v1/embeddings) does NOT support base64-encoded images.\n"
-            "When base64 data URIs are sent, the API treats them as text and returns:\n"
-            "  'Input text exceeds maximum length of 8194 tokens'\n\n"
-            "The API only supports IMAGE URLS, not base64 data.\n\n"
-            "ALTERNATIVES:\n"
-            "  1. Skip image embeddings (text-only RAG will still work)\n"
-            "  2. Upload images to cloud storage and use URLs\n"
-            "  3. Use HuggingFace transformers to run jina-clip-v2 locally:\n"
-            "     pip install transformers pillow torch\n"
-            "     from transformers import AutoModel\n"
-            "     model = AutoModel.from_pretrained('jinaai/jina-clip-v2', trust_remote_code=True)\n"
-            "  4. Use a different embedding service that supports base64\n\n"
-            f"Current request: {len(images)} images with base64 data\n"
-        )
-        logger.error("=" * 80)
+        all_embeddings = []
 
-        raise NotImplementedError(
-            "Jina REST API does not support base64 images. "
-            "Only image URLs are supported. "
-            "See logs above for alternatives."
-        )
+        # Check if we have base64 data (not supported)
+        has_base64 = False
+        for img in images:
+            if isinstance(img, bytes) or (isinstance(img, str) and img.startswith('data:')):
+                has_base64 = True
+                break
+
+        if has_base64:
+            logger.error("=" * 80)
+            logger.error("JINA CLIP v2 API LIMITATION DETECTED")
+            logger.error("=" * 80)
+            logger.error(
+                "The Jina REST API endpoint (/v1/embeddings) does NOT support base64-encoded images.\n"
+                "When base64 data URIs are sent, the API treats them as text and returns:\n"
+                "  'Input text exceeds maximum length of 8194 tokens'\n\n"
+                "The API only supports IMAGE URLS, not base64 data.\n\n"
+                "SOLUTION: Upload images to S3 first:\n"
+                "  from s3_image_storage import upload_images_to_s3\n"
+                "  urls = upload_images_to_s3(images, document_id, space_id)\n"
+                "  embeddings = embedder.embed_images(urls)  # Use URLs\n\n"
+                "ALTERNATIVES:\n"
+                "  1. Use s3_image_storage module (recommended)\n"
+                "  2. Upload images to any cloud storage and use URLs\n"
+                "  3. Use HuggingFace transformers to run jina-clip-v2 locally\n"
+                "  4. Use a different embedding service that supports base64\n\n"
+                f"Current request: {len(images)} images with base64 data\n"
+            )
+            logger.error("=" * 80)
+
+            raise NotImplementedError(
+                "Jina REST API does not support base64 images. "
+                "Upload to S3 first using s3_image_storage module. "
+                "See logs above for details."
+            )
+
+        # All inputs should be URLs at this point
+        image_urls = [str(img) for img in images]
+
+        # Validate URLs
+        for url in image_urls:
+            if not url.startswith(('http://', 'https://')):
+                raise ValueError(f"Invalid image URL: {url}. Must start with http:// or https://")
+
+        # Use moderate batch size for URL-based images
+        image_batch_size = 20  # URLs are small, can use larger batches
+
+        # Process in batches
+        for i in range(0, len(image_urls), image_batch_size):
+            batch = image_urls[i:i + image_batch_size]
+
+            # Call Jina API
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"
+            }
+
+            # Minimal payload for image URLs
+            payload = {
+                "model": "jina-clip-v2",
+                "input": batch
+            }
+
+            try:
+                response = requests.post(
+                    self.jina_endpoint,
+                    headers=headers,
+                    json=payload,
+                    timeout=60  # Longer timeout for image processing
+                )
+
+                # Log detailed error if request fails
+                if response.status_code != 200:
+                    logger.error(f"Jina API error {response.status_code}: {response.text}")
+                    logger.error(f"Request payload: model={payload['model']}, batch_size={len(batch)}")
+                    logger.error(f"First URL: {batch[0]}")
+
+                response.raise_for_status()
+
+                result = response.json()
+
+                # Extract embeddings
+                batch_embeddings = [item['embedding'] for item in result['data']]
+                all_embeddings.extend(batch_embeddings)
+
+                logger.info(f"Embedded image batch {i // image_batch_size + 1}/{(len(image_urls) + image_batch_size - 1) // image_batch_size}")
+
+            except Exception as e:
+                logger.error(f"Error embedding image batch with Jina: {e}")
+                raise
+
+        return all_embeddings
 
     def _embed_texts_openai(self, texts: List[str]) -> List[List[float]]:
         """Embed texts using OpenAI."""
