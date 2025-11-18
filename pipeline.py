@@ -433,28 +433,31 @@ async def process_document_with_openai(
 
                 try:
                     from multimodal_embeddings import MultimodalEmbedder
+                    from s3_image_storage import S3ImageStorage
 
-                    # Initialize embedder
-                    embedder = MultimodalEmbedder(model="jina-clip-v2", batch_size=batch_size)
+                    # Step 1: Upload images to S3 and get URLs
+                    logging.info(f"📤 Uploading {len(images_with_data)} images to S3...")
+                    s3_storage = S3ImageStorage()
+                    image_urls = s3_storage.upload_images_batch(
+                        images=images_with_data,
+                        document_id=document_id,
+                        space_id=space_id
+                    )
 
-                    # Extract base64 data for embedding
-                    image_data_list = []
-                    for img in images_with_data:
-                        img_base64 = img.get('image_base64', '')
-                        if img_base64:
-                            # Jina expects data URI format
-                            if not img_base64.startswith('data:'):
-                                img_data_uri = f"data:image/jpeg;base64,{img_base64}"
-                            else:
-                                img_data_uri = img_base64
-                            image_data_list.append(img_data_uri)
-
-                    # Embed images
-                    if image_data_list:
-                        image_embeddings = embedder.embed_images(image_data_list, normalize=True)
-                        logging.info(f"✅ Image embedding complete: {len(image_embeddings)} embeddings (1024 dims)")
+                    if not image_urls:
+                        logging.warning("No images were uploaded to S3")
+                        image_embeddings = []
                     else:
-                        logging.warning("No valid image data found for embedding")
+                        logging.info(f"✅ Uploaded {len(image_urls)} images to S3")
+
+                        # Step 2: Embed images using URLs
+                        embedder = MultimodalEmbedder(model="jina-clip-v2", batch_size=batch_size)
+                        image_embeddings = embedder.embed_images(image_urls, normalize=True)
+                        logging.info(f"✅ Image embedding complete: {len(image_embeddings)} embeddings (1024 dims)")
+
+                        # Step 3: Add URLs to image metadata for later retrieval
+                        for img, url in zip(images_with_data, image_urls):
+                            img['image_url'] = url
 
                 except Exception as e:
                     logging.error(f"❌ Image embedding failed: {e}")
