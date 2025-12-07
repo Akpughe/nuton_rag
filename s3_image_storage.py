@@ -47,7 +47,7 @@ class S3ImageStorage:
             aws_secret_access_key: AWS secret key (defaults to env var)
             aws_region: AWS region (defaults to env var)
         """
-        self.bucket_name = bucket_name or os.getenv("AWS_S3_BUCKET", "nuton-rag-images")
+        self.bucket_name = bucket_name or os.getenv("AWS_S3_BUCKET", "nutonai")
         self.aws_region = aws_region or os.getenv("AWS_REGION", "us-east-1")
 
         # Initialize S3 client

@@ -5,6 +5,7 @@ import logging
 from pinecone import Pinecone
 import concurrent.futures
 from functools import lru_cache
+from pinecone_cache import PineconeCache
 
 # Load environment variables
 load_dotenv()
@@ -20,6 +21,9 @@ SPARSE_INDEX = f"{PINECONE_INDEX_NAME}-sparse"  # Keep existing sparse index
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Initialize Pinecone Cache
+pinecone_cache = PineconeCache()
 
 # Initialize Pinecone client using new style
 try:
@@ -358,6 +362,20 @@ def hybrid_search_parallel(
     Returns:
         List of merged, deduped hits (dicts with id, score, metadata).
     """
+    # Check cache first
+    cached_results = pinecone_cache.get(
+        function_name="hybrid_search_parallel",
+        query_emb=query_emb,
+        query_sparse=query_sparse,
+        top_k=top_k,
+        doc_id=doc_id,
+        space_id=space_id,
+        acl_tags=acl_tags,
+        include_full_text=include_full_text
+    )
+    if cached_results:
+        return cached_results
+
     dense_index = pc.Index(DENSE_INDEX)
     sparse_index = pc.Index(SPARSE_INDEX)
     
@@ -422,7 +440,22 @@ def hybrid_search_parallel(
                 }
     
     logger.info(f"Parallel search returning {len(all_hits)} total deduplicated hits")
-    return list(all_hits.values())
+    results = list(all_hits.values())
+    
+    # Cache the results
+    pinecone_cache.set(
+        function_name="hybrid_search_parallel",
+        results=results,
+        query_emb=query_emb,
+        query_sparse=query_sparse,
+        top_k=top_k,
+        doc_id=doc_id,
+        space_id=space_id,
+        acl_tags=acl_tags,
+        include_full_text=include_full_text
+    )
+    
+    return results
 
 # Keep the original hybrid_search function for backward compatibility
 def hybrid_search(
@@ -585,6 +618,20 @@ def hybrid_search_document_aware(
     if not document_ids:
         logging.warning("No document IDs provided for document-aware search")
         return []
+
+    # Check cache first
+    cached_results = pinecone_cache.get(
+        function_name="hybrid_search_document_aware",
+        query_emb=query_emb,
+        query_sparse=query_sparse,
+        document_ids=document_ids,
+        space_id=space_id,
+        acl_tags=acl_tags,
+        top_k_per_doc=top_k_per_doc,
+        include_full_text=include_full_text
+    )
+    if cached_results:
+        return cached_results
     
     dense_index = pc.Index(DENSE_INDEX)
     sparse_index = pc.Index(SPARSE_INDEX)
@@ -668,7 +715,22 @@ def hybrid_search_document_aware(
     for doc_id, count in document_hit_counts.items():
         logging.info(f"  Document {doc_id}: {count} chunks")
     
-    return list(all_hits.values())
+    results = list(all_hits.values())
+    
+    # Cache the results
+    pinecone_cache.set(
+        function_name="hybrid_search_document_aware",
+        results=results,
+        query_emb=query_emb,
+        query_sparse=query_sparse,
+        document_ids=document_ids,
+        space_id=space_id,
+        acl_tags=acl_tags,
+        top_k_per_doc=top_k_per_doc,
+        include_full_text=include_full_text
+    )
+    
+    return results
 
 def rerank_results_document_aware(
     query: str,
