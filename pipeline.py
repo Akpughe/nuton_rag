@@ -418,9 +418,43 @@ async def process_document_with_openai(
 
         logging.info(f"Successfully embedded {len(embeddings)} chunks with Jina CLIP-v2 (1024 dims)")
 
-        # 2.5. Process images if extracted by Mistral OCR
+        # 3. Prepare fields for pdfs table
+        file_name = os.path.basename(file_path)
+        file_type = os.path.splitext(file_path)[1][1:] or "unknown"
+        
+        # Safely access space_id
+        if not isinstance(metadata, dict):
+            logging.warning(f"Metadata is not a dictionary: {type(metadata)}")
+            metadata = {"space_id": "default"}
+            
+        space_id = metadata.get("space_id")
+        if not space_id:
+            logging.warning("No space_id found in metadata, using default")
+            space_id = "default"
+            
+        logging.info(f"Using space_id: {space_id}")
+        
+        extracted_text = "No text extracted yet"
+        
+        # Use the file_path from metadata if provided, otherwise use the local file path
+        db_file_path = metadata.get("file_path", file_path)
+        
+        pdfs_row = {
+            "space_id": space_id,
+            "file_path": db_file_path,  # This can now be a URL
+            "extracted_text": extracted_text,
+            "file_type": file_type,
+            "file_name": metadata.get("filename", file_name)
+        }
+        
+        # 4. Insert into Supabase and get document_id
+        document_id = insert_pdf_record(pdfs_row)
+        logging.info(f"Inserted document into Supabase with ID: {document_id}")
+
+        # 4.5. Process images if extracted by Mistral OCR (AFTER document_id is created)
         images = []
         image_embeddings = []
+        images_with_data = []
         if extraction_result is not None and extraction_result.get('images'):
             images = extraction_result.get('images', [])
             logging.info(f"📷 Found {len(images)} images in document")
@@ -466,39 +500,6 @@ async def process_document_with_openai(
             else:
                 logging.info("No images with base64 data found")
 
-        # 3. Prepare fields for pdfs table
-        file_name = os.path.basename(file_path)
-        file_type = os.path.splitext(file_path)[1][1:] or "unknown"
-        
-        # Safely access space_id
-        if not isinstance(metadata, dict):
-            logging.warning(f"Metadata is not a dictionary: {type(metadata)}")
-            metadata = {"space_id": "default"}
-            
-        space_id = metadata.get("space_id")
-        if not space_id:
-            logging.warning("No space_id found in metadata, using default")
-            space_id = "default"
-            
-        logging.info(f"Using space_id: {space_id}")
-        
-        extracted_text = "No text extracted yet"
-        
-        # Use the file_path from metadata if provided, otherwise use the local file path
-        db_file_path = metadata.get("file_path", file_path)
-        
-        pdfs_row = {
-            "space_id": space_id,
-            "file_path": db_file_path,  # This can now be a URL
-            "extracted_text": extracted_text,
-            "file_type": file_type,
-            "file_name": metadata.get("filename", file_name)
-        }
-        
-        # 4. Insert into Supabase and get document_id
-        document_id = insert_pdf_record(pdfs_row)
-        logging.info(f"Inserted document into Supabase with ID: {document_id}")
-        
         # 5. Upsert to Pinecone
         try:
             # Use filename from metadata if provided, otherwise use file_name from path
