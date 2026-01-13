@@ -503,6 +503,7 @@ def upsert_generated_content_notes(document_id: str, notes_markdown: str, space_
                 "yts_id": document_id,
                 "space_id": space_id,
                 "new_note": notes_markdown,
+                "summary": notes_markdown,
                 "updated_at": datetime.now().isoformat()
             }
         else:
@@ -511,6 +512,7 @@ def upsert_generated_content_notes(document_id: str, notes_markdown: str, space_
                 "pdf_id": document_id,
                 "space_id": space_id,
                 "new_note": notes_markdown,
+                "summary": notes_markdown,
                 "updated_at": datetime.now().isoformat()
             }
         
