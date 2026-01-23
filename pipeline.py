@@ -1180,17 +1180,37 @@ def process_youtube(
             file.write(transcript_text)
         logging.info(f"Saved transcript to file: {file_path}")
         
-        # Direct chunking of transcript text without requiring file
-        logging.info(f"Chunking transcript directly from text")
-        chunks = chunk_document(
-            text=transcript_text,  # Pass text directly to chunker
+        # Chunk with Chonkie RecursiveChunker (matching process_document_with_openai)
+        logging.info(f"✂️ Chunking transcript with Chonkie RecursiveChunker (size={chunk_size})")
+
+        # Initialize tokenizer
+        chonkie_tokenizer = AutoTokenizer("cl100k_base")  # OpenAI tokenizer
+
+        # Initialize RecursiveChunker
+        chunker = RecursiveChunker(
+            tokenizer=chonkie_tokenizer,
             chunk_size=chunk_size,
-            overlap_tokens=overlap_tokens,
-            recipe="markdown",  # Use text recipe for transcript format with timestamps
-            lang="en",
             min_characters_per_chunk=12
         )
-        chunks = flatten_chunks(chunks)
+
+        # Chunk the text
+        chunk_objects = chunker.chunk(transcript_text)
+
+        # Convert to dicts (matching test format)
+        chunks = []
+        for i, chunk_obj in enumerate(chunk_objects):
+            chunk_dict = {
+                "text": chunk_obj.text,
+                "start_index": chunk_obj.start_index,
+                "end_index": chunk_obj.end_index,
+                "token_count": chunk_obj.token_count,
+                "chunk_index": i
+            }
+            chunks.append(chunk_dict)
+
+        logging.info(f"✅ Chunking complete: {len(chunks)} chunks")
+        logging.info(f"   Total tokens: {sum(c['token_count'] for c in chunks)}")
+        logging.info(f"   Avg tokens/chunk: {sum(c['token_count'] for c in chunks) / len(chunks):.1f}")
         
         if not chunks:
             logging.error(f"No chunks generated from transcript")
