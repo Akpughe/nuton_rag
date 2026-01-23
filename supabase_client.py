@@ -498,7 +498,7 @@ def upsert_generated_content_notes(document_id: str, notes_markdown: str, space_
     try:
         # Determine which column to use for lookup and insertion
         if is_youtube:
-            lookup_column = "yts_id"
+            lookup_column = "yt_id"
             insert_data = {
                 "yt_id": document_id,
                 "space_id": space_id,
