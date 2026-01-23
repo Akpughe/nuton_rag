@@ -500,7 +500,7 @@ def upsert_generated_content_notes(document_id: str, notes_markdown: str, space_
         if is_youtube:
             lookup_column = "yts_id"
             insert_data = {
-                "yts_id": document_id,
+                "yt_id": document_id,
                 "space_id": space_id,
                 "new_note": notes_markdown,
                 "summary": notes_markdown,
