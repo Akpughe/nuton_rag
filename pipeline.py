@@ -10,29 +10,28 @@ import json
 import time
 from functools import lru_cache
 
-from chonkie_client import chunk_document, embed_chunks, embed_chunks_v2, embed_query, embed_query_v2, embed_chunks_multimodal, embed_query_multimodal
-from pinecone_client import upsert_vectors, upsert_image_vectors, hybrid_search, hybrid_search_parallel, rerank_results, hybrid_search_document_aware, rerank_results_document_aware
-from supabase_client import insert_pdf_record, insert_yts_record, get_documents_in_space, check_document_type, upsert_generated_content_notes
-from groq_client import generate_answer, generate_answer_document_aware
-import openai_client
+from clients.chonkie_client import chunk_document, embed_chunks, embed_chunks_v2, embed_query, embed_query_v2, embed_chunks_multimodal, embed_query_multimodal
+from clients.pinecone_client import upsert_vectors, upsert_image_vectors, hybrid_search, hybrid_search_parallel, rerank_results, hybrid_search_document_aware, rerank_results_document_aware
+from clients.supabase_client import insert_pdf_record, insert_yts_record, get_documents_in_space, check_document_type, upsert_generated_content_notes
+from clients.groq_client import generate_answer, generate_answer_document_aware
+import clients.openai_client as openai_client
 from services.wetrocloud_youtube import WetroCloudYouTubeService
 from services.youtube_transcript_service import YouTubeTranscriptService
 from services.ytdlp_transcript_service import YTDLPTranscriptService
-from flashcard_process import generate_flashcards, regenerate_flashcards
+from processors.flashcard_process import generate_flashcards, regenerate_flashcards
 from pydantic import BaseModel
 from typing import Optional, List
-from quiz_process import generate_quiz, regenerate_quiz
-from hybrid_pdf_processor import extract_and_chunk_pdf_async
-from diagram_explainer import explain_diagrams_batch
-from mistral_ocr_extractor import MistralOCRExtractor, MistralOCRConfig
+from processors.quiz_process import generate_quiz, regenerate_quiz
+from processors.hybrid_pdf_processor import extract_and_chunk_pdf_async
+from processors.diagram_explainer import explain_diagrams_batch
+from processors.mistral_ocr_extractor import MistralOCRExtractor, MistralOCRConfig
 from chonkie import RecursiveChunker
 from chonkie.tokenizer import AutoTokenizer
 
-from prompts import main_prompt, general_knowledge_prompt, simple_general_knowledge_prompt, no_docs_in_space_prompt, no_relevant_in_scope_prompt, additional_space_only_prompt
-from intelligent_enrichment import create_enriched_system_prompt
-from enrichment_examples import create_few_shot_enhanced_prompt
-from enhanced_prompts import get_domain_from_context
-from websearch_client import analyze_and_generate_queries, perform_contextual_websearch_async, synthesize_rag_and_web_results
+from prompts.prompts import main_prompt, general_knowledge_prompt, simple_general_knowledge_prompt, no_docs_in_space_prompt, no_relevant_in_scope_prompt, additional_space_only_prompt
+from prompts.enrichment_examples import create_few_shot_enhanced_prompt
+from prompts.enhanced_prompts import get_domain_from_context
+from clients.websearch_client import analyze_and_generate_queries, perform_contextual_websearch_async, synthesize_rag_and_web_results
 from services.google_drive_service import GoogleDriveService
 
 
@@ -432,7 +431,7 @@ async def process_document_with_openai(
                 logging.info(f"🧠 Embedding {len(images_with_data)} images with Jina CLIP-v2")
 
                 try:
-                    from multimodal_embeddings import MultimodalEmbedder
+                    from embeddings.multimodal_embeddings import MultimodalEmbedder
 
                     # Initialize embedder
                     embedder = MultimodalEmbedder(model="jina-clip-v2", batch_size=batch_size)

@@ -1,0 +1,358 @@
+
+╭─── Claude Code v2.0.75 ──────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting        │
+│                 Welcome back David!                │ started                 │
+│                                                    │ Run /init to create a … │
+│                     * ▐▛███▜▌ *                    │ ─────────────────────── │
+│                    * ▝▜█████▛▘ *                   │ Recent activity         │
+│                     *  ▘▘ ▝▝  *                    │ No recent activity      │
+│                                                    │                         │
+│ Opus 4.5 · Claude Pro · davidakpughe2@gmail.com's  │                         │
+│ Organization                                       │                         │
+│               ~/Documents/nuton_rag                │                         │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+  A gift for you
+  Your rate limits are 2x higher through 12/31. Enjoy the extra room to think!
+
+> '/Users/davak/Documents/nuton_rag/pipeline.py' -- I want to write articles
+ about most of the things we are doing here -- I think people can learn from
+ it -- so I was thinking we can starting writing about the RAG process and 
+system we have like extraction, chunking, cleaning text with different 
+processes, embedding, talking about multi-modality, speed and all that -- so
+ you can plan, look at what we have and let me know how many articles we can
+ come up with first -- let me see their titles -- do not write the articles 
+yet o 00 this is just a planning phase -- create a folder for this 
+
+⏺ I'll explore your RAG system to understand all the components and processes, then come up with article topics. Let me start by examining the codebase.
+
+⏺ Explore(Explore RAG pipeline system)
+  ⎿  Done (31 tool uses · 80.3k tokens · 8m 55s)                           
+
+⏺ I've got a comprehensive view of your RAG system. This is a rich codebase with many interesting components. Let me write up a plan with potential article titles.
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ I've explored your RAG system thoroughly. Here are 12 potential articles I identified:
+
+  Proposed Article Titles
+
+  Core Pipeline (5 articles)
+
+  | #   | Title                                                                              |
+  |-----|------------------------------------------------------------------------------------|
+  | 1   | Building a Production RAG Pipeline with FastAPI: Architecture and Design Decisions |
+  | 2   | The Art of PDF Text Extraction: Multi-Strategy Approaches with Quality Scoring     |
+  | 3   | Cleaning PDF Extraction Artifacts: From CID Codes to Mid-Word Spaces               |
+  | 4   | Smart Chunking Strategies: Token-Based Semantic Splitting with Chonkie             |
+  | 5   | Selective Quality Correction: Saving 60-80% on LLM Costs with Smart Detection      |
+
+  Embeddings & Search (3 articles)
+
+  | #   | Title                                                                       |
+  |-----|-----------------------------------------------------------------------------|
+  | 6   | Multimodal Embeddings with Jina CLIP-v2: Unifying Text and Images           |
+  | 7   | Hybrid Search: Combining Dense and Sparse Retrieval with Parallel Execution |
+  | 8   | Reranking for RAG: From bge-reranker to Document-Aware Diversity            |
+
+  Multimodal & Advanced (4 articles)
+
+  | #   | Title                                                                         |
+  |-----|-------------------------------------------------------------------------------|
+  | 9   | Handling YouTube in RAG: Transcripts, Fallbacks, and Proxy Strategies         |
+  | 10  | Processing Diagrams and Images in RAG: From Extraction to Explanation         |
+  | 11  | RAG Performance Optimization: From Query Truncation to Batch Processing       |
+  | 12  | Building Educational Features on RAG: Flashcards, Quizzes, and Adaptive Notes |
+
+  ---
+                                                                           
+⏺ User answered Claude's questions:
+  ⎿  · Which articles interest you most or should I add/remove any topics? →
+      All 12 look good
+     · Where should I create the articles folder? → articles/
+
+⏺ All 12 articles confirmed. Let me update the final plan.
+
+⏺ Updated plan
+  ⎿  /plan to preview
+
+⏺ Plan finalized. Here's the summary:
+
+  12 Articles Confirmed:
+  1. Production RAG Pipeline with FastAPI
+  2. PDF Text Extraction Multi-Strategy
+  3. Cleaning PDF Extraction Artifacts
+  4. Smart Chunking with Chonkie
+  5. Selective Quality Correction (60-80% cost savings)
+  6. Multimodal Embeddings with Jina CLIP-v2
+  7. Hybrid Dense + Sparse Search
+  8. Reranking for RAG
+  9. YouTube Transcripts in RAG
+  10. Diagrams and Images in RAG
+  11. RAG Performance Optimization
+  12. Educational Features (Flashcards, Quizzes, Notes)
+
+  Folder: /Users/davak/Documents/nuton_rag/articles/
+
+  Ready to create the folder when you approve.
+                                                                           
+⏺ User approved Claude's plan
+  ⎿  Plan saved to: ~/.claude/plans/misty-humming-yeti.md · /plan to edit
+     RAG System Article Series - Planning
+
+     Overview
+
+     Based on exploring the nuton_rag codebase, I've identified 12 potential
+      articles covering the full RAG pipeline, from extraction to 
+     generation.
+
+     ---
+     Proposed Article Titles
+
+     Core Pipeline Articles
+
+     1. "Building a Production RAG Pipeline with FastAPI: Architecture and 
+     Design Decisions"
+     - Main pipeline architecture
+     - FastAPI endpoint design
+     - Service integration patterns
+     - Key file: pipeline.py
+
+     2. "The Art of PDF Text Extraction: Multi-Strategy Approaches with 
+     Quality Scoring"
+     - PyMuPDF vs pdfplumber vs Mistral OCR
+     - Quality scoring system (0-100)
+     - Automatic fallback chains
+     - Key files: pdf_extraction_strategies.py, mistral_ocr_extractor.py
+
+     3. "Cleaning PDF Extraction Artifacts: From CID Codes to Mid-Word 
+     Spaces"
+     - CID code removal
+     - Ligature replacement (fi, fl, ff)
+     - Mid-word space detection and fixing
+     - Unicode normalization
+     - Key file: pdf_text_cleaner.py
+
+     4. "Smart Chunking Strategies: Token-Based Semantic Splitting with 
+     Chonkie"
+     - Why chunking matters for RAG
+     - Token overlap vs character overlap
+     - Recursive chunking with markdown awareness
+     - Large document handling (parallel processing)
+     - Key files: chonkie_client.py, document_chunker.py, 
+     hybrid_pdf_processor.py
+
+     5. "Selective Quality Correction: Saving 60-80% on LLM Costs with Smart
+      Detection"
+     - Fast regex-based quality scoring
+     - Threshold-based LLM correction
+     - Async parallel processing with Groq
+     - Cost optimization strategies
+     - Key file: chunk_quality_corrector.py
+
+     Embedding & Search Articles
+
+     6. "Multimodal Embeddings with Jina CLIP-v2: Unifying Text and Images"
+     - Why multimodal matters
+     - Jina CLIP-v2 integration (1024 dimensions)
+     - Batch processing and normalization
+     - Text-image unified search
+     - Key file: multimodal_embeddings.py
+
+     7. "Hybrid Search: Combining Dense and Sparse Retrieval with Parallel 
+     Execution"
+     - Dense vs sparse search tradeoffs
+     - ThreadPoolExecutor for parallel queries
+     - Result deduplication and merging
+     - Document-aware search for diversity
+     - Key file: pinecone_client.py
+
+     8. "Reranking for RAG: From bge-reranker to Document-Aware Diversity"
+     - Why reranking improves retrieval
+     - Pinecone hosted reranker integration
+     - Document-aware reranking for balance
+     - Round-robin interleaving
+     - Key file: pinecone_client.py
+
+     Multimodal & Advanced Articles
+
+     9. "Handling YouTube in RAG: Transcripts, Fallbacks, and Proxy 
+     Strategies"
+     - youtube-transcript-api vs yt-dlp
+     - Cookie-based authentication
+     - WebShare proxy for cloud deployments
+     - Fallback service chains
+     - Key files: services/youtube_transcript_service.py, 
+     services/ytdlp_transcript_service.py
+
+     10. "Processing Diagrams and Images in RAG: From Extraction to 
+     Explanation"
+     - Image extraction with Mistral OCR
+     - Base64 encoding and spatial metadata
+     - Vision API integration for diagram explanation
+     - Image embeddings with CLIP
+     - Key files: mistral_ocr_extractor.py, diagram_explainer.py
+
+     Performance & Optimization Articles
+
+     11. "RAG Performance Optimization: From Query Truncation to Batch 
+     Processing"
+     - Conversation history optimization
+     - Context size limiting
+     - Parallel processing patterns
+     - Caching strategies (lru_cache)
+     - Batch embedding and upsert operations
+     - Key file: pipeline.py
+
+     12. "Building Educational Features on RAG: Flashcards, Quizzes, and 
+     Adaptive Notes"
+     - Learning style detection and adaptation
+     - Flashcard generation pipeline
+     - Quiz generation with gap-filling
+     - Hierarchical note generation
+     - Key files: learning_styles.py, flashcard_process.py, quiz_process.py,
+      note_generation_process.py
+
+     ---
+     Summary
+
+     | #   | Article Title                        | Main Topic        |
+     |-----|--------------------------------------|-------------------|
+     | 1   | Production RAG Pipeline with FastAPI | Architecture      |
+     | 2   | PDF Text Extraction Multi-Strategy   | Extraction        |
+     | 3   | Cleaning PDF Extraction Artifacts    | Text Cleaning     |
+     | 4   | Smart Chunking with Chonkie          | Chunking          |
+     | 5   | Selective Quality Correction         | Cost Optimization |
+     | 6   | Multimodal Embeddings with Jina CLIP | Embeddings        |
+     | 7   | Hybrid Dense + Sparse Search         | Retrieval         |
+     | 8   | Reranking for RAG                    | Ranking           |
+     | 9   | YouTube Transcripts in RAG           | Multimodal        |
+     | 10  | Diagrams and Images in RAG           | Multimodal        |
+     | 11  | RAG Performance Optimization         | Speed             |
+     | 12  | Educational Features on RAG          | Applications      |
+
+     ---
+     Final Plan
+
+     Action: Create Articles Folder
+
+     mkdir /Users/davak/Documents/nuton_rag/articles/
+
+     12 Articles Confirmed
+
+     1. Building a Production RAG Pipeline with FastAPI
+     2. The Art of PDF Text Extraction: Multi-Strategy Approaches
+     3. Cleaning PDF Extraction Artifacts: CID Codes to Mid-Word Spaces
+     4. Smart Chunking Strategies with Chonkie
+     5. Selective Quality Correction: Saving 60-80% on LLM Costs
+     6. Multimodal Embeddings with Jina CLIP-v2
+     7. Hybrid Search: Dense + Sparse Retrieval
+     8. Reranking for RAG: Document-Aware Diversity
+     9. YouTube Transcripts in RAG: Fallbacks and Proxies
+     10. Diagrams and Images in RAG
+     11. RAG Performance Optimization
+     12. Educational Features: Flashcards, Quizzes, Notes
+
+     Folder Location
+
+     /Users/davak/Documents/nuton_rag/articles/
+
+⏺ Bash(mkdir -p /Users/davak/Documents/nuton_rag/articles)
+  ⎿  (No content)
+
+⏺ Bash(ls -la /Users/davak/Documents/nuton_rag/articles)
+  ⎿  total 0                                          
+     drwxr-xr-x@  2 davak  staff    64 Jan  1 03:02 .
+     drwxr-xr-x@ 83 davak  staff  2656 Jan  1 03:02 ..
+
+⏺ Done! Created /Users/davak/Documents/nuton_rag/articles/
+
+  12 Articles Ready to Write:
+
+  | #   | Article Topic                                          |
+  |-----|--------------------------------------------------------|
+  | 1   | Production RAG Pipeline with FastAPI                   |
+  | 2   | PDF Text Extraction Multi-Strategy                     |
+  | 3   | Cleaning PDF Extraction Artifacts                      |
+  | 4   | Smart Chunking with Chonkie                            |
+  | 5   | Selective Quality Correction (60-80% LLM cost savings) |
+  | 6   | Multimodal Embeddings with Jina CLIP-v2                |
+  | 7   | Hybrid Dense + Sparse Search                           |
+  | 8   | Reranking for RAG                                      |
+  | 9   | YouTube Transcripts in RAG                             |
+  | 10  | Diagrams and Images in RAG                             |
+  | 11  | RAG Performance Optimization                           |
+  | 12  | Educational Features (Flashcards, Quizzes, Notes)      |
+
+  Let me know which article you'd like to start with when you're ready!
+
+> start with Production RAG Pipeline with FastAPI 
+
+⏺ Read(pipeline.py)
+  ⎿  Error: File content (28551 tokens) exceeds maximum allowed tokens (25000). 
+     Please use offset and limit parameters to read specific portions of the 
+     file, or use the GrepTool to search for specific content.
+
+⏺ Read(pipeline.py)
+  ⎿  Read 400 lines
+
+⏺ Read(pipeline.py)
+  ⎿  Read 400 lines
+
+⏺ Read(pipeline.py)
+  ⎿  Read 400 lines
+
+⏺ Read(pipeline.py)
+  ⎿  Read 400 lines
+
+⏺ Read(pipeline.py)
+  ⎿  Read 400 lines
+
+⏺ I have enough context now. Let me write the first article.
+
+⏺ Write(articles/01-production-rag-pipeline-fastapi.md)
+  ⎿  Wrote 470 lines to articles/01-production-rag-pipeline-fastapi.md   
+      1 # Building a Production RAG Pipeline with FastAPI: Architecture a
+        nd Design Decisions
+      2 When building a Retrieval-Augmented Generation (RAG) system that 
+        needs to handle real users, you quickly realize that the academic
+         examples don't cut it. You need resilient extraction, smart chun
+        king, multi-modal support, and graceful fallbacks. In this articl
+        e, I'll walk you through the architecture of a production RAG pip
+        eline built with FastAPI, sharing the design decisions that emerg
+        ed from real-world constraints.
+      3 ## The Big Picture
+      4 At its core, our RAG pipeline does three things:
+      5 1. **Ingest documents** - Extract text, chunk it intelligently, e
+        mbed it, and store vectors
+      6 2. **Process queries** - Embed the query, search vectors, rerank 
+        results, and generate answers
+     … +460 lines (ctrl+o to expand)
+
+⏺ Done! Created the first article at:
+
+  articles/01-production-rag-pipeline-fastapi.md
+
+  Article Summary
+
+  The article covers:
+
+  1. Architecture Overview - Visual diagram showing the full pipeline flow
+  2. Why FastAPI - Async support, OpenAPI docs, Pydantic models, form data handling
+  3. Document Ingestion - The 3-tier fallback chain (Mistral OCR → DocChunker → Basic)
+  4. Selective Quality Correction - How the quality_threshold=0.65 saves 60-80% on LLM costs
+  5. Multimodal Embeddings - Why Jina CLIP-v2 for unified text+image embedding space
+  6. Query Answering - Hybrid search, reranking, and LLM fallback chains
+  7. Performance Optimizations - Caching, batching, context limiting
+  8. Streaming with SSE - Real-time progressive feedback
+  9. YouTube Integration - Multi-source support with same infrastructure
+  10. Error Handling Philosophy - Partial success, detailed logging
+
+  Key code examples from your actual pipeline.py are included throughout.
+
+  ---
+  Would you like me to continue with Article 2: "The Art of PDF Text Extraction: Multi-Strategy Approaches with Quality Scoring"?
+
+
+

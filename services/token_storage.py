@@ -3,7 +3,7 @@ import logging
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 from cryptography.fernet import Fernet
-from supabase_client import supabase
+from clients.supabase_client import supabase
 
 logging.basicConfig(level=logging.INFO)
 
