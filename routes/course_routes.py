@@ -150,7 +150,7 @@ async def create_course_from_files(
             )
         
         # Process files
-        processed_files = await _process_uploaded_files(files)
+        processed_files = await _process_uploaded_files(files, model=model)
         
         # Generate course
         result = await course_service.create_course_from_files(
@@ -362,7 +362,7 @@ ALLOWED_EXTENSIONS = {".pdf", ".pptx", ".ppt", ".docx", ".doc", ".txt", ".md"}
 MAX_FILE_SIZE_MB = 50
 
 
-async def _process_uploaded_files(files: List[UploadFile]) -> List[dict]:
+async def _process_uploaded_files(files: List[UploadFile], model: Optional[str] = None) -> List[dict]:
     """Process uploaded files with OCR and topic extraction"""
     processed = []
 
@@ -388,11 +388,32 @@ async def _process_uploaded_files(files: List[UploadFile]) -> List[dict]:
         if size_mb > MAX_FILE_SIZE_MB:
             raise ValueError(f"File {file.filename} is {size_mb:.1f}MB. Max: {MAX_FILE_SIZE_MB}MB")
 
-        # Save temp file
+        # Handle plaintext files directly (no OCR needed)
+        plaintext_extensions = {".txt", ".md"}
+        if ext in plaintext_extensions:
+            text = content.decode("utf-8", errors="replace")
+
+            if not text.strip():
+                raise ValueError(f"No text extracted from {file.filename}")
+
+            topic = await _extract_topic(text[:2000], model=model)
+
+            processed.append({
+                "filename": file.filename,
+                "topic": topic,
+                "extracted_text": text,
+                "pages": 1,
+                "char_count": len(text)
+            })
+
+            logger.info(f"Processed {file.filename}: {topic} ({len(text)} chars, plaintext)")
+            continue
+
+        # Save temp file for OCR-based extraction
         temp_path = _save_temp_file(file)
 
         try:
-            # Extract text
+            # Extract text via OCR
             extraction = extractor.process_document(temp_path)
             text = extraction.get('full_text', '')
 
@@ -400,7 +421,7 @@ async def _process_uploaded_files(files: List[UploadFile]) -> List[dict]:
                 raise ValueError(f"No text extracted from {file.filename}")
 
             # Extract topic using Claude
-            topic = await _extract_topic(text[:2000])
+            topic = await _extract_topic(text[:2000], model=model)
 
             processed.append({
                 "filename": file.filename,
@@ -431,10 +452,10 @@ def _save_temp_file(file: UploadFile) -> str:
         return tmp.name
 
 
-async def _extract_topic(text: str) -> str:
-    """Extract main topic from text using Claude"""
+async def _extract_topic(text: str, model: Optional[str] = None) -> str:
+    """Extract main topic from text using LLM"""
     prompt = build_topic_extraction_prompt(text)
-    model_config = ModelConfig.get_config("claude-sonnet-4")
+    model_config = ModelConfig.get_config(model)
     
     # Import here to avoid circular dependency
     from services.course_service import CourseService

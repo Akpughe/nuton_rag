@@ -164,7 +164,7 @@ class CourseService:
         # Step 3: Multi-file organization (if multiple files)
         chosen_org = None
         if len(files) > 1:
-            _, chosen_org = await self._analyze_multi_files(files, organization)
+            _, chosen_org = await self._analyze_multi_files(files, organization, model_config)
 
         # Step 4: Build topic from files
         combined_topic = " + ".join([f["topic"] for f in files]) if len(files) > 1 else files[0]["topic"]
@@ -700,22 +700,31 @@ class CourseService:
     ) -> List[Dict[str, Any]]:
         """
         Chunk full document text into overlapping semantic chunks.
-        Uses existing Chonkie client. Returns list of chunks with index IDs.
+        Uses local Chonkie RecursiveChunker (no API key needed).
+        Returns list of chunks with index IDs.
         """
-        from clients.chonkie_client import chunk_document
+        from chonkie import RecursiveChunker
+        from chonkie.tokenizer import AutoTokenizer
 
-        chunks = chunk_document(
-            text=extracted_text,
+        tokenizer = AutoTokenizer("cl100k_base")
+        chunker = RecursiveChunker(
+            tokenizer=tokenizer,
             chunk_size=512,
-            overlap_tokens=80,
-            recipe="markdown",
             min_characters_per_chunk=50
         )
 
-        # Tag each chunk with an index for tracking
-        for i, chunk in enumerate(chunks):
-            chunk["chunk_index"] = i
-            chunk["source_file"] = filename
+        chunk_objects = chunker.chunk(extracted_text)
+
+        chunks = []
+        for i, chunk_obj in enumerate(chunk_objects):
+            chunks.append({
+                "text": chunk_obj.text,
+                "start_index": chunk_obj.start_index,
+                "end_index": chunk_obj.end_index,
+                "token_count": chunk_obj.token_count,
+                "chunk_index": i,
+                "source_file": filename
+            })
 
         logger.info(f"Chunked {filename}: {len(chunks)} chunks from {len(extracted_text)} chars")
         return chunks
@@ -883,7 +892,8 @@ class CourseService:
     async def _analyze_multi_files(
         self,
         files: List[Dict[str, Any]],
-        requested_org: str
+        requested_org: str,
+        model_config: Optional[Dict[str, Any]] = None
     ) -> tuple:
         """Analyze multiple files and determine organization"""
         
@@ -903,9 +913,10 @@ class CourseService:
             combined_text = "\n\n---\n\n".join([f["extracted_text"][:1500] for f in files])
             return combined_text, chosen_org
         
-        # Auto-detect: Use Claude to analyze
+        # Auto-detect: Use LLM to analyze
         prompt = build_multi_file_analysis_prompt(topics)
-        model_config = ModelConfig.get_config("claude-sonnet-4")
+        if model_config is None:
+            model_config = ModelConfig.get_config(None)
         
         analysis = await self._call_model(prompt, model_config, expect_json=False)
         analysis_text = analysis.get("content", "")
