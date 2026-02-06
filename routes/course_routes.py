@@ -336,6 +336,27 @@ async def get_user_progress(user_id: str):
     }
 
 
+# Course Q&A Endpoint
+@router.post("/courses/{course_id}/ask")
+async def ask_course_question(course_id: str, question: str = Form(...), model: Optional[str] = Form(None)):
+    """
+    Ask a question about a course. Answers are grounded in the uploaded source material.
+    Uses Pinecone vector search to find relevant chunks from the original documents.
+    """
+    try:
+        result = await course_service.query_course(
+            course_id=course_id,
+            question=question,
+            model=model
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Course Q&A error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # Helper functions
 ALLOWED_EXTENSIONS = {".pdf", ".pptx", ".ppt", ".docx", ".doc", ".txt", ".md"}
 MAX_FILE_SIZE_MB = 50

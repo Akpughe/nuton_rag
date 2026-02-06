@@ -150,6 +150,14 @@ class CourseService:
 
         logger.info(f"Total chunks from {len(files)} file(s): {len(all_chunks)}")
 
+        # Step 1b: Embed and upsert chunks to Pinecone (for course Q&A)
+        course_id = generate_uuid()
+        await self._embed_and_upsert_chunks(
+            course_id=course_id,
+            all_chunks=all_chunks,
+            source_files=[{"filename": f["filename"]} for f in files]
+        )
+
         # Step 2: Build document map
         doc_map = await self._build_document_map(all_chunks, model_config)
 
@@ -169,6 +177,7 @@ class CourseService:
         try:
             course = await self._generate_full_course_from_files(
                 user_id=user_id,
+                course_id=course_id,
                 topic=combined_topic,
                 profile=profile,
                 model_config=model_config,
@@ -297,6 +306,7 @@ class CourseService:
     async def _generate_full_course_from_files(
         self,
         user_id: str,
+        course_id: str,
         topic: str,
         profile: LearningProfile,
         model_config: Dict[str, Any],
@@ -321,8 +331,7 @@ class CourseService:
             organization=organization
         )
 
-        # Create course record
-        course_id = generate_uuid()
+        # Use pre-generated course_id (shared with Pinecone upsert)
         personalization = PersonalizationParams(
             format_pref=profile.format_pref,
             depth_pref=profile.depth_pref,
@@ -827,6 +836,50 @@ class CourseService:
         logger.info(f"Chapter '{chapter_outline['title']}': {len(context_parts)} chunks, ~{token_count} tokens")
         return context
 
+    async def _embed_and_upsert_chunks(
+        self,
+        course_id: str,
+        all_chunks: List[Dict[str, Any]],
+        source_files: List[Dict]
+    ) -> None:
+        """
+        Embed course chunks and upsert to Pinecone for later Q&A retrieval.
+        Uses existing Chonkie multimodal embeddings + Pinecone upsert pattern.
+        """
+        from clients.chonkie_client import embed_chunks_multimodal
+        from clients.pinecone_client import upsert_vectors
+
+        if not all_chunks:
+            logger.warning("No chunks to embed/upsert")
+            return
+
+        # Embed all chunks using multimodal embeddings (Jina CLIP-v2, 1024 dims)
+        logger.info(f"Embedding {len(all_chunks)} course chunks...")
+        embeddings = embed_chunks_multimodal(all_chunks, batch_size=32)
+
+        if not embeddings or len(embeddings) != len(all_chunks):
+            logger.error(f"Embedding count mismatch: {len(embeddings)} embeddings for {len(all_chunks)} chunks")
+            return
+
+        # Tag chunks with course metadata before upserting
+        tagged_chunks = []
+        for chunk in all_chunks:
+            tagged = dict(chunk)
+            tagged["course_id"] = course_id
+            tagged["content_type"] = "course_source_material"
+            tagged_chunks.append(tagged)
+
+        # Upsert to Pinecone with course_id as the doc_id
+        upsert_vectors(
+            doc_id=course_id,
+            space_id=f"course_{course_id}",
+            embeddings=embeddings,
+            chunks=tagged_chunks,
+            source_file=", ".join([f["filename"] for f in source_files])
+        )
+
+        logger.info(f"Upserted {len(all_chunks)} chunks to Pinecone for course {course_id}")
+
     async def _analyze_multi_files(
         self,
         files: List[Dict[str, Any]],
@@ -899,3 +952,86 @@ class CourseService:
         """Save learning profile"""
         profile = LearningProfile(**profile_data)
         return self.profile_storage.save_profile(profile.dict())
+
+    async def query_course(
+        self,
+        course_id: str,
+        question: str,
+        model: Optional[str] = None,
+        top_k: int = 5
+    ) -> Dict[str, Any]:
+        """
+        Answer a question about a course using its source material from Pinecone.
+        Searches course chunks, reranks, and generates a grounded answer.
+        """
+        from clients.chonkie_client import embed_query_multimodal
+        from clients.pinecone_client import hybrid_search, rerank_results
+
+        model_config = ModelConfig.get_config(model)
+
+        # Get course for context
+        course = self.get_course(course_id)
+        if not course:
+            raise ValueError(f"Course not found: {course_id}")
+
+        # Embed the question
+        query_result = embed_query_multimodal(question)
+        query_emb = query_result["embedding"]
+
+        # Search Pinecone filtered by course namespace
+        search_results = hybrid_search(
+            query_emb=query_emb,
+            space_id=f"course_{course_id}",
+            top_k=top_k * 2  # Over-fetch for reranking
+        )
+
+        # Rerank results
+        if search_results:
+            reranked = rerank_results(
+                query=question,
+                hits=search_results,
+                top_n=top_k
+            )
+        else:
+            reranked = []
+
+        # Build context from retrieved chunks
+        context_parts = []
+        for i, result in enumerate(reranked):
+            text = result.get("metadata", {}).get("text", "")
+            source = result.get("metadata", {}).get("source_file", "")
+            context_parts.append(f"[Source {i+1}] ({source})\n{text}")
+
+        context = "\n\n---\n\n".join(context_parts)
+
+        # Generate answer
+        prompt = f"""You are a helpful course assistant. Answer the student's question based ONLY on the source material provided.
+
+COURSE: {course.get('title', '')}
+
+SOURCE MATERIAL:
+{context}
+
+STUDENT QUESTION: {question}
+
+Instructions:
+- Answer based ONLY on the source material above
+- If the source material doesn't contain the answer, say so clearly
+- Reference specific sources using [Source N] citations
+- Keep the answer concise and educational"""
+
+        response = await self._call_model(prompt, model_config, expect_json=False)
+
+        return {
+            "course_id": course_id,
+            "question": question,
+            "answer": response.get("content", ""),
+            "sources_used": len(reranked),
+            "source_excerpts": [
+                {
+                    "text": r.get("metadata", {}).get("text", "")[:200],
+                    "file": r.get("metadata", {}).get("source_file", "")
+                }
+                for r in reranked
+            ]
+        }

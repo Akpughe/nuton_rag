@@ -109,8 +109,15 @@ def build_chapter_content_prompt(
 - Next Chapter: {next_chapter_title}""" if next_chapter_title else ""
     
     source_section = f"""
-SOURCE MATERIAL TO INCORPORATE:
+SOURCE MATERIAL (from uploaded document - YOU MUST teach from this):
 {source_material_context}
+
+CRITICAL INSTRUCTIONS FOR SOURCE MATERIAL:
+- Base your chapter content PRIMARILY on the source material above
+- Do NOT invent facts or examples that aren't supported by the source material
+- Use the source material's terminology and structure
+- If the source material is thin on a subtopic, note it briefly and move on
+- Inline citations [1], [2] should reference the [Source Section N] labels above
 """ if source_material_context else ""
 
     objectives_formatted = "\n".join([f"- {obj}" for obj in objectives])
