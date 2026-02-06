@@ -130,61 +130,81 @@ class CourseService:
         model: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Generate course from uploaded files.
-        Multi-file detection and organization included.
+        Generate course from uploaded files using RAG pipeline.
+        Full document chunking -> document map -> per-chapter retrieval.
         """
         start_time = time.time()
-        
-        # Get profile
+
+        # Get profile and model config
         profile = self._get_or_create_profile(user_id, {})
         model_config = ModelConfig.get_config(model)
-        
-        # Multi-file analysis
+
+        # Step 1: Chunk ALL files
+        all_chunks = []
+        for f in files:
+            file_chunks = self._chunk_document_for_course(
+                extracted_text=f["extracted_text"],
+                filename=f["filename"]
+            )
+            all_chunks.extend(file_chunks)
+
+        logger.info(f"Total chunks from {len(files)} file(s): {len(all_chunks)}")
+
+        # Step 2: Build document map
+        doc_map = await self._build_document_map(all_chunks, model_config)
+
+        # Step 3: Multi-file organization (if multiple files)
+        chosen_org = None
         if len(files) > 1:
-            file_context, chosen_org = await self._analyze_multi_files(files, organization)
-        else:
-            file_context = files[0]["extracted_text"][:3000] if files else ""
-            chosen_org = None
-        
-        # Build topic from files
+            _, chosen_org = await self._analyze_multi_files(files, organization)
+
+        # Step 4: Build topic from files
         combined_topic = " + ".join([f["topic"] for f in files]) if len(files) > 1 else files[0]["topic"]
-        
-        # Generate course
+
+        # Step 5: Generate outline from document map (not raw text)
+        doc_map_context = "DOCUMENT MAP (topics found in uploaded material):\n"
+        for topic in doc_map.get("topics", []):
+            doc_map_context += f"- {topic['topic']}: {topic.get('description', '')} [{len(topic.get('chunk_indices', []))} sections]\n"
+
         try:
-            course = await self._generate_full_course(
+            course = await self._generate_full_course_from_files(
                 user_id=user_id,
                 topic=combined_topic,
-                source_type=SourceType.FILES,
                 profile=profile,
                 model_config=model_config,
                 source_files=[{"file_id": generate_uuid(), "filename": f["filename"], "extracted_topic": f["topic"]} for f in files],
-                file_context=file_context,
+                doc_map=doc_map,
+                doc_map_context=doc_map_context,
+                all_chunks=all_chunks,
                 organization=chosen_org
             )
-            
+
             generation_time = round(time.time() - start_time, 2)
-            
+
             self.logger.log_generation({
                 "type": "file_course",
                 "user_id": user_id,
                 "course_id": course["id"],
                 "files": [f["filename"] for f in files],
+                "total_chunks": len(all_chunks),
                 "organization": chosen_org.value if chosen_org else None,
                 "model": model_config["model"],
                 "generation_time": generation_time,
                 "status": "success"
             })
-            
+
             return {
                 "course_id": course["id"],
                 "status": CourseStatus.READY,
                 "detected_topics": [f["topic"] for f in files],
                 "organization_chosen": chosen_org.value if chosen_org else None,
+                "document_map": doc_map,
+                "total_chunks_processed": len(all_chunks),
                 "course": course,
                 "storage_path": f"courses/course_{course['id']}/",
                 "generation_time_seconds": generation_time
             }
-            
+
         except Exception as e:
             logger.error(f"File course generation failed: {e}")
             raise
@@ -273,7 +293,111 @@ class CourseService:
         self.storage.save_course(course_data)
         
         return course_data
-    
+
+    async def _generate_full_course_from_files(
+        self,
+        user_id: str,
+        topic: str,
+        profile: LearningProfile,
+        model_config: Dict[str, Any],
+        source_files: List[Dict],
+        doc_map: Dict[str, Any],
+        doc_map_context: str,
+        all_chunks: List[Dict[str, Any]],
+        organization: Optional[OrganizationType] = None
+    ) -> Dict[str, Any]:
+        """
+        Generate full course from files with per-chapter RAG retrieval.
+        Chapters are generated in parallel for speed.
+        """
+        import asyncio
+
+        # Step 1: Generate outline using document map as context
+        outline = await self._generate_outline(
+            topic=topic,
+            profile=profile,
+            model_config=model_config,
+            file_context=doc_map_context,
+            organization=organization
+        )
+
+        # Create course record
+        course_id = generate_uuid()
+        personalization = PersonalizationParams(
+            format_pref=profile.format_pref,
+            depth_pref=profile.depth_pref,
+            role=profile.role,
+            learning_goal=profile.learning_goal,
+            example_pref=profile.example_pref
+        )
+
+        course_data = {
+            "id": course_id,
+            "user_id": user_id,
+            "title": outline["title"],
+            "description": outline["description"],
+            "topic": topic,
+            "source_type": SourceType.FILES,
+            "source_files": source_files,
+            "multi_file_organization": organization.value if organization else None,
+            "total_chapters": len(outline["chapters"]),
+            "estimated_time": outline["total_estimated_time"],
+            "status": CourseStatus.GENERATING,
+            "personalization_params": personalization.dict(),
+            "outline": outline,
+            "model_used": model_config["model"],
+            "created_at": datetime.utcnow(),
+            "completed_at": None
+        }
+
+        self.storage.save_course(course_data)
+
+        # Step 2: Retrieve relevant chunks per chapter
+        chapter_contexts = {}
+        for chapter_outline in outline["chapters"]:
+            context = self._get_chunks_for_chapter(
+                chapter_outline=chapter_outline,
+                doc_map=doc_map,
+                all_chunks=all_chunks,
+                max_context_tokens=3000
+            )
+            chapter_contexts[chapter_outline["order"]] = context
+
+        # Step 3: Generate chapters in parallel
+        async def generate_single_chapter(i, chapter_outline):
+            chapter = await self._generate_chapter(
+                course_id=course_id,
+                course_title=outline["title"],
+                chapter_outline=chapter_outline,
+                total_chapters=len(outline["chapters"]),
+                profile=profile,
+                model_config=model_config,
+                prev_chapter_title=outline["chapters"][i - 1]["title"] if i > 0 else None,
+                next_chapter_title=outline["chapters"][i + 1]["title"] if i < len(outline["chapters"]) - 1 else None,
+                file_context=chapter_contexts.get(chapter_outline["order"])
+            )
+            self.storage.save_chapter(course_id, chapter)
+            logger.info(f"Generated chapter {i + 1}/{len(outline['chapters'])}: {chapter['title']}")
+            return chapter
+
+        tasks = [
+            generate_single_chapter(i, ch)
+            for i, ch in enumerate(outline["chapters"])
+        ]
+
+        try:
+            chapters = await asyncio.gather(*tasks)
+        except Exception as e:
+            logger.error(f"Parallel chapter generation failed: {e}")
+            raise CourseGenerationError(f"Chapter generation failed: {e}")
+
+        # Update course status
+        course_data["status"] = CourseStatus.READY
+        course_data["completed_at"] = datetime.utcnow()
+        self.storage.save_course(course_data)
+
+        return course_data
+
     async def _generate_outline(
         self,
         topic: str,
