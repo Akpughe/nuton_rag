@@ -161,3 +161,4 @@ cython_debug/
 
 .mcp.json
 2025-*-*.txt
+courses/
