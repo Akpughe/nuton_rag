@@ -12,7 +12,7 @@ from functools import lru_cache
 
 from clients.chonkie_client import chunk_document, embed_chunks, embed_chunks_v2, embed_query, embed_query_v2, embed_chunks_multimodal, embed_query_multimodal
 from clients.pinecone_client import upsert_vectors, upsert_image_vectors, hybrid_search, hybrid_search_parallel, rerank_results, hybrid_search_document_aware, rerank_results_document_aware
-from clients.supabase_client import insert_pdf_record, insert_yts_record, get_documents_in_space, check_document_type, upsert_generated_content_notes
+from clients.supabase_client import insert_pdf_record, insert_yts_record, get_documents_in_space, check_document_type, upsert_generated_content_notes, get_supabase
 from clients.groq_client import generate_answer, generate_answer_document_aware
 import clients.openai_client as openai_client
 from services.wetrocloud_youtube import WetroCloudYouTubeService
@@ -49,6 +49,15 @@ app.add_middleware(
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
 )
+
+@app.on_event("startup")
+async def startup():
+    try:
+        db = get_supabase()
+        db.table("user_list").select("id").limit(1).execute()
+        logger.info("Supabase connection OK")
+    except Exception as e:
+        logger.error(f"Supabase connection failed: {e}")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
