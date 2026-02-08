@@ -16,19 +16,36 @@ def build_outline_generation_prompt(
     learning_goal: str,
     example_pref: str,
     file_context: Optional[str] = None,
-    organization_instructions: Optional[str] = None
+    organization_instructions: Optional[str] = None,
+    suggested_chapter_count: Optional[int] = None,
+    structured_topic_constraint: Optional[str] = None
 ) -> str:
     """Build prompt for course outline generation"""
-    
-    file_section = f"""
+
+    # Use structured constraint instead of flat file_context when available
+    if structured_topic_constraint:
+        file_section = f"""
+DOCUMENT STRUCTURE CONSTRAINT:
+{structured_topic_constraint}
+"""
+    elif file_context:
+        file_section = f"""
 SOURCE MATERIAL CONTEXT:
 {file_context}
-""" if file_context else ""
+"""
+    else:
+        file_section = ""
 
     org_section = f"""
 MULTI-FILE ORGANIZATION:
 {organization_instructions}
 """ if organization_instructions else ""
+
+    # Dynamic chapter count instruction
+    if suggested_chapter_count:
+        chapter_instruction = f"Generate EXACTLY {suggested_chapter_count} chapters that progressively build knowledge"
+    else:
+        chapter_instruction = "Generate 3-5 chapters that progressively build knowledge"
 
     return f"""You are an expert curriculum designer and educator. Create a structured, pedagogically sound course outline.
 
@@ -44,7 +61,7 @@ USER CONTEXT:
 {file_section}
 {org_section}
 REQUIREMENTS:
-1. Generate 3-5 chapters that progressively build knowledge
+1. {chapter_instruction}
 2. Structure: Foundation → Core Concepts → Applications → Synthesis
 3. Each chapter must have:
    - Clear, descriptive title
@@ -84,6 +101,36 @@ OUTPUT FORMAT (JSON - no markdown formatting):
 Important: Return ONLY the JSON object, no markdown code blocks or additional text."""
 
 
+def _build_search_section(search_mode: str, web_sources: Optional[List[Dict]] = None) -> str:
+    """Build the search/citation section of the chapter prompt based on model capabilities."""
+    if search_mode == "native":
+        return """SEARCH REQUIREMENTS:
+Use web search to find 3-5 authoritative sources on key claims. Prioritize:
+- Academic papers (.edu sources)
+- Official documentation
+- Reputable news sources
+- Educational institutions"""
+
+    if search_mode == "provided" and web_sources:
+        sources_text = ""
+        for i, src in enumerate(web_sources, 1):
+            sources_text += f"[{i}] {src.get('title', 'Source')}\n"
+            sources_text += f"    URL: {src.get('url', 'N/A')}\n"
+            if src.get('excerpt'):
+                sources_text += f"    Excerpt: {src['excerpt']}\n"
+            sources_text += "\n"
+        return f"""WEB RESEARCH SOURCES (pre-fetched):
+{sources_text}
+Use these sources for inline citations [1], [2], etc. Reference them accurately.
+If additional facts are needed beyond these sources, cite from your training knowledge and note the source."""
+
+    # search_mode == "none"
+    return """CITATION GUIDANCE:
+No web search available. Cite from training knowledge. Note real sources you know exist
+(textbooks, papers, official docs) rather than fabricating URLs. Use format:
+[1] Author, "Title", Publication (Year) — or similar known references."""
+
+
 def build_chapter_content_prompt(
     course_title: str,
     chapter_num: int,
@@ -98,7 +145,9 @@ def build_chapter_content_prompt(
     example_pref: str,
     prev_chapter_title: Optional[str] = None,
     next_chapter_title: Optional[str] = None,
-    source_material_context: Optional[str] = None
+    source_material_context: Optional[str] = None,
+    search_mode: str = "native",
+    web_sources: Optional[List[Dict]] = None
 ) -> str:
     """Build prompt for chapter content generation"""
     
@@ -168,12 +217,7 @@ Generate 3-5 questions that test UNDERSTANDING, not memorization:
 - Include explanations for correct AND incorrect answers
 - Make distractors (wrong answers) plausible
 
-SEARCH REQUIREMENTS:
-Use web search to find 3-5 authoritative sources on key claims. Prioritize:
-- Academic papers (.edu sources)
-- Official documentation
-- Reputable news sources
-- Educational institutions
+{_build_search_section(search_mode, web_sources)}
 
 OUTPUT FORMAT (JSON - no markdown):
 {{

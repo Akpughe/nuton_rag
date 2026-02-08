@@ -33,9 +33,13 @@ from prompts.enrichment_examples import create_few_shot_enhanced_prompt
 from prompts.enhanced_prompts import get_domain_from_context
 from clients.websearch_client import analyze_and_generate_queries, perform_contextual_websearch_async, synthesize_rag_and_web_results
 from services.google_drive_service import GoogleDriveService
+from routes.course_routes import router as course_router
 
 
 app = FastAPI()
+
+# Include course generation routes
+app.include_router(course_router)
 
 # Add CORS middleware
 app.add_middleware(
