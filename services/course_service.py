@@ -7,7 +7,7 @@ Following DRY principle - modular, reusable components.
 import json
 import time
 import logging
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, AsyncGenerator
 from datetime import datetime
 
 from models.course_models import (
@@ -402,19 +402,48 @@ Return ONLY a JSON object:
         all_chunks: Optional[List[Dict[str, Any]]] = None,
         course_id: Optional[str] = None
     ) -> Dict[str, Any]:
+        """Non-streaming wrapper — consumes generator, returns final course_data."""
+        result_course_id = None
+        async for event in self._generate_full_course_stream(
+            user_id=user_id, topic=topic, source_type=source_type,
+            profile=profile, model_config=model_config,
+            source_files=source_files, file_context=file_context,
+            organization=organization, doc_map=doc_map,
+            doc_map_context=doc_map_context, all_chunks=all_chunks,
+            course_id=course_id
+        ):
+            if event["type"] == "error":
+                raise CourseGenerationError(event["message"])
+            if event["type"] == "outline_ready":
+                result_course_id = event["course_id"]
+        return self.storage.get_course(result_course_id)
+
+    async def _generate_full_course_stream(
+        self,
+        user_id: str,
+        topic: str,
+        source_type: SourceType,
+        profile: LearningProfile,
+        model_config: Dict[str, Any],
+        source_files: Optional[List[Dict]] = None,
+        file_context: Optional[str] = None,
+        organization: Optional[OrganizationType] = None,
+        doc_map: Optional[Dict[str, Any]] = None,
+        doc_map_context: Optional[str] = None,
+        all_chunks: Optional[List[Dict[str, Any]]] = None,
+        course_id: Optional[str] = None
+    ) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        Internal method: Generate complete course with all chapters.
-        Supports dynamic chapter counts, parallel generation, and model-aware search.
+        Internal async generator: Generate complete course with all chapters.
+        Yields outline_ready and chapter_ready events as they complete.
         """
         import asyncio
 
         # Step 1: Determine chapter count and time
-        # For topic+files hybrid, use doc map if available
         if doc_map:
             suggested_chapters, dynamic_time = self._calculate_chapter_count_from_doc_map(doc_map)
             structured_constraint = self._build_structured_topic_constraint(doc_map)
         else:
-            # Pure topic course: use LLM complexity assessment
             suggested_chapters, dynamic_time = await self._assess_topic_complexity(topic, model_config)
             structured_constraint = None
 
@@ -460,7 +489,7 @@ Return ONLY a JSON object:
                 )
                 chapter_contexts[chapter_outline["order"]] = context
 
-        # Create course record (use pre-generated ID if provided, e.g. for Pinecone alignment)
+        # Create course record
         course_id = course_id or generate_uuid()
         personalization = PersonalizationParams(
             format_pref=profile.format_pref,
@@ -491,16 +520,25 @@ Return ONLY a JSON object:
 
         self.storage.save_course(course_data)
 
+        # Yield outline_ready event
+        yield {
+            "type": "outline_ready",
+            "course_id": course_id,
+            "title": outline["title"],
+            "total_chapters": len(outline["chapters"]),
+            "estimated_time": outline["total_estimated_time"],
+            "outline": outline
+        }
+
         # Step 6: Generate chapters in batched parallel
         BATCH_SIZE = 4
 
-        # Determine per-chapter search params
         def get_chapter_search_mode(chapter_order: int) -> str:
             if search_mode == "perplexity" and chapter_web_sources.get(chapter_order, {}).get("sources"):
                 return "provided"
             return search_mode
 
-        def get_chapter_web_sources(chapter_order: int) -> Optional[List[Dict]]:
+        def get_chapter_web_sources_fn(chapter_order: int) -> Optional[List[Dict]]:
             if search_mode == "perplexity":
                 return chapter_web_sources.get(chapter_order, {}).get("sources")
             return None
@@ -508,12 +546,8 @@ Return ONLY a JSON object:
         async def generate_single_chapter(i, chapter_outline):
             ch_order = chapter_outline["order"]
             ch_search_mode = get_chapter_search_mode(ch_order)
-            ch_web_sources = get_chapter_web_sources(ch_order)
-
-            # File context: from pre-fetched chunks or passed file_context
+            ch_web_sources = get_chapter_web_sources_fn(ch_order)
             ch_file_context = chapter_contexts.get(ch_order) if chapter_contexts else (file_context if i == 0 else None)
-
-            # For OpenAI native search, pass use_search=True
             ch_use_search = (search_mode == "native" and model_config["provider"] == "openai")
 
             chapter = await self._generate_chapter(
@@ -535,26 +569,37 @@ Return ONLY a JSON object:
             return chapter
 
         all_chapters_indexed = list(enumerate(outline["chapters"]))
-        chapters = []
 
         try:
             for batch_start in range(0, len(all_chapters_indexed), BATCH_SIZE):
                 batch = all_chapters_indexed[batch_start:batch_start + BATCH_SIZE]
                 batch_tasks = [generate_single_chapter(i, ch) for i, ch in batch]
                 batch_results = await asyncio.gather(*batch_tasks)
-                chapters.extend(batch_results)
+                for chapter in batch_results:
+                    yield {
+                        "type": "chapter_ready",
+                        "course_id": course_id,
+                        "chapter_order": chapter["order"],
+                        "chapter_title": chapter["title"],
+                        "total_chapters": len(outline["chapters"]),
+                        "chapter": chapter
+                    }
                 if batch_start + BATCH_SIZE < len(all_chapters_indexed):
                     await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"Batched chapter generation failed: {e}")
-            raise CourseGenerationError(f"Chapter generation failed: {e}")
+            yield {
+                "type": "error",
+                "message": f"Chapter generation failed: {e}",
+                "course_id": course_id,
+                "phase": "chapter_generation"
+            }
+            return
 
         # Update course status
         course_data["status"] = CourseStatus.READY
         course_data["completed_at"] = datetime.utcnow()
         self.storage.save_course(course_data)
-
-        return course_data
 
     async def _generate_full_course_from_files(
         self,
@@ -569,9 +614,37 @@ Return ONLY a JSON object:
         all_chunks: List[Dict[str, Any]],
         organization: Optional[OrganizationType] = None
     ) -> Dict[str, Any]:
+        """Non-streaming wrapper — consumes generator, returns final course_data."""
+        result_course_id = None
+        async for event in self._generate_full_course_from_files_stream(
+            user_id=user_id, course_id=course_id, topic=topic,
+            profile=profile, model_config=model_config,
+            source_files=source_files, doc_map=doc_map,
+            doc_map_context=doc_map_context, all_chunks=all_chunks,
+            organization=organization
+        ):
+            if event["type"] == "error":
+                raise CourseGenerationError(event["message"])
+            if event["type"] == "outline_ready":
+                result_course_id = event["course_id"]
+        return self.storage.get_course(result_course_id)
+
+    async def _generate_full_course_from_files_stream(
+        self,
+        user_id: str,
+        course_id: str,
+        topic: str,
+        profile: LearningProfile,
+        model_config: Dict[str, Any],
+        source_files: List[Dict],
+        doc_map: Dict[str, Any],
+        doc_map_context: str,
+        all_chunks: List[Dict[str, Any]],
+        organization: Optional[OrganizationType] = None
+    ) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        Generate full course from files with per-chapter RAG retrieval.
-        Chapters are generated in batches of 4 for rate-limit safety.
+        Async generator: Generate full course from files with per-chapter RAG retrieval.
+        Yields outline_ready and chapter_ready events.
         """
         import asyncio
 
@@ -621,6 +694,16 @@ Return ONLY a JSON object:
 
         self.storage.save_course(course_data)
 
+        # Yield outline_ready event
+        yield {
+            "type": "outline_ready",
+            "course_id": course_id,
+            "title": outline["title"],
+            "total_chapters": len(outline["chapters"]),
+            "estimated_time": outline["total_estimated_time"],
+            "outline": outline
+        }
+
         # Step 2: Retrieve relevant chunks per chapter
         chapter_contexts = {}
         for chapter_outline in outline["chapters"]:
@@ -640,8 +723,6 @@ Return ONLY a JSON object:
                 file_model_key = key
                 break
         file_search_mode = get_search_mode(file_model_key)
-        # For file-based courses, don't ask models to web search — content comes from files
-        # Only use "none" for models without search; native models can still supplement
         if file_search_mode == "perplexity":
             file_search_mode = "none"
 
@@ -666,27 +747,37 @@ Return ONLY a JSON object:
             return chapter
 
         all_chapters_indexed = list(enumerate(outline["chapters"]))
-        chapters = []
 
         try:
             for batch_start in range(0, len(all_chapters_indexed), BATCH_SIZE):
                 batch = all_chapters_indexed[batch_start:batch_start + BATCH_SIZE]
                 batch_tasks = [generate_single_chapter(i, ch) for i, ch in batch]
                 batch_results = await asyncio.gather(*batch_tasks)
-                chapters.extend(batch_results)
-                # Sleep between batches to avoid rate limits (skip after last batch)
+                for chapter in batch_results:
+                    yield {
+                        "type": "chapter_ready",
+                        "course_id": course_id,
+                        "chapter_order": chapter["order"],
+                        "chapter_title": chapter["title"],
+                        "total_chapters": len(outline["chapters"]),
+                        "chapter": chapter
+                    }
                 if batch_start + BATCH_SIZE < len(all_chapters_indexed):
                     await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"Batched chapter generation failed: {e}")
-            raise CourseGenerationError(f"Chapter generation failed: {e}")
+            yield {
+                "type": "error",
+                "message": f"Chapter generation failed: {e}",
+                "course_id": course_id,
+                "phase": "chapter_generation"
+            }
+            return
 
         # Update course status
         course_data["status"] = CourseStatus.READY
         course_data["completed_at"] = datetime.utcnow()
         self.storage.save_course(course_data)
-
-        return course_data
 
     async def _generate_outline(
         self,
@@ -1374,9 +1465,28 @@ Return ONLY a JSON object:
         profile: 'LearningProfile',
         model_config: Dict[str, Any]
     ) -> Dict[str, Any]:
+        """Non-streaming wrapper — consumes generator, returns final course_data."""
+        result_course_id = None
+        async for event in self._generate_single_file_course_stream(
+            user_id=user_id, file_data=file_data,
+            profile=profile, model_config=model_config
+        ):
+            if event["type"] == "error":
+                raise CourseGenerationError(event["message"])
+            if event["type"] == "outline_ready":
+                result_course_id = event["course_id"]
+        return self.storage.get_course(result_course_id)
+
+    async def _generate_single_file_course_stream(
+        self,
+        user_id: str,
+        file_data: Dict[str, Any],
+        profile: 'LearningProfile',
+        model_config: Dict[str, Any]
+    ) -> AsyncGenerator[Dict[str, Any], None]:
         """
-        Generate a course from a single file (used by separate_courses path).
-        Handles chunking, embedding, doc map, and full course generation.
+        Async generator for single-file course (used by separate_courses path).
+        Forwards events from _generate_full_course_from_files_stream.
         """
         # Chunk the single file
         file_chunks = self._chunk_document_for_course(
@@ -1395,14 +1505,14 @@ Return ONLY a JSON object:
         # Build document map
         doc_map = await self._build_document_map(file_chunks, model_config)
 
-        # Build doc_map_context (flat text fallback, used internally)
+        # Build doc_map_context
         doc_map_context = "DOCUMENT MAP (topics found in uploaded material):\n"
         for topic in doc_map.get("topics", []):
             doc_map_context += f"- {topic['topic']}: {topic.get('description', '')} [{len(topic.get('chunk_indices', []))} sections]\n"
 
         source_files = [{"file_id": generate_uuid(), "filename": file_data["filename"], "extracted_topic": file_data["topic"]}]
 
-        course = await self._generate_full_course_from_files(
+        async for event in self._generate_full_course_from_files_stream(
             user_id=user_id,
             course_id=course_id,
             topic=file_data["topic"],
@@ -1413,12 +1523,251 @@ Return ONLY a JSON object:
             doc_map_context=doc_map_context,
             all_chunks=file_chunks,
             organization=None
-        )
+        ):
+            yield event
 
-        return course
+    # Streaming public methods
+
+    async def create_course_from_topic_stream(
+        self,
+        user_id: str,
+        topic: str,
+        context: Dict[str, Any],
+        model: Optional[str] = None
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Streaming version of create_course_from_topic. Yields SSE events."""
+        start_time = time.time()
+        profile = self._get_or_create_profile(user_id, context)
+        model_config = ModelConfig.get_config(model)
+        course_id = None
+        total_chapters = None
+
+        try:
+            async for event in self._generate_full_course_stream(
+                user_id=user_id,
+                topic=topic,
+                source_type=SourceType.TOPIC,
+                profile=profile,
+                model_config=model_config,
+                source_files=None
+            ):
+                if event["type"] == "outline_ready":
+                    course_id = event["course_id"]
+                    total_chapters = event["total_chapters"]
+                yield event
+                if event["type"] == "error":
+                    return
+
+            generation_time = round(time.time() - start_time, 2)
+            yield {
+                "type": "course_complete",
+                "course_id": course_id,
+                "status": CourseStatus.READY,
+                "total_chapters": total_chapters,
+                "generation_time_seconds": generation_time
+            }
+        except Exception as e:
+            logger.error(f"Streaming course generation failed: {e}")
+            yield {
+                "type": "error",
+                "message": str(e),
+                "course_id": course_id,
+                "phase": "generation"
+            }
+
+    async def create_course_from_topic_with_files_stream(
+        self,
+        user_id: str,
+        topic: str,
+        files: List[Dict[str, Any]],
+        model: Optional[str] = None
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Streaming version of create_course_from_topic_with_files."""
+        import asyncio
+        start_time = time.time()
+
+        profile = self._get_or_create_profile(user_id, {})
+        model_config = ModelConfig.get_config(model)
+        course_id = None
+        total_chapters = None
+
+        try:
+            # Chunk all files
+            all_chunks = []
+            for f in files:
+                file_chunks = self._chunk_document_for_course(
+                    extracted_text=f["extracted_text"],
+                    filename=f["filename"]
+                )
+                all_chunks.extend(file_chunks)
+
+            # Embed/upsert and build doc map in parallel
+            pre_course_id = generate_uuid()
+            embed_task = self._embed_and_upsert_chunks(
+                course_id=pre_course_id,
+                all_chunks=all_chunks,
+                source_files=[{"filename": f["filename"]} for f in files]
+            )
+            doc_map_task = self._build_document_map(all_chunks, model_config)
+            _, doc_map = await asyncio.gather(embed_task, doc_map_task)
+
+            doc_map_context = "SUPPLEMENTARY MATERIAL MAP (from uploaded files):\n"
+            for t in doc_map.get("topics", []):
+                doc_map_context += f"- {t['topic']}: {t.get('description', '')} [{len(t.get('chunk_indices', []))} sections]\n"
+
+            source_files = [
+                {"file_id": generate_uuid(), "filename": f["filename"], "extracted_topic": f.get("topic", "")}
+                for f in files
+            ]
+
+            async for event in self._generate_full_course_stream(
+                user_id=user_id,
+                topic=topic,
+                source_type=SourceType.TOPIC,
+                profile=profile,
+                model_config=model_config,
+                source_files=source_files,
+                doc_map=doc_map,
+                doc_map_context=doc_map_context,
+                all_chunks=all_chunks,
+                course_id=pre_course_id
+            ):
+                if event["type"] == "outline_ready":
+                    course_id = event["course_id"]
+                    total_chapters = event["total_chapters"]
+                yield event
+                if event["type"] == "error":
+                    return
+
+            generation_time = round(time.time() - start_time, 2)
+            yield {
+                "type": "course_complete",
+                "course_id": course_id,
+                "status": CourseStatus.READY,
+                "total_chapters": total_chapters,
+                "generation_time_seconds": generation_time
+            }
+        except Exception as e:
+            logger.error(f"Streaming topic+files course generation failed: {e}")
+            yield {
+                "type": "error",
+                "message": str(e),
+                "course_id": course_id,
+                "phase": "generation"
+            }
+
+    async def create_course_from_files_stream(
+        self,
+        user_id: str,
+        files: List[Dict[str, Any]],
+        organization: str,
+        model: Optional[str] = None
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Streaming version of create_course_from_files."""
+        import asyncio
+        start_time = time.time()
+
+        profile = self._get_or_create_profile(user_id, {})
+        model_config = ModelConfig.get_config(model)
+        course_id = None
+        total_chapters = None
+
+        try:
+            # Multi-file organization analysis
+            chosen_org = None
+            if len(files) > 1:
+                _, chosen_org = await self._analyze_multi_files(files, organization, model_config)
+
+            # Branch: SEPARATE_COURSES
+            if chosen_org == OrganizationType.SEPARATE_COURSES:
+                for idx, f in enumerate(files):
+                    yield {
+                        "type": "course_start",
+                        "course_index": idx + 1,
+                        "total_courses": len(files),
+                        "filename": f["filename"]
+                    }
+                    async for event in self._generate_single_file_course_stream(
+                        user_id=user_id,
+                        file_data=f,
+                        profile=profile,
+                        model_config=model_config
+                    ):
+                        yield event
+                        if event["type"] == "error":
+                            return
+
+                generation_time = round(time.time() - start_time, 2)
+                yield {
+                    "type": "course_complete",
+                    "status": CourseStatus.READY,
+                    "organization": "separate_courses",
+                    "total_courses": len(files),
+                    "generation_time_seconds": generation_time
+                }
+                return
+
+            # Single-course path
+            all_chunks = []
+            for f in files:
+                file_chunks = self._chunk_document_for_course(
+                    extracted_text=f["extracted_text"],
+                    filename=f["filename"]
+                )
+                all_chunks.extend(file_chunks)
+
+            pre_course_id = generate_uuid()
+            embed_task = self._embed_and_upsert_chunks(
+                course_id=pre_course_id,
+                all_chunks=all_chunks,
+                source_files=[{"filename": f["filename"]} for f in files]
+            )
+            doc_map_task = self._build_document_map(all_chunks, model_config)
+            _, doc_map = await asyncio.gather(embed_task, doc_map_task)
+
+            combined_topic = " + ".join([f["topic"] for f in files]) if len(files) > 1 else files[0]["topic"]
+            doc_map_context = "DOCUMENT MAP (topics found in uploaded material):\n"
+            for topic in doc_map.get("topics", []):
+                doc_map_context += f"- {topic['topic']}: {topic.get('description', '')} [{len(topic.get('chunk_indices', []))} sections]\n"
+
+            async for event in self._generate_full_course_from_files_stream(
+                user_id=user_id,
+                course_id=pre_course_id,
+                topic=combined_topic,
+                profile=profile,
+                model_config=model_config,
+                source_files=[{"file_id": generate_uuid(), "filename": f["filename"], "extracted_topic": f["topic"]} for f in files],
+                doc_map=doc_map,
+                doc_map_context=doc_map_context,
+                all_chunks=all_chunks,
+                organization=chosen_org
+            ):
+                if event["type"] == "outline_ready":
+                    course_id = event["course_id"]
+                    total_chapters = event["total_chapters"]
+                yield event
+                if event["type"] == "error":
+                    return
+
+            generation_time = round(time.time() - start_time, 2)
+            yield {
+                "type": "course_complete",
+                "course_id": course_id,
+                "status": CourseStatus.READY,
+                "total_chapters": total_chapters,
+                "generation_time_seconds": generation_time
+            }
+        except Exception as e:
+            logger.error(f"Streaming file course generation failed: {e}")
+            yield {
+                "type": "error",
+                "message": str(e),
+                "course_id": course_id,
+                "phase": "generation"
+            }
 
     # Public API methods
-    
+
     def get_course(self, course_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve full course with chapters"""
         return self.storage.get_course(course_id)

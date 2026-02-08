@@ -4,6 +4,7 @@ Clean, well-documented endpoints following REST conventions.
 """
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi.responses import StreamingResponse
 from typing import List, Optional
 import json
 import logging
@@ -272,6 +273,192 @@ async def create_course_from_files(
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# SSE Streaming Helpers
+
+def _sse_event(data: dict) -> str:
+    """Format a dict as an SSE data line."""
+    return f"data: {json.dumps(data, default=str)}\n\n"
+
+
+# SSE Streaming Endpoints
+
+@router.post("/courses/from-topic/stream")
+async def create_course_from_topic_stream(
+    user_id: str = Form(...),
+    topic: str = Form(...),
+    model: Optional[str] = Form(None),
+    files: Optional[List[UploadFile]] = File(None),
+    youtube_urls: Optional[str] = Form(None),
+    web_urls: Optional[str] = Form(None)
+):
+    """
+    SSE streaming version of /courses/from-topic.
+    Returns a text/event-stream that progressively emits:
+    - processing_sources: when source extraction begins
+    - outline_ready: course outline + metadata (~10s)
+    - chapter_ready: each chapter as it finishes
+    - course_complete: all done with timing
+    - error: on failure
+    """
+    # Pre-stream validation (can still return HTTP errors)
+    if model and model not in ModelConfig.get_available_models():
+        available = ModelConfig.get_available_models()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid model. Available: {available}"
+        )
+
+    try:
+        yt_urls = _parse_url_list(youtube_urls)
+        w_urls = _parse_url_list(web_urls)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    has_files = files and len(files) > 0 and files[0].filename
+    if has_files and len(files) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
+
+    async def event_generator():
+        try:
+            # Process sources
+            all_processed = []
+            source_count = 0
+
+            if has_files:
+                source_count += len(files)
+            if yt_urls:
+                source_count += len(yt_urls)
+            if w_urls:
+                source_count += len(w_urls)
+
+            if source_count > 0:
+                yield _sse_event({
+                    "type": "processing_sources",
+                    "message": f"Processing {source_count} source(s)...",
+                    "source_count": source_count
+                })
+
+            if has_files:
+                all_processed.extend(await _process_uploaded_files(files, model=model))
+            if yt_urls:
+                all_processed.extend(await _process_youtube_urls(yt_urls, model=model))
+            if w_urls:
+                all_processed.extend(await _process_web_urls(w_urls, model=model))
+
+            # Route to streaming service method
+            if all_processed:
+                stream = course_service.create_course_from_topic_with_files_stream(
+                    user_id=user_id,
+                    topic=topic,
+                    files=all_processed,
+                    model=model
+                )
+            else:
+                stream = course_service.create_course_from_topic_stream(
+                    user_id=user_id,
+                    topic=topic,
+                    context={},
+                    model=model
+                )
+
+            async for event in stream:
+                yield _sse_event(event)
+
+        except Exception as e:
+            logger.error(f"SSE stream error: {e}")
+            yield _sse_event({
+                "type": "error",
+                "message": str(e),
+                "phase": "stream"
+            })
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+@router.post("/courses/from-files/stream")
+async def create_course_from_files_stream(
+    files: Optional[List[UploadFile]] = File(None),
+    user_id: str = Form(...),
+    organization: str = Form("auto"),
+    model: Optional[str] = Form(None),
+    youtube_urls: Optional[str] = Form(None),
+    web_urls: Optional[str] = Form(None)
+):
+    """
+    SSE streaming version of /courses/from-files.
+    Returns a text/event-stream that progressively emits events.
+    """
+    # Pre-stream validation
+    if model and model not in ModelConfig.get_available_models():
+        available = ModelConfig.get_available_models()
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid model. Available: {available}"
+        )
+
+    try:
+        yt_urls = _parse_url_list(youtube_urls)
+        w_urls = _parse_url_list(web_urls)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    has_files = files and len(files) > 0 and files[0].filename
+    if has_files and len(files) > 10:
+        raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
+
+    if not has_files and not yt_urls and not w_urls:
+        raise HTTPException(
+            status_code=400,
+            detail="At least 1 source required (file, YouTube URL, or web URL)"
+        )
+
+    async def event_generator():
+        try:
+            # Process sources
+            all_processed = []
+            source_count = (len(files) if has_files else 0) + len(yt_urls) + len(w_urls)
+
+            yield _sse_event({
+                "type": "processing_sources",
+                "message": f"Processing {source_count} source(s)...",
+                "source_count": source_count
+            })
+
+            if has_files:
+                all_processed.extend(await _process_uploaded_files(files, model=model))
+            if yt_urls:
+                all_processed.extend(await _process_youtube_urls(yt_urls, model=model))
+            if w_urls:
+                all_processed.extend(await _process_web_urls(w_urls, model=model))
+
+            if not all_processed:
+                yield _sse_event({
+                    "type": "error",
+                    "message": "No usable content extracted from provided sources",
+                    "phase": "source_processing"
+                })
+                return
+
+            # Stream course generation
+            async for event in course_service.create_course_from_files_stream(
+                user_id=user_id,
+                files=all_processed,
+                organization=organization,
+                model=model
+            ):
+                yield _sse_event(event)
+
+        except Exception as e:
+            logger.error(f"SSE stream error: {e}")
+            yield _sse_event({
+                "type": "error",
+                "message": str(e),
+                "phase": "stream"
+            })
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 # Course Access Endpoints
