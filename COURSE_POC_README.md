@@ -16,6 +16,7 @@ Complete POC for AI-powered course generation with the following features:
 7. **Source Citations**: Claude native search + Perplexity fallback
 8. **Chapter-Specific Quizzes**: 3-5 questions with explanations
 9. **Course Q&A**: Ask questions about course content per chapter
+10. **SSE Streaming**: Real-time progress via Server-Sent Events (outline → chapters → complete)
 
 ### File Structure
 ```
@@ -40,6 +41,10 @@ nuton_rag/
 ### Course Generation
 - `POST /api/v1/courses/from-topic` - Generate from topic (45-60s)
 - `POST /api/v1/courses/from-files` - Generate from PDF/PPT
+
+### Course Generation (SSE Streaming)
+- `POST /api/v1/courses/from-topic/stream` - Stream course generation from topic via SSE
+- `POST /api/v1/courses/from-files/stream` - Stream course generation from files via SSE
 
 ### Course Access
 - `GET /api/v1/courses/{course_id}` - Full course with chapters
@@ -122,7 +127,48 @@ curl -X POST http://localhost:8000/api/v1/courses/{course_id}/progress \
   }'
 ```
 
-### 6. Ask a Question about a Course
+### 6. Stream Course from Topic (SSE)
+```bash
+curl -N -X POST http://localhost:8000/api/v1/courses/from-topic/stream \
+  -F "user_id=user-123" \
+  -F "topic=quantum computing basics" \
+  -F "model=claude-haiku-4-5"
+```
+
+**SSE Events** (streamed progressively):
+```
+data: {"type": "processing_sources", "message": "Processing 2 source(s)...", "source_count": 2}
+
+data: {"type": "outline_ready", "course_id": "uuid", "title": "...", "chapters": [...]}
+
+data: {"type": "chapter_ready", "chapter_order": 1, "title": "...", "content": "..."}
+
+data: {"type": "chapter_ready", "chapter_order": 2, "title": "...", "content": "..."}
+
+data: {"type": "course_complete", "course_id": "uuid", "generation_time_seconds": 52}
+```
+
+Optional source parameters (can be combined with topic):
+```bash
+curl -N -X POST http://localhost:8000/api/v1/courses/from-topic/stream \
+  -F "user_id=user-123" \
+  -F "topic=quantum computing basics" \
+  -F "files=@notes.pdf" \
+  -F "youtube_urls=https://youtube.com/watch?v=abc123" \
+  -F "web_urls=https://example.com/article"
+```
+
+### 7. Stream Course from Files (SSE)
+```bash
+curl -N -X POST http://localhost:8000/api/v1/courses/from-files/stream \
+  -F "files=@physics_lecture.pdf" \
+  -F "files=@chemistry_notes.pdf" \
+  -F "user_id=user-123" \
+  -F "organization=auto" \
+  -F "model=claude-haiku-4-5"
+```
+
+### 8. Ask a Question about a Course
 ```bash
 curl -X POST http://localhost:8000/api/v1/courses/{course_id}/ask \
   -H "Content-Type: application/json" \
