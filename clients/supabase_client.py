@@ -559,6 +559,236 @@ def upsert_generated_content_notes(document_id: str, notes_markdown: str, space_
         logging.error(f"Error upserting notes to generated_content for document {document_id}: {e}")
         raise
 
+# ============================================================================
+# Course CRUD functions
+# ============================================================================
+
+def _serialize_for_supabase(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Recursively convert enums → .value, datetimes → .isoformat() for Supabase writes."""
+    from enum import Enum
+    result = {}
+    for key, value in data.items():
+        if isinstance(value, Enum):
+            result[key] = value.value
+        elif isinstance(value, datetime):
+            result[key] = value.isoformat()
+        elif isinstance(value, dict):
+            result[key] = _serialize_for_supabase(value)
+        elif isinstance(value, list):
+            result[key] = [
+                _serialize_for_supabase(item) if isinstance(item, dict)
+                else item.value if isinstance(item, Enum)
+                else item.isoformat() if isinstance(item, datetime)
+                else item
+                for item in value
+            ]
+        else:
+            result[key] = value
+    return result
+
+
+def _serialize_course_data(course_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Serialize course data for DB insert/update. Drops non-DB fields like chapters."""
+    # Only keep columns that exist in the courses table
+    db_fields = {
+        "id", "user_id", "space_id", "title", "description", "topic",
+        "source_type", "source_files", "multi_file_organization",
+        "total_chapters", "estimated_time", "status", "personalization_params",
+        "outline", "model_used", "created_at", "completed_at"
+    }
+    filtered = {k: v for k, v in course_data.items() if k in db_fields}
+    return _serialize_for_supabase(filtered)
+
+
+def _serialize_chapter_data(chapter_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Serialize chapter data for DB insert. Maps 'order' → 'order_index'."""
+    serialized = _serialize_for_supabase(chapter_data)
+    # Map order → order_index
+    if "order" in serialized:
+        serialized["order_index"] = serialized.pop("order")
+    # Only keep columns that exist in the chapters table
+    db_fields = {
+        "id", "course_id", "order_index", "title", "learning_objectives",
+        "content", "content_format", "estimated_time", "key_concepts",
+        "sources", "quiz", "word_count", "source_document_id",
+        "source_document_type", "status", "generated_at"
+    }
+    return {k: v for k, v in serialized.items() if k in db_fields}
+
+
+# --- Learning Profile ---
+
+def upsert_learning_profile(profile_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Upsert a learning profile by user_id."""
+    data = _serialize_for_supabase(profile_data)
+    response = get_supabase().table("learning_profiles").upsert(
+        data, on_conflict="user_id"
+    ).execute()
+    if not response.data:
+        raise Exception(f"Failed to upsert learning profile: {response}")
+    return response.data[0]
+
+
+def get_learning_profile(user_id: str) -> Optional[Dict[str, Any]]:
+    """Get learning profile by user_id."""
+    response = get_supabase().table("learning_profiles") \
+        .select("*").eq("user_id", user_id).execute()
+    if response.data and len(response.data) > 0:
+        return response.data[0]
+    return None
+
+
+# --- Courses ---
+
+def upsert_course(course_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Upsert a course record. Uses PK (id) for conflict resolution."""
+    data = _serialize_course_data(course_data)
+    response = get_supabase().table("courses").upsert(
+        data, on_conflict="id"
+    ).execute()
+    if not response.data:
+        raise Exception(f"Failed to upsert course: {response}")
+    return response.data[0]
+
+
+def get_course_by_id(course_id: str) -> Optional[Dict[str, Any]]:
+    """Get a course by id."""
+    response = get_supabase().table("courses") \
+        .select("*").eq("id", course_id).execute()
+    if response.data and len(response.data) > 0:
+        return response.data[0]
+    return None
+
+
+def list_courses_by_user(user_id: str) -> List[Dict[str, Any]]:
+    """List courses for a user, ordered by created_at desc."""
+    response = get_supabase().table("courses") \
+        .select("id, user_id, title, topic, status, total_chapters, estimated_time, created_at") \
+        .eq("user_id", user_id) \
+        .order("created_at", desc=True) \
+        .execute()
+    return response.data or []
+
+
+# --- Chapters ---
+
+def upsert_chapter(chapter_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Upsert a chapter. Maps order → order_index. Conflict on (course_id, order_index)."""
+    data = _serialize_chapter_data(chapter_data)
+    response = get_supabase().table("chapters").upsert(
+        data, on_conflict="course_id,order_index"
+    ).execute()
+    if not response.data:
+        raise Exception(f"Failed to upsert chapter: {response}")
+    return response.data[0]
+
+
+def get_chapter_by_order(course_id: str, order_index: int) -> Optional[Dict[str, Any]]:
+    """Get a chapter by course_id and order_index. Maps order_index → order on return."""
+    response = get_supabase().table("chapters") \
+        .select("*").eq("course_id", course_id).eq("order_index", order_index).execute()
+    if response.data and len(response.data) > 0:
+        row = response.data[0]
+        row["order"] = row.pop("order_index", order_index)
+        return row
+    return None
+
+
+def get_chapters_by_course(course_id: str) -> List[Dict[str, Any]]:
+    """Get all chapters for a course, ordered by order_index. Maps order_index → order."""
+    response = get_supabase().table("chapters") \
+        .select("*").eq("course_id", course_id) \
+        .order("order_index").execute()
+    chapters = response.data or []
+    for ch in chapters:
+        ch["order"] = ch.pop("order_index", None)
+    return chapters
+
+
+# --- Progress ---
+
+def upsert_chapter_progress(
+    user_id: str, course_id: str, chapter_id: str,
+    completed: bool, time_spent_minutes: int = 0,
+    completed_at: Optional[str] = None
+) -> Dict[str, Any]:
+    """Upsert progress for a specific chapter. Conflict on (user_id, chapter_id)."""
+    data = {
+        "user_id": user_id,
+        "course_id": course_id,
+        "chapter_id": chapter_id,
+        "completed": completed,
+        "time_spent_minutes": time_spent_minutes,
+        "completed_at": completed_at,
+        "updated_at": datetime.now().isoformat()
+    }
+    response = get_supabase().table("course_progress") \
+        .upsert(data, on_conflict="user_id,chapter_id").execute()
+    if not response.data:
+        raise Exception(f"Failed to upsert chapter progress: {response}")
+    return response.data[0]
+
+
+def get_chapter_progress_for_course(user_id: str, course_id: str) -> List[Dict[str, Any]]:
+    """Get all progress rows for a user+course."""
+    response = get_supabase().table("course_progress") \
+        .select("*").eq("user_id", user_id).eq("course_id", course_id).execute()
+    return response.data or []
+
+
+def get_all_progress_for_user(user_id: str) -> List[Dict[str, Any]]:
+    """Get ALL progress rows for a user across all courses. Single query."""
+    response = get_supabase().table("course_progress") \
+        .select("*").eq("user_id", user_id).execute()
+    return response.data or []
+
+
+def get_all_quiz_attempts_for_user(user_id: str) -> List[Dict[str, Any]]:
+    """Get ALL quiz attempts for a user across all chapters. Single query."""
+    response = get_supabase().table("course_quiz_attempts") \
+        .select("*").eq("user_id", user_id) \
+        .order("started_at").execute()
+    return response.data or []
+
+
+# --- Quiz Attempts ---
+
+def insert_course_quiz_attempt(
+    user_id: str, chapter_id: str, score: float,
+    answers: Optional[Any] = None,
+    completed_at: Optional[str] = None,
+    time_taken_seconds: Optional[int] = None
+) -> Dict[str, Any]:
+    """Insert a quiz attempt record."""
+    data = {
+        "user_id": user_id,
+        "chapter_id": chapter_id,
+        "score": score,
+    }
+    if answers is not None:
+        data["answers"] = answers
+    if completed_at is not None:
+        data["completed_at"] = completed_at
+    if time_taken_seconds is not None:
+        data["time_taken_seconds"] = time_taken_seconds
+    response = get_supabase().table("course_quiz_attempts").insert(data).execute()
+    if not response.data:
+        raise Exception(f"Failed to insert quiz attempt: {response}")
+    return response.data[0]
+
+
+def get_course_quiz_attempts(user_id: str, chapter_id: str) -> List[Dict[str, Any]]:
+    """Get all quiz attempts for a user+chapter, ordered by started_at."""
+    response = get_supabase().table("course_quiz_attempts") \
+        .select("*").eq("user_id", user_id).eq("chapter_id", chapter_id) \
+        .order("started_at").execute()
+    return response.data or []
+
+
+# ============================================================================
+# Existing document functions
+# ============================================================================
+
 def get_documents_in_space(space_id: str) -> Dict[str, List[Dict[str, Any]]]:
     """
     Get all documents (PDFs and YouTube videos) in a specific space.
