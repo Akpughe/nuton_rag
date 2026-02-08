@@ -5,13 +5,17 @@ Clean, well-documented endpoints following REST conventions.
 
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from typing import List, Optional
+import json
 import logging
+import re
 import time
 
 from services.course_service import CourseService, CourseGenerationError
+from services.wetrocloud_youtube import WetroCloudYouTubeService
+from clients.jina_reader_client import extract_web_content
 from utils.file_storage import ProgressStorage
 from models.course_models import (
-    LearningProfileRequest, CourseFromTopicRequest, ProgressUpdateRequest
+    LearningProfileRequest, ProgressUpdateRequest
 )
 
 # File processing imports
@@ -24,8 +28,9 @@ import tempfile
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1", tags=["courses"])
 
-# Initialize service
+# Initialize services
 course_service = CourseService()
+yt_service = WetroCloudYouTubeService()
 
 
 # Learning Profile Endpoints
@@ -75,35 +80,92 @@ async def get_learning_profile(user_id: str):
 
 # Course Generation Endpoints
 @router.post("/courses/from-topic", status_code=201)
-async def create_course_from_topic(request: CourseFromTopicRequest):
+async def create_course_from_topic(
+    user_id: str = Form(...),
+    topic: str = Form(...),
+    model: Optional[str] = Form(None),
+    files: Optional[List[UploadFile]] = File(None),
+    youtube_urls: Optional[str] = Form(None),
+    web_urls: Optional[str] = Form(None)
+):
     """
-    Generate complete course from topic string.
-    
-    **Blocking operation** - Returns full course in 45-60 seconds.
-    
+    Generate complete course from topic string with optional supplementary sources.
+
+    **Blocking operation** - Returns full course in 30-60 seconds.
+
+    Accepts Form data (not JSON) to support optional file uploads.
+    Topic drives the course structure; files, YouTube videos, and web URLs
+    provide supplementary context.
+
+    Source params (all optional, can be combined):
+    - files: PDF/PPTX/DOCX/TXT/MD uploads (max 10, 50MB each)
+    - youtube_urls: JSON array of YouTube URLs, e.g. '["https://youtube.com/watch?v=abc"]'
+    - web_urls: JSON array of web URLs, e.g. '["https://example.com/article"]'
+
     Models available:
-    - claude-sonnet-4 (default): Best quality, supports web search
-    - gpt-4o: Good quality, no web search
-    - llama-4-scout: Fastest, cheapest, no web search
+    - claude-haiku-4-5 (default): Fast, affordable, native web search
+    - claude-sonnet-4-5: High quality, native web search
+    - claude-opus-4-6: Highest quality, native web search
+    - gpt-4o: Good quality, web search via Responses API
+    - gpt-5-mini: Fast, affordable, web search via Responses API
+    - gpt-5.2: High quality, web search via Responses API
+    - llama-4-scout: Fastest, cheapest, Perplexity search fallback
+    - llama-4-maverick: Fast, affordable, Perplexity search fallback
     """
     try:
         # Validate model if provided
-        if request.model and request.model not in ModelConfig.get_available_models():
+        if model and model not in ModelConfig.get_available_models():
             available = ModelConfig.get_available_models()
             raise HTTPException(
-                status_code=400, 
+                status_code=400,
                 detail=f"Invalid model. Available: {available}"
             )
-        
-        result = await course_service.create_course_from_topic(
-            user_id=request.user_id,
-            topic=request.topic,
-            context=request.context,
-            model=request.model
-        )
-        
+
+        # Parse URL lists
+        try:
+            yt_urls = _parse_url_list(youtube_urls)
+            w_urls = _parse_url_list(web_urls)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        # Validate file count
+        has_files = files and len(files) > 0 and files[0].filename
+        if has_files and len(files) > 10:
+            raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
+
+        # Build merged source list
+        all_processed = []
+
+        if has_files:
+            all_processed.extend(await _process_uploaded_files(files, model=model))
+
+        if yt_urls:
+            all_processed.extend(await _process_youtube_urls(yt_urls, model=model))
+
+        if w_urls:
+            all_processed.extend(await _process_web_urls(w_urls, model=model))
+
+        # Route to appropriate service method
+        if all_processed:
+            result = await course_service.create_course_from_topic_with_files(
+                user_id=user_id,
+                topic=topic,
+                files=all_processed,
+                model=model
+            )
+        else:
+            # Pure topic path
+            result = await course_service.create_course_from_topic(
+                user_id=user_id,
+                topic=topic,
+                context={},
+                model=model
+            )
+
         return result
-        
+
+    except HTTPException:
+        raise
     except CourseGenerationError as e:
         logger.error(f"Course generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -114,33 +176,34 @@ async def create_course_from_topic(request: CourseFromTopicRequest):
 
 @router.post("/courses/from-files", status_code=201)
 async def create_course_from_files(
-    files: List[UploadFile] = File(...),
+    files: Optional[List[UploadFile]] = File(None),
     user_id: str = Form(...),
     organization: str = Form("auto"),
-    model: Optional[str] = Form(None)
+    model: Optional[str] = Form(None),
+    youtube_urls: Optional[str] = Form(None),
+    web_urls: Optional[str] = Form(None)
 ):
     """
-    Generate course from uploaded PDF/PPT files.
-    
-    **Multi-file support included:**
-    - Auto-detects topic relationships
-    - Recommends organization strategy
-    - 1-10 files supported
-    
+    Generate course from uploaded files, YouTube videos, and/or web URLs.
+
+    At least one source is required (file, YouTube URL, or web URL).
+
+    **Multi-source support:**
+    - Files: PDF/PPTX/DOCX/TXT/MD (max 10, 50MB each)
+    - youtube_urls: JSON array of YouTube URLs, e.g. '["https://youtube.com/watch?v=abc"]'
+    - web_urls: JSON array of web URLs, e.g. '["https://example.com/article"]'
+
     Organization options:
     - auto: Let system decide based on topic similarity
     - thematic_bridge: Unified course showing connections
     - sequential_sections: Separate sections within one course
     - separate_courses: Create multiple independent courses
+
+    Response format varies by organization:
+    - Single course: `{course_id, status, course, storage_path, ...}`
+    - Separate courses: `{organization: "separate_courses", total_courses, courses: [...]}`
     """
     try:
-        # Validate files
-        if len(files) > 10:
-            raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
-        
-        if len(files) < 1:
-            raise HTTPException(status_code=400, detail="At least 1 file required")
-        
         # Validate model
         if model and model not in ModelConfig.get_available_models():
             available = ModelConfig.get_available_models()
@@ -148,20 +211,56 @@ async def create_course_from_files(
                 status_code=400,
                 detail=f"Invalid model. Available: {available}"
             )
-        
-        # Process files
-        processed_files = await _process_uploaded_files(files, model=model)
-        
+
+        # Parse URL lists
+        try:
+            yt_urls = _parse_url_list(youtube_urls)
+            w_urls = _parse_url_list(web_urls)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+        # Validate file count
+        has_files = files and len(files) > 0 and files[0].filename
+        if has_files and len(files) > 10:
+            raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
+
+        # Require at least one source
+        if not has_files and not yt_urls and not w_urls:
+            raise HTTPException(
+                status_code=400,
+                detail="At least 1 source required (file, YouTube URL, or web URL)"
+            )
+
+        # Build merged source list
+        all_processed = []
+
+        if has_files:
+            all_processed.extend(await _process_uploaded_files(files, model=model))
+
+        if yt_urls:
+            all_processed.extend(await _process_youtube_urls(yt_urls, model=model))
+
+        if w_urls:
+            all_processed.extend(await _process_web_urls(w_urls, model=model))
+
+        if not all_processed:
+            raise HTTPException(
+                status_code=400,
+                detail="No usable content extracted from provided sources"
+            )
+
         # Generate course
         result = await course_service.create_course_from_files(
             user_id=user_id,
-            files=processed_files,
+            files=all_processed,
             organization=organization,
             model=model
         )
-        
+
         return result
-        
+
+    except HTTPException:
+        raise
     except CourseGenerationError as e:
         logger.error(f"File course generation error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -441,6 +540,116 @@ async def _process_uploaded_files(files: List[UploadFile], model: Optional[str] 
     return processed
 
 
+def _parse_url_list(urls_json: Optional[str]) -> List[str]:
+    """Parse a JSON string into a list of URL strings."""
+    if not urls_json:
+        return []
+    try:
+        urls = json.loads(urls_json)
+        if not isinstance(urls, list):
+            raise ValueError("Expected a JSON array of URLs")
+        return [str(u) for u in urls]
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON for URLs: {e}")
+
+
+async def _process_youtube_urls(urls: List[str], model: Optional[str] = None) -> List[dict]:
+    """Process YouTube URLs by extracting transcripts and packaging as source dicts.
+
+    Follows the same pattern as process_youtube() in pipeline.py:
+    uses WetroCloudYouTubeService with extract_video_id + get_transcript + get_video_title.
+    """
+    processed = []
+
+    for url in urls:
+        try:
+            # Extract video ID first (validates the URL)
+            video_id = yt_service.extract_video_id(url)
+            if not video_id:
+                logger.warning(f"Invalid YouTube URL, could not extract video ID: {url}")
+                continue
+
+            # Get transcript (WetroCloud -> Vcyon -> yt-dlp fallback chain)
+            result = yt_service.get_transcript(url)
+            if not result.get("success"):
+                logger.warning(f"YouTube transcript failed for {url}: {result.get('message', 'Unknown error')}")
+                continue
+
+            text = result.get("text", "")
+            if len(text) < 50:
+                logger.warning(f"YouTube transcript too short for {url}: {len(text)} chars")
+                continue
+
+            # Get video title — matches pipeline.py pattern
+            if "video_title" in result and result["video_title"]:
+                video_title = result["video_title"]
+            else:
+                video_title = yt_service.get_video_title(url)
+
+            # Fall back to LLM topic extraction if title is still missing or generic
+            if not video_title or video_title.startswith("YouTube Video:") or len(video_title) < 5:
+                video_title = await _extract_topic(text[:2000], model=model)
+
+            processed.append({
+                "filename": f"youtube_{video_id}.txt",
+                "topic": video_title,
+                "extracted_text": text,
+                "pages": 1,
+                "char_count": len(text),
+                "source_url": url,
+                "source_type": "youtube",
+            })
+
+            logger.info(f"Processed YouTube {video_id}: {video_title} ({len(text)} chars, method={result.get('method', 'unknown')})")
+
+        except Exception as e:
+            logger.warning(f"YouTube processing error for {url}: {e}")
+            continue
+
+    return processed
+
+
+async def _process_web_urls(urls: List[str], model: Optional[str] = None) -> List[dict]:
+    """Process web URLs by extracting content via Jina Reader and packaging as source dicts."""
+    processed = []
+
+    for url in urls:
+        try:
+            result = extract_web_content(url)
+            if not result.get("success"):
+                logger.warning(f"Web extraction failed for {url}: {result.get('message', 'Unknown error')}")
+                continue
+
+            text = result.get("text", "")
+            if len(text) < 50:
+                logger.warning(f"Web content too short for {url}: {len(text)} chars")
+                continue
+
+            # Extract topic from content via LLM
+            topic = await _extract_topic(text[:2000], model=model)
+
+            # Build safe filename from domain
+            safe_domain = re.sub(r"[^a-zA-Z0-9]", "_", url.split("//")[-1].split("/")[0])
+
+            processed.append({
+                "filename": f"web_{safe_domain}.txt",
+                "topic": topic,
+                "extracted_text": text,
+                "pages": 1,
+                "char_count": len(text),
+                "source_url": url,
+                "source_type": "web",
+            })
+
+            logger.info(f"Processed web URL {url}: {topic} ({len(text)} chars)")
+
+        except Exception as e:
+            logger.warning(f"Web URL processing error for {url}: {e}")
+            continue
+
+    return processed
+
+
 def _save_temp_file(file: UploadFile) -> str:
     """Save uploaded file to temp location"""
     suffix = os.path.splitext(file.filename)[1] if file.filename else ""
@@ -456,13 +665,9 @@ async def _extract_topic(text: str, model: Optional[str] = None) -> str:
     """Extract main topic from text using LLM"""
     prompt = build_topic_extraction_prompt(text)
     model_config = ModelConfig.get_config(model)
-    
-    # Import here to avoid circular dependency
-    from services.course_service import CourseService
-    service = CourseService()
-    
-    # Quick call to get topic
-    response = await service._call_model(prompt, model_config, expect_json=False)
+
+    # Use module-level singleton instead of creating new instances
+    response = await course_service._call_model(prompt, model_config, expect_json=False)
     topic = response.get("content", "").strip()
     
     # Clean up
@@ -475,8 +680,8 @@ async def _extract_topic(text: str, model: Optional[str] = None) -> str:
 @router.get("/models")
 async def get_available_models():
     """List all available AI models for course generation"""
-    from utils.model_config import MODEL_CONFIGS, estimate_course_cost
-    
+    from utils.model_config import MODEL_CONFIGS, DEFAULT_MODEL, estimate_course_cost, get_search_mode
+
     models = []
     for key, config in MODEL_CONFIGS.items():
         models.append({
@@ -484,8 +689,9 @@ async def get_available_models():
             "name": config["model"],
             "provider": config["provider"],
             "supports_web_search": config["supports_search"],
+            "search_mode": get_search_mode(key),
             "estimated_cost_per_course": estimate_course_cost(key, 4),
-            "default": key == "claude-sonnet-4"
+            "default": key == DEFAULT_MODEL
         })
-    
+
     return {"models": models}
