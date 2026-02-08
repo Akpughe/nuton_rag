@@ -14,6 +14,11 @@ from services.course_service import CourseService, CourseGenerationError
 from services.wetrocloud_youtube import WetroCloudYouTubeService
 from clients.jina_reader_client import extract_web_content
 from utils.file_storage import ProgressStorage
+from clients.supabase_client import (
+    upsert_chapter_progress,
+    insert_course_quiz_attempt,
+    get_chapter_progress_for_course,
+)
 from models.course_models import (
     LearningProfileRequest, ProgressUpdateRequest
 )
@@ -200,7 +205,7 @@ async def create_course_from_files(
     - separate_courses: Create multiple independent courses
 
     Response format varies by organization:
-    - Single course: `{course_id, status, course, storage_path, ...}`
+    - Single course: `{course_id, status, course, generation_time_seconds, ...}`
     - Separate courses: `{organization: "separate_courses", total_courses, courses: [...]}`
     """
     try:
@@ -336,68 +341,46 @@ async def update_progress(course_id: str, request: ProgressUpdateRequest):
     - Time spent
     """
     try:
-        progress_storage = ProgressStorage()
-        
-        # Load existing or create new
         course = course_service.get_course(course_id)
         if not course:
             raise HTTPException(status_code=404, detail="Course not found")
-        
+
         user_id = course["user_id"]
-        progress_data = progress_storage.load_progress(user_id, course_id) or {
-            "user_id": user_id,
-            "course_id": course_id,
-            "chapter_progress": [],
-            "overall_progress": {
-                "completed_chapters": 0,
-                "total_chapters": course["total_chapters"],
-                "percentage": 0,
-                "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")
-            }
-        }
-        
-        # Update chapter progress
-        chapter_found = False
-        for cp in progress_data["chapter_progress"]:
-            if cp["chapter_id"] == request.chapter_id:
-                cp["completed"] = request.completed
-                cp["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ") if request.completed else None
-                if request.quiz_score is not None:
-                    cp.setdefault("quiz_attempts", []).append({
-                        "attempt_id": len(cp.get("quiz_attempts", [])) + 1,
-                        "score": request.quiz_score,
-                        "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")
-                    })
-                if request.time_spent_minutes:
-                    cp["time_spent_minutes"] = request.time_spent_minutes
-                chapter_found = True
-                break
-        
-        if not chapter_found:
-            progress_data["chapter_progress"].append({
-                "chapter_id": request.chapter_id,
-                "completed": request.completed,
-                "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ") if request.completed else None,
-                "quiz_attempts": [{"attempt_id": 1, "score": request.quiz_score, "completed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ")}] if request.quiz_score else [],
-                "time_spent_minutes": request.time_spent_minutes or 0
-            })
-        
-        # Recalculate overall progress
-        completed = sum(1 for cp in progress_data["chapter_progress"] if cp["completed"])
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Upsert chapter progress directly to Supabase
+        upsert_chapter_progress(
+            user_id=user_id,
+            course_id=course_id,
+            chapter_id=request.chapter_id,
+            completed=request.completed,
+            time_spent_minutes=request.time_spent_minutes or 0,
+            completed_at=now if request.completed else None,
+        )
+
+        # Insert quiz attempt if score provided
+        if request.quiz_score is not None:
+            insert_course_quiz_attempt(
+                user_id=user_id,
+                chapter_id=request.chapter_id,
+                score=request.quiz_score,
+                completed_at=now,
+            )
+
+        # Re-query to compute overall stats
+        rows = get_chapter_progress_for_course(user_id, course_id)
         total = course["total_chapters"]
-        progress_data["overall_progress"]["completed_chapters"] = completed
-        progress_data["overall_progress"]["total_chapters"] = total
-        progress_data["overall_progress"]["percentage"] = round((completed / total) * 100) if total > 0 else 0
-        progress_data["overall_progress"]["last_activity"] = time.strftime("%Y-%m-%dT%H:%M:%SZ")
-        
-        # Save
-        success = progress_storage.save_progress(progress_data)
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to save progress")
-        
+        completed_count = sum(1 for r in rows if r.get("completed"))
+        percentage = round((completed_count / total) * 100) if total > 0 else 0
+
         return {
             "success": True,
-            "overall_progress": progress_data["overall_progress"]
+            "overall_progress": {
+                "completed_chapters": completed_count,
+                "total_chapters": total,
+                "percentage": percentage,
+                "last_activity": now,
+            }
         }
         
     except HTTPException:
@@ -409,23 +392,24 @@ async def update_progress(course_id: str, request: ProgressUpdateRequest):
 
 @router.get("/users/{user_id}/progress")
 async def get_user_progress(user_id: str):
-    """Get learning progress across all courses"""
+    """Get learning progress across all courses (batched — 3 queries total)"""
     courses = course_service.list_user_courses(user_id)
-    
+
+    # Batch: 2 queries for ALL progress + quiz attempts (instead of N+1+N*M)
     progress_storage = ProgressStorage()
+    progress_map = progress_storage.load_all_progress(user_id, courses)
+
     courses_with_progress = []
-    
     for course in courses:
-        progress = progress_storage.load_progress(user_id, course["id"])
         courses_with_progress.append({
             "course": course,
-            "progress": progress
+            "progress": progress_map.get(course["id"])
         })
-    
+
     # Calculate stats
     completed_courses = [c for c in courses_with_progress if c["progress"] and c["progress"]["overall_progress"]["percentage"] == 100]
     in_progress = [c for c in courses_with_progress if c["progress"] and c["progress"]["overall_progress"]["percentage"] > 0 and c["progress"]["overall_progress"]["percentage"] < 100]
-    
+
     return {
         "user_id": user_id,
         "total_courses": len(courses),
