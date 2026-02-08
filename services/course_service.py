@@ -106,7 +106,6 @@ class CourseService:
                 "course_id": course["id"],
                 "status": CourseStatus.READY,
                 "course": course,
-                "storage_path": f"courses/course_{course['id']}/",
                 "generation_time_seconds": generation_time
             }
             
@@ -165,7 +164,6 @@ class CourseService:
                     "status": CourseStatus.READY,
                     "total_chapters": course["total_chapters"],
                     "estimated_time": course["estimated_time"],
-                    "storage_path": f"courses/course_{course['id']}/"
                 })
 
             generation_time = round(time.time() - start_time, 2)
@@ -254,7 +252,6 @@ class CourseService:
                 "document_map": doc_map,
                 "total_chunks_processed": len(all_chunks),
                 "course": course,
-                "storage_path": f"courses/course_{course['id']}/",
                 "generation_time_seconds": generation_time
             }
 
@@ -347,7 +344,6 @@ class CourseService:
                 "document_map": doc_map,
                 "total_chunks_processed": len(all_chunks),
                 "course": course,
-                "storage_path": f"courses/course_{course['id']}/",
                 "generation_time_seconds": generation_time
             }
 

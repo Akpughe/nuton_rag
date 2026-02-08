@@ -250,7 +250,7 @@ class CourseGenerationResponse(BaseModel):
     course_id: str
     status: CourseStatus
     course: Course
-    storage_path: str
+    storage_path: Optional[str] = None
     generation_time_seconds: float
 
 
@@ -262,7 +262,7 @@ class SingleCourseInfo(BaseModel):
     status: CourseStatus
     total_chapters: int
     estimated_time: int
-    storage_path: str
+    storage_path: Optional[str] = None
 
 
 class MultiFileAnalysis(BaseModel):
