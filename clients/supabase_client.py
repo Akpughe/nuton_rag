@@ -7,10 +7,18 @@ import logging
 
 load_dotenv()
 
-SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+_supabase_client: Optional[Client] = None
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+def get_supabase() -> Client:
+    global _supabase_client
+    if _supabase_client is None:
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_KEY")
+        if not url or not key:
+            raise ValueError("SUPABASE_URL and SUPABASE_KEY must be set")
+        _supabase_client = create_client(url, key)
+    return _supabase_client
+
 
 def insert_pdf_record(metadata: Dict[str, Any]) -> str:
     """
@@ -22,7 +30,7 @@ def insert_pdf_record(metadata: Dict[str, Any]) -> str:
     Raises:
         Exception if insertion fails or id is not returned.
     """
-    response = supabase.table("pdfs").insert(metadata).execute()
+    response = get_supabase().table("pdfs").insert(metadata).execute()
     if not response.data or "id" not in response.data[0]:
         raise Exception(f"Supabase insert failed or id not returned: {response}")
     return str(response.data[0]["id"])
@@ -37,14 +45,14 @@ def insert_yts_record(metadata: Dict[str, Any]) -> str:
     Raises:
         Exception if insertion fails or id is not returned.
     """
-    response = supabase.table("yts").insert(metadata).execute()
+    response = get_supabase().table("yts").insert(metadata).execute()
     if not response.data or "id" not in response.data[0]:
         raise Exception(f"Supabase insert failed or id not returned: {response}")
     return str(response.data[0]["id"])
 
 # get id of generated_content by pdf_id or yt_id
 def get_generated_content_id(document_id: str) -> str:
-    response = supabase.table('generated_content').select('id').or_(f"pdf_id.eq.{document_id},yt_id.eq.{document_id}").execute()
+    response = get_supabase().table('generated_content').select('id').or_(f"pdf_id.eq.{document_id},yt_id.eq.{document_id}").execute()
     print('response', response)
     if not response.data or len(response.data) == 0:
         raise Exception(f"Supabase get failed or no content found for document: {document_id}")
@@ -56,7 +64,7 @@ def update_generated_content(document_id: str, content: Dict[str, Any]) -> None:
     # print('document_id', document_id)
     # print('content', content)
 
-    supabase.table('generated_content').update({
+    get_supabase().table('generated_content').update({
         'flashcards': content['flashcards'],
         'updated_at': datetime.now().isoformat()
     }).or_(f"pdf_id.eq.{document_id},yt_id.eq.{document_id}").execute()
@@ -67,7 +75,7 @@ def update_generated_content_quiz(document_id: str, content: Dict[str, Any]) -> 
     # print('document_id', document_id)
     # print('content', content)
 
-    supabase.table('generated_content').update({
+    get_supabase().table('generated_content').update({
         'quiz': content['quiz'],
         'updated_at': datetime.now().isoformat()
     }).or_(f"pdf_id.eq.{document_id},yt_id.eq.{document_id}").execute()
@@ -100,7 +108,7 @@ def insert_flashcard_set(
         Exception if operation fails or id is not returned
     """
     # First check if a record with this content_id and set_number already exists
-    check_response = supabase.table("flashcard_sets").select("id").eq("content_id", content_id).eq("set_number", set_number).execute()
+    check_response = get_supabase().table("flashcard_sets").select("id").eq("content_id", content_id).eq("set_number", set_number).execute()
     
     if check_response.data and len(check_response.data) > 0:
         # Record exists, update it
@@ -117,7 +125,7 @@ def insert_flashcard_set(
         if is_shared is not None:
             update_data["is_shared"] = is_shared
         
-        response = supabase.table("flashcard_sets").update(update_data).eq("id", existing_id).execute()
+        response = get_supabase().table("flashcard_sets").update(update_data).eq("id", existing_id).execute()
         
         if not response.data or len(response.data) == 0:
             raise Exception(f"Flashcard set update failed: {response}")
@@ -138,7 +146,7 @@ def insert_flashcard_set(
         # Always set is_shared (don't use conditional)
         insert_data["is_shared"] = is_shared if is_shared is not None else False
         
-        response = supabase.table("flashcard_sets").insert(insert_data).execute()
+        response = get_supabase().table("flashcard_sets").insert(insert_data).execute()
         
         if not response.data or "id" not in response.data[0]:
             raise Exception(f"Flashcard set insertion failed: {response}")
@@ -158,7 +166,7 @@ def get_existing_flashcards(content_id: str) -> List[Dict[str, Any]]:
     """
     try:
         # First get the generated_content entry to retrieve existing flashcards
-        response = supabase.table("generated_content").select("flashcards").eq("id", content_id).execute()
+        response = get_supabase().table("generated_content").select("flashcards").eq("id", content_id).execute()
         if not response.data or len(response.data) == 0:
             return []
             
@@ -188,7 +196,7 @@ def get_visible_flashcard_sets(content_id: str, user_id: Optional[str] = None) -
     """
     try:
         # Query flashcard_sets table with content_id
-        response = supabase.table("flashcard_sets")\
+        response = get_supabase().table("flashcard_sets")\
             .select("set_number, flashcards, created_by, is_shared")\
             .eq("content_id", content_id)\
             .order("set_number")\
@@ -230,7 +238,7 @@ def get_existing_quizzes(content_id: str) -> List[Dict[str, Any]]:
     """
     try:
         # Query the quiz_sets table for all sets associated with this content_id
-        response = supabase.table("quiz_sets").select("quiz, set_number, title, description").eq("content_id", content_id).order("set_number").execute()
+        response = get_supabase().table("quiz_sets").select("quiz, set_number, title, description").eq("content_id", content_id).order("set_number").execute()
         
         if not response.data or len(response.data) == 0:
             return []
@@ -272,7 +280,7 @@ def get_visible_quiz_sets(content_id: str, user_id: Optional[str] = None) -> Lis
     """
     try:
         # Query quiz_sets table with content_id
-        response = supabase.table("quiz_sets")\
+        response = get_supabase().table("quiz_sets")\
             .select("quiz, set_number, title, description, created_by, is_shared")\
             .eq("content_id", content_id)\
             .order("set_number")\
@@ -338,7 +346,7 @@ def insert_quiz_set(
         Exception if operation fails or id is not returned
     """
     # First check if a record with this content_id and set_number already exists
-    check_response = supabase.table("quiz_sets").select("id").eq("content_id", content_id).eq("set_number", set_number).execute()
+    check_response = get_supabase().table("quiz_sets").select("id").eq("content_id", content_id).eq("set_number", set_number).execute()
     
     if check_response.data and len(check_response.data) > 0:
         # Record exists, update it
@@ -359,7 +367,7 @@ def insert_quiz_set(
         if is_shared is not None:
             update_data["is_shared"] = is_shared
             
-        response = supabase.table("quiz_sets").update(update_data).eq("id", existing_id).execute()
+        response = get_supabase().table("quiz_sets").update(update_data).eq("id", existing_id).execute()
         
         if not response.data or len(response.data) == 0:
             raise Exception(f"Quiz set update failed: {response}")
@@ -384,7 +392,7 @@ def insert_quiz_set(
         # Always set is_shared
         insert_data["is_shared"] = is_shared if is_shared is not None else False
             
-        response = supabase.table("quiz_sets").insert(insert_data).execute()
+        response = get_supabase().table("quiz_sets").insert(insert_data).execute()
         
         if not response.data or "id" not in response.data[0]:
             raise Exception(f"Quiz set insertion failed: {response}")
@@ -412,7 +420,7 @@ def determine_shared_status(user_id: str, content_id: str) -> bool:
             return False  # Safe default if no user provided
         
         # Get space_id from generated_content
-        content_response = supabase.table('generated_content')\
+        content_response = get_supabase().table('generated_content')\
             .select('space_id')\
             .eq('id', content_id)\
             .execute()
@@ -424,7 +432,7 @@ def determine_shared_status(user_id: str, content_id: str) -> bool:
         space_id = content_response.data[0]['space_id']
         
         # Get space owner info
-        space_response = supabase.table('spaces')\
+        space_response = get_supabase().table('spaces')\
             .select('user_id, created_by')\
             .eq('id', space_id)\
             .execute()
@@ -465,12 +473,12 @@ def check_document_type(document_id: str) -> Tuple[str, str]:
     """
     try:
         # Check if document exists in pdfs table
-        pdf_response = supabase.table("pdfs").select("id").eq("id", document_id).execute()
+        pdf_response = get_supabase().table("pdfs").select("id").eq("id", document_id).execute()
         if pdf_response.data and len(pdf_response.data) > 0:
             return ("pdf", document_id)
         
         # Check if document exists in yts table
-        yts_response = supabase.table("yts").select("id").eq("id", document_id).execute()
+        yts_response = get_supabase().table("yts").select("id").eq("id", document_id).execute()
         if yts_response.data and len(yts_response.data) > 0:
             return ("youtube", document_id)
         
@@ -517,7 +525,7 @@ def upsert_generated_content_notes(document_id: str, notes_markdown: str, space_
             }
         
         # Check if record already exists
-        check_response = supabase.table("generated_content").select("id").eq(lookup_column, document_id).execute()
+        check_response = get_supabase().table("generated_content").select("id").eq(lookup_column, document_id).execute()
         
         if check_response.data and len(check_response.data) > 0:
             # Record exists, update it
@@ -529,7 +537,7 @@ def upsert_generated_content_notes(document_id: str, notes_markdown: str, space_
                 "updated_at": datetime.now().isoformat()
             }
             
-            response = supabase.table("generated_content").update(update_data).eq("id", existing_id).execute()
+            response = get_supabase().table("generated_content").update(update_data).eq("id", existing_id).execute()
             
             if not response.data or len(response.data) == 0:
                 raise Exception(f"Failed to update generated_content record: {response}")
@@ -540,7 +548,7 @@ def upsert_generated_content_notes(document_id: str, notes_markdown: str, space_
             logging.info(f"Creating new generated_content record for document {document_id}")
             insert_data["created_at"] = datetime.now().isoformat()
             
-            response = supabase.table("generated_content").insert(insert_data).execute()
+            response = get_supabase().table("generated_content").insert(insert_data).execute()
             
             if not response.data or "id" not in response.data[0]:
                 raise Exception(f"Failed to insert generated_content record: {response}")
@@ -563,11 +571,11 @@ def get_documents_in_space(space_id: str) -> Dict[str, List[Dict[str, Any]]]:
     """
     try:
         # Get PDF documents in the space
-        pdf_response = supabase.table("pdfs").select("id, file_name, file_path, file_type").eq("space_id", space_id).execute()
+        pdf_response = get_supabase().table("pdfs").select("id, file_name, file_path, file_type").eq("space_id", space_id).execute()
         pdf_documents = pdf_response.data if pdf_response.data else []
         
         # Get YouTube videos in the space
-        yts_response = supabase.table("yts").select("id, file_name, yt_url, thumbnail").eq("space_id", space_id).execute()
+        yts_response = get_supabase().table("yts").select("id, file_name, yt_url, thumbnail").eq("space_id", space_id).execute()
         yts_documents = yts_response.data if yts_response.data else []
         
         logging.info(f"Found {len(pdf_documents)} PDFs and {len(yts_documents)} YouTube videos in space {space_id}")

@@ -3,7 +3,7 @@ import logging
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
 from cryptography.fernet import Fernet
-from clients.supabase_client import supabase
+from clients.supabase_client import get_supabase
 
 logging.basicConfig(level=logging.INFO)
 
@@ -25,7 +25,7 @@ class TokenStorage:
         except Exception as e:
             raise ValueError(f"Invalid encryption key format: {e}")
         
-        self.supabase = supabase
+        self.supabase = get_supabase()
     
     def encrypt_token(self, token: str) -> str:
         """Encrypt a token for secure storage."""
