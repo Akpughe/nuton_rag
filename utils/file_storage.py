@@ -1,6 +1,7 @@
 """
-JSON file storage utilities for Course Generation POC.
-Simple, robust file operations following KISS principle.
+Storage utilities for Course Generation.
+Supabase-backed storage for courses, chapters, profiles, and progress.
+Local JSON still used for generation logs.
 """
 
 import json
@@ -11,20 +12,28 @@ from datetime import datetime
 import logging
 import uuid
 
+from clients.supabase_client import (
+    get_learning_profile,
+    upsert_learning_profile,
+    upsert_course,
+    get_course_by_id,
+    list_courses_by_user,
+    upsert_chapter,
+    get_chapter_by_order,
+    get_chapters_by_course,
+    upsert_chapter_progress,
+    get_chapter_progress_for_course,
+    get_all_progress_for_user,
+    get_all_quiz_attempts_for_user,
+    insert_course_quiz_attempt,
+    get_course_quiz_attempts,
+)
+
 logger = logging.getLogger(__name__)
 
-# Base paths
+# Base paths (only used for generation logs now)
 BASE_DIR = Path("/Users/davak/Documents/nuton_rag")
-COURSES_DIR = BASE_DIR / "courses"
-LEARNING_PROFILES_FILE = BASE_DIR / "learning_profiles.json"
-COURSE_INDEX_FILE = COURSES_DIR / "index.json"
 GENERATION_LOGS_FILE = BASE_DIR / "course_generation_logs.json"
-
-
-def ensure_directories():
-    """Ensure all required directories exist"""
-    COURSES_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Ensured courses directory: {COURSES_DIR}")
 
 
 def generate_uuid() -> str:
@@ -76,207 +85,274 @@ def append_to_json_list(filepath: Path, item: Dict[str, Any]) -> bool:
 
 # Learning Profile Operations
 class LearningProfileStorage:
-    """Handle learning profile storage"""
-    
+    """Handle learning profile storage via Supabase"""
+
     @staticmethod
     def get_profile(user_id: str) -> Optional[Dict[str, Any]]:
-        """Get learning profile for user"""
-        data = read_json_file(LEARNING_PROFILES_FILE)
-        if not data or "profiles" not in data:
+        """Get learning profile for user from Supabase"""
+        try:
+            return get_learning_profile(user_id)
+        except Exception as e:
+            logger.error(f"Error getting learning profile for {user_id}: {e}")
             return None
-        
-        for profile in data["profiles"]:
-            if profile.get("user_id") == user_id:
-                return profile
-        return None
-    
+
     @staticmethod
     def save_profile(profile_data: Dict[str, Any]) -> bool:
-        """Save or update learning profile"""
-        data = read_json_file(LEARNING_PROFILES_FILE) or {"profiles": []}
-        
-        # Update existing or add new
-        updated = False
-        for i, existing in enumerate(data["profiles"]):
-            if existing.get("user_id") == profile_data["user_id"]:
-                data["profiles"][i] = profile_data
-                updated = True
-                break
-        
-        if not updated:
-            data["profiles"].append(profile_data)
-        
-        return write_json_file(LEARNING_PROFILES_FILE, data)
+        """Save or update learning profile in Supabase"""
+        try:
+            upsert_learning_profile(profile_data)
+            return True
+        except Exception as e:
+            logger.error(f"Error saving learning profile: {e}")
+            return False
 
 
 # Course Storage Operations
 class CourseStorage:
-    """Handle course file storage"""
-    
-    @staticmethod
-    def create_course_directory(course_id: str) -> Path:
-        """Create and return course directory path"""
-        course_dir = COURSES_DIR / f"course_{course_id}"
-        course_dir.mkdir(parents=True, exist_ok=True)
-        return course_dir
-    
+    """Handle course storage via Supabase"""
+
     @staticmethod
     def save_course(course_data: Dict[str, Any]) -> bool:
-        """Save course metadata"""
-        course_id = course_data["id"]
-        course_dir = CourseStorage.create_course_directory(course_id)
-        
-        # Save course.json
-        success = write_json_file(course_dir / "course.json", course_data)
-        
-        if success:
-            # Update index
-            CourseStorage._update_index(course_data)
-        
-        return success
-    
+        """Save or update course in Supabase via upsert"""
+        try:
+            upsert_course(course_data)
+            return True
+        except Exception as e:
+            logger.error(f"Error saving course: {e}")
+            return False
+
     @staticmethod
     def save_chapter(course_id: str, chapter_data: Dict[str, Any]) -> bool:
-        """Save individual chapter"""
-        course_dir = COURSES_DIR / f"course_{course_id}"
-        chapter_order = chapter_data["order"]
-        
-        return write_json_file(
-            course_dir / f"chapter_{chapter_order}.json", 
-            chapter_data
-        )
-    
+        """Save individual chapter to Supabase via upsert"""
+        try:
+            data = dict(chapter_data)  # shallow copy to avoid mutating caller's dict
+            data["course_id"] = course_id
+            upsert_chapter(data)
+            return True
+        except Exception as e:
+            logger.error(f"Error saving chapter: {e}")
+            return False
+
     @staticmethod
     def get_course(course_id: str) -> Optional[Dict[str, Any]]:
-        """Load full course with chapters"""
-        course_dir = COURSES_DIR / f"course_{course_id}"
-        course_file = course_dir / "course.json"
-        
-        course_data = read_json_file(course_file)
-        if not course_data:
+        """Load full course with chapters from Supabase"""
+        try:
+            course_data = get_course_by_id(course_id)
+            if not course_data:
+                return None
+            chapters = get_chapters_by_course(course_id)
+            course_data["chapters"] = chapters
+            return course_data
+        except Exception as e:
+            logger.error(f"Error getting course {course_id}: {e}")
             return None
-        
-        # Load chapters
-        chapters = []
-        for i in range(1, course_data.get("total_chapters", 0) + 1):
-            chapter_file = course_dir / f"chapter_{i}.json"
-            chapter = read_json_file(chapter_file)
-            if chapter:
-                chapters.append(chapter)
-        
-        course_data["chapters"] = chapters
-        return course_data
-    
+
     @staticmethod
     def get_chapter(course_id: str, chapter_order: int) -> Optional[Dict[str, Any]]:
-        """Load specific chapter"""
-        chapter_file = COURSES_DIR / f"course_{course_id}" / f"chapter_{chapter_order}.json"
-        return read_json_file(chapter_file)
-    
+        """Load specific chapter from Supabase"""
+        try:
+            return get_chapter_by_order(course_id, chapter_order)
+        except Exception as e:
+            logger.error(f"Error getting chapter {chapter_order} for course {course_id}: {e}")
+            return None
+
     @staticmethod
     def list_courses(user_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        """List all courses, optionally filtered by user"""
-        index = read_json_file(COURSE_INDEX_FILE)
-        if not index or "courses" not in index:
+        """List courses from Supabase, optionally filtered by user"""
+        try:
+            if not user_id:
+                return []
+            return list_courses_by_user(user_id)
+        except Exception as e:
+            logger.error(f"Error listing courses: {e}")
             return []
-        
-        courses = index["courses"]
-        if user_id:
-            courses = [c for c in courses if c.get("user_id") == user_id]
-        
-        return courses
-    
-    @staticmethod
-    def _update_index(course_data: Dict[str, Any]):
-        """Update course index"""
-        index = read_json_file(COURSE_INDEX_FILE) or {"courses": []}
-        
-        # Update or add entry
-        updated = False
-        for i, existing in enumerate(index["courses"]):
-            if existing.get("id") == course_data["id"]:
-                index["courses"][i] = {
-                    "id": course_data["id"],
-                    "user_id": course_data["user_id"],
-                    "title": course_data["title"],
-                    "topic": course_data["topic"],
-                    "status": course_data["status"],
-                    "total_chapters": course_data["total_chapters"],
-                    "created_at": course_data["created_at"]
-                }
-                updated = True
-                break
-        
-        if not updated:
-            index["courses"].append({
-                "id": course_data["id"],
-                "user_id": course_data["user_id"],
-                "title": course_data["title"],
-                "topic": course_data["topic"],
-                "status": course_data["status"],
-                "total_chapters": course_data["total_chapters"],
-                "created_at": course_data["created_at"]
-            })
-        
-        write_json_file(COURSE_INDEX_FILE, index)
 
 
 # Progress Storage Operations
 class ProgressStorage:
-    """Handle progress tracking"""
-    
-    @staticmethod
-    def get_progress_file(course_id: str) -> Path:
-        """Get path to progress file for course"""
-        return COURSES_DIR / f"course_{course_id}" / "progress.json"
-    
+    """Handle progress tracking via Supabase"""
+
     @staticmethod
     def load_progress(user_id: str, course_id: str) -> Optional[Dict[str, Any]]:
-        """Load progress for user and course"""
-        progress_file = ProgressStorage.get_progress_file(course_id)
-        data = read_json_file(progress_file)
-        
-        if not data or "user_progress" not in data:
+        """Load progress for user and course from Supabase.
+        Assembles normalized DB rows into the nested dict shape
+        expected by routes: {user_id, course_id, chapter_progress: [...], overall_progress: {...}}
+        """
+        try:
+            rows = get_chapter_progress_for_course(user_id, course_id)
+            if not rows:
+                return None
+
+            # Get course for total_chapters
+            course = get_course_by_id(course_id)
+            total_chapters = course.get("total_chapters", 0) if course else 0
+
+            chapter_progress = []
+            for row in rows:
+                chapter_id = row.get("chapter_id")
+                # Fetch quiz attempts for this chapter
+                quiz_attempts_raw = get_course_quiz_attempts(user_id, chapter_id)
+                quiz_attempts = [
+                    {
+                        "attempt_id": i + 1,
+                        "score": float(qa.get("score", 0)),
+                        "completed_at": qa.get("completed_at"),
+                    }
+                    for i, qa in enumerate(quiz_attempts_raw)
+                ]
+
+                chapter_progress.append({
+                    "chapter_id": chapter_id,
+                    "completed": row.get("completed", False),
+                    "completed_at": row.get("completed_at"),
+                    "quiz_attempts": quiz_attempts,
+                    "time_spent_minutes": row.get("time_spent_minutes", 0),
+                })
+
+            completed_count = sum(1 for cp in chapter_progress if cp["completed"])
+            percentage = round((completed_count / total_chapters) * 100) if total_chapters > 0 else 0
+
+            # Find earliest and latest timestamps
+            started_at = None
+            last_activity = None
+            for row in rows:
+                created = row.get("created_at")
+                updated = row.get("updated_at")
+                if created and (started_at is None or created < started_at):
+                    started_at = created
+                if updated and (last_activity is None or updated > last_activity):
+                    last_activity = updated
+
+            return {
+                "user_id": user_id,
+                "course_id": course_id,
+                "chapter_progress": chapter_progress,
+                "overall_progress": {
+                    "completed_chapters": completed_count,
+                    "total_chapters": total_chapters,
+                    "percentage": percentage,
+                    "started_at": started_at,
+                    "last_activity": last_activity,
+                }
+            }
+        except Exception as e:
+            logger.error(f"Error loading progress for {user_id}/{course_id}: {e}")
             return None
-        
-        for progress in data["user_progress"]:
-            if progress.get("user_id") == user_id:
-                return progress
-        
-        return None
-    
+
+    @staticmethod
+    def load_all_progress(user_id: str, courses: List[Dict[str, Any]]) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Load progress for ALL courses in 2 queries (instead of N+1+N*M).
+        Returns {course_id: progress_dict_or_None}.
+        """
+        try:
+            # 2 bulk queries instead of N*M individual ones
+            all_progress = get_all_progress_for_user(user_id)
+            all_quiz = get_all_quiz_attempts_for_user(user_id)
+
+            # Index quiz attempts by chapter_id
+            quiz_by_chapter: Dict[str, List[Dict]] = {}
+            for qa in all_quiz:
+                cid = qa.get("chapter_id")
+                quiz_by_chapter.setdefault(cid, []).append(qa)
+
+            # Group progress rows by course_id
+            progress_by_course: Dict[str, List[Dict]] = {}
+            for row in all_progress:
+                cid = row.get("course_id")
+                progress_by_course.setdefault(cid, []).append(row)
+
+            # Build per-course total_chapters lookup
+            total_chapters_map = {c["id"]: c.get("total_chapters", 0) for c in courses}
+
+            result: Dict[str, Optional[Dict[str, Any]]] = {}
+            for course in courses:
+                course_id = course["id"]
+                rows = progress_by_course.get(course_id, [])
+                if not rows:
+                    result[course_id] = None
+                    continue
+
+                total_chapters = total_chapters_map.get(course_id, 0)
+
+                chapter_progress = []
+                for row in rows:
+                    chapter_id = row.get("chapter_id")
+                    quiz_raw = quiz_by_chapter.get(chapter_id, [])
+                    quiz_attempts = [
+                        {
+                            "attempt_id": i + 1,
+                            "score": float(qa.get("score", 0)),
+                            "completed_at": qa.get("completed_at"),
+                        }
+                        for i, qa in enumerate(quiz_raw)
+                    ]
+                    chapter_progress.append({
+                        "chapter_id": chapter_id,
+                        "completed": row.get("completed", False),
+                        "completed_at": row.get("completed_at"),
+                        "quiz_attempts": quiz_attempts,
+                        "time_spent_minutes": row.get("time_spent_minutes", 0),
+                    })
+
+                completed_count = sum(1 for cp in chapter_progress if cp["completed"])
+                percentage = round((completed_count / total_chapters) * 100) if total_chapters > 0 else 0
+
+                started_at = None
+                last_activity = None
+                for row in rows:
+                    created = row.get("created_at")
+                    updated = row.get("updated_at")
+                    if created and (started_at is None or created < started_at):
+                        started_at = created
+                    if updated and (last_activity is None or updated > last_activity):
+                        last_activity = updated
+
+                result[course_id] = {
+                    "user_id": user_id,
+                    "course_id": course_id,
+                    "chapter_progress": chapter_progress,
+                    "overall_progress": {
+                        "completed_chapters": completed_count,
+                        "total_chapters": total_chapters,
+                        "percentage": percentage,
+                        "started_at": started_at,
+                        "last_activity": last_activity,
+                    }
+                }
+
+            return result
+        except Exception as e:
+            logger.error(f"Error loading all progress for {user_id}: {e}")
+            return {c["id"]: None for c in courses}
+
     @staticmethod
     def save_progress(progress_data: Dict[str, Any]) -> bool:
-        """Save progress update"""
-        course_id = progress_data["course_id"]
-        progress_file = ProgressStorage.get_progress_file(course_id)
-        
-        data = read_json_file(progress_file) or {"user_progress": []}
-        
-        # Update or add
-        updated = False
-        for i, existing in enumerate(data["user_progress"]):
-            if existing.get("user_id") == progress_data["user_id"]:
-                data["user_progress"][i] = progress_data
-                updated = True
-                break
-        
-        if not updated:
-            data["user_progress"].append(progress_data)
-        
-        return write_json_file(progress_file, data)
+        """Save progress update by decomposing into individual upsert calls."""
+        try:
+            user_id = progress_data["user_id"]
+            course_id = progress_data["course_id"]
+
+            for cp in progress_data.get("chapter_progress", []):
+                upsert_chapter_progress(
+                    user_id=user_id,
+                    course_id=course_id,
+                    chapter_id=cp["chapter_id"],
+                    completed=cp.get("completed", False),
+                    time_spent_minutes=cp.get("time_spent_minutes", 0),
+                    completed_at=cp.get("completed_at"),
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Error saving progress: {e}")
+            return False
 
 
-# Generation Logging
+# Generation Logging (stays local — no DB table)
 class GenerationLogger:
     """Log course generation for debugging and cost tracking"""
-    
+
     @staticmethod
     def log_generation(log_entry: Dict[str, Any]) -> bool:
         """Log a generation attempt"""
         log_entry["timestamp"] = datetime.utcnow().isoformat()
         return append_to_json_list(GENERATION_LOGS_FILE, log_entry)
-
-
-# Initialize on import
-ensure_directories()
