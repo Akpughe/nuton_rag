@@ -591,7 +591,7 @@ def _serialize_course_data(course_data: Dict[str, Any]) -> Dict[str, Any]:
     """Serialize course data for DB insert/update. Drops non-DB fields like chapters."""
     # Only keep columns that exist in the courses table
     db_fields = {
-        "id", "user_id", "space_id", "title", "description", "topic",
+        "id", "user_id", "space_id", "slug", "title", "description", "topic",
         "source_type", "source_files", "multi_file_organization",
         "total_chapters", "estimated_time", "status", "personalization_params",
         "outline", "model_used", "created_at", "completed_at"
@@ -663,11 +663,27 @@ def get_course_by_id(course_id: str) -> Optional[Dict[str, Any]]:
 def list_courses_by_user(user_id: str) -> List[Dict[str, Any]]:
     """List courses for a user, ordered by created_at desc."""
     response = get_supabase().table("courses") \
-        .select("id, user_id, title, topic, status, total_chapters, estimated_time, created_at") \
+        .select("id, user_id, slug, title, topic, status, total_chapters, estimated_time, created_at") \
         .eq("user_id", user_id) \
         .order("created_at", desc=True) \
         .execute()
     return response.data or []
+
+
+def get_course_by_slug(slug: str) -> Optional[Dict[str, Any]]:
+    """Get a course by its slug."""
+    response = get_supabase().table("courses") \
+        .select("*").eq("slug", slug).execute()
+    if response.data and len(response.data) > 0:
+        return response.data[0]
+    return None
+
+
+def is_slug_taken(slug: str) -> bool:
+    """Check if a slug already exists."""
+    response = get_supabase().table("courses") \
+        .select("id").eq("slug", slug).execute()
+    return bool(response.data and len(response.data) > 0)
 
 
 # --- Chapters ---

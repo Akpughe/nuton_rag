@@ -44,13 +44,14 @@ yt_service = WetroCloudYouTubeService()
 async def create_learning_profile(request: LearningProfileRequest):
     """
     Save or update user learning preferences.
-    
-    The 5 questions from PRD:
-    1. format_pref: reading/listening/testing
-    2. depth_pref: quick/detailed/conversational/academic  
-    3. role: student/professional/graduate_student
-    4. learning_goal: exams/career/curiosity/supplement
-    5. example_pref: real_world/technical/stories/analogies
+
+    The 6 personalization questions:
+    1. expertise: beginner/intermediate/advanced (default: beginner)
+    2. format_pref: reading/listening/testing/mixed
+    3. depth_pref: quick/detailed/conversational/academic
+    4. role: student/professional/graduate_student
+    5. learning_goal: exams/career/curiosity/supplement
+    6. example_pref: real_world/technical/stories/analogies
     """
     try:
         success = course_service.save_learning_profile(request.dict())
@@ -481,6 +482,32 @@ async def get_course(course_id: str):
     progress_storage = ProgressStorage()
     progress = progress_storage.load_progress(course["user_id"], course_id)
     
+    return {
+        "course": course,
+        "progress": progress
+    }
+
+
+@router.get("/courses/by-slug/{slug}")
+async def get_course_by_slug(slug: str):
+    """
+    Retrieve full course by its URL-friendly slug.
+    e.g. GET /api/v1/courses/by-slug/exploring-modern-ai
+    """
+    from clients.supabase_client import get_course_by_slug as db_get_course_by_slug, get_chapters_by_course
+
+    course = db_get_course_by_slug(slug)
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    # Attach chapters
+    chapters = get_chapters_by_course(course["id"])
+    course["chapters"] = chapters
+
+    # Get progress if available
+    progress_storage = ProgressStorage()
+    progress = progress_storage.load_progress(course["user_id"], course["id"])
+
     return {
         "course": course,
         "progress": progress

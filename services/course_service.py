@@ -15,7 +15,7 @@ from models.course_models import (
     PersonalizationParams, SourceFile, OrganizationType
 )
 from utils.file_storage import (
-    CourseStorage, LearningProfileStorage, GenerationLogger, generate_uuid
+    CourseStorage, LearningProfileStorage, GenerationLogger, generate_uuid, generate_slug
 )
 from utils.model_config import ModelConfig, estimate_course_cost, get_search_mode
 from prompts.course_prompts import (
@@ -500,9 +500,12 @@ Return ONLY a JSON object:
             example_pref=profile.example_pref
         )
 
+        slug = generate_slug(outline["title"])
+
         course_data = {
             "id": course_id,
             "user_id": user_id,
+            "slug": slug,
             "title": outline["title"],
             "description": outline["description"],
             "topic": topic,
@@ -525,6 +528,7 @@ Return ONLY a JSON object:
         yield {
             "type": "outline_ready",
             "course_id": course_id,
+            "slug": slug,
             "title": outline["title"],
             "total_chapters": len(outline["chapters"]),
             "estimated_time": outline["total_estimated_time"],
@@ -675,9 +679,12 @@ Return ONLY a JSON object:
             example_pref=profile.example_pref
         )
 
+        slug = generate_slug(outline["title"])
+
         course_data = {
             "id": course_id,
             "user_id": user_id,
+            "slug": slug,
             "title": outline["title"],
             "description": outline["description"],
             "topic": topic,
@@ -700,6 +707,7 @@ Return ONLY a JSON object:
         yield {
             "type": "outline_ready",
             "course_id": course_id,
+            "slug": slug,
             "title": outline["title"],
             "total_chapters": len(outline["chapters"]),
             "estimated_time": outline["total_estimated_time"],

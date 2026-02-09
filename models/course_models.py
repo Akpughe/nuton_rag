@@ -78,8 +78,9 @@ class ModelProvider(str, Enum):
 
 # Learning Profile Models
 class LearningProfile(BaseModel):
-    """User learning preferences - 5 questions from PRD"""
+    """User learning preferences - 5 questions from PRD + expertise level"""
     user_id: str
+    expertise: ExpertiseLevel = ExpertiseLevel.BEGINNER
     format_pref: FormatPreference
     depth_pref: DepthPreference
     role: UserRole
@@ -92,6 +93,7 @@ class LearningProfile(BaseModel):
 class LearningProfileRequest(BaseModel):
     """Request to create/update learning profile"""
     user_id: str
+    expertise: ExpertiseLevel = ExpertiseLevel.BEGINNER
     format_pref: FormatPreference
     depth_pref: DepthPreference
     role: UserRole
@@ -167,6 +169,7 @@ class SourceFile(BaseModel):
 
 class PersonalizationParams(BaseModel):
     """Stored preferences used for generation"""
+    expertise: ExpertiseLevel = ExpertiseLevel.BEGINNER
     format_pref: FormatPreference
     depth_pref: DepthPreference
     role: UserRole
@@ -178,6 +181,7 @@ class Course(BaseModel):
     """Full course model"""
     id: str
     user_id: str
+    slug: Optional[str] = None
     title: str
     description: str
     topic: str

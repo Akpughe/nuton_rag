@@ -48,8 +48,9 @@ nuton_rag/
 
 ### Course Access
 - `GET /api/v1/courses/{course_id}` - Full course with chapters
+- `GET /api/v1/courses/by-slug/{slug}` - Full course by URL-friendly slug
 - `GET /api/v1/courses/{course_id}/chapters/{chapter_order}` - Single chapter
-- `GET /api/v1/users/{user_id}/courses` - List user's courses
+- `GET /api/v1/users/{user_id}/courses` - List user's courses (includes slug)
 
 ### Course Q&A
 - `POST /api/v1/courses/{course_id}/ask` - Ask questions about course content
@@ -113,6 +114,9 @@ curl -X POST http://localhost:8000/api/v1/courses/from-files \
 ### 4. Get Course
 ```bash
 curl http://localhost:8000/api/v1/courses/{course_id}
+
+# Or by slug (URL-friendly identifier auto-generated from title)
+curl http://localhost:8000/api/v1/courses/by-slug/understanding-quantum-computing
 ```
 
 ### 5. Update Progress

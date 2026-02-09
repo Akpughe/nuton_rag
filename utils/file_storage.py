@@ -17,7 +17,9 @@ from clients.supabase_client import (
     upsert_learning_profile,
     upsert_course,
     get_course_by_id,
+    get_course_by_slug,
     list_courses_by_user,
+    is_slug_taken,
     upsert_chapter,
     get_chapter_by_order,
     get_chapters_by_course,
@@ -39,6 +41,32 @@ GENERATION_LOGS_FILE = BASE_DIR / "course_generation_logs.json"
 def generate_uuid() -> str:
     """Generate unique ID for courses/chapters"""
     return str(uuid.uuid4())
+
+
+def generate_slug(title: str) -> str:
+    """
+    Generate a URL-friendly slug from a course title.
+    e.g. "Exploring Modern AI & Machine Learning" -> "exploring-modern-ai-machine-learning"
+    Ensures uniqueness by appending -2, -3, etc. if slug is taken.
+    """
+    import re
+    # Lowercase and replace non-alphanumeric with hyphens
+    slug = title.lower().strip()
+    slug = re.sub(r'[^a-z0-9]+', '-', slug)
+    # Remove leading/trailing hyphens
+    slug = slug.strip('-')
+    # Truncate to 80 chars at a word boundary
+    if len(slug) > 80:
+        slug = slug[:80].rsplit('-', 1)[0]
+
+    # Ensure uniqueness
+    base_slug = slug
+    counter = 2
+    while is_slug_taken(slug):
+        slug = f"{base_slug}-{counter}"
+        counter += 1
+
+    return slug
 
 
 def read_json_file(filepath: Path) -> Optional[Dict[str, Any]]:
