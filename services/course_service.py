@@ -575,8 +575,8 @@ Return ONLY a JSON object:
             for batch_start in range(0, len(all_chapters_indexed), BATCH_SIZE):
                 batch = all_chapters_indexed[batch_start:batch_start + BATCH_SIZE]
                 batch_tasks = [generate_single_chapter(i, ch) for i, ch in batch]
-                batch_results = await asyncio.gather(*batch_tasks)
-                for chapter in batch_results:
+                for future in asyncio.as_completed(batch_tasks):
+                    chapter = await future
                     yield {
                         "type": "chapter_ready",
                         "course_id": course_id,
@@ -754,8 +754,8 @@ Return ONLY a JSON object:
             for batch_start in range(0, len(all_chapters_indexed), BATCH_SIZE):
                 batch = all_chapters_indexed[batch_start:batch_start + BATCH_SIZE]
                 batch_tasks = [generate_single_chapter(i, ch) for i, ch in batch]
-                batch_results = await asyncio.gather(*batch_tasks)
-                for chapter in batch_results:
+                for future in asyncio.as_completed(batch_tasks):
+                    chapter = await future
                     yield {
                         "type": "chapter_ready",
                         "course_id": course_id,
