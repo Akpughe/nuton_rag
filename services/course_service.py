@@ -492,6 +492,7 @@ Return ONLY a JSON object:
         # Create course record
         course_id = course_id or generate_uuid()
         personalization = PersonalizationParams(
+            expertise=profile.expertise,
             format_pref=profile.format_pref,
             depth_pref=profile.depth_pref,
             role=profile.role,
@@ -666,6 +667,7 @@ Return ONLY a JSON object:
 
         # Use pre-generated course_id (shared with Pinecone upsert)
         personalization = PersonalizationParams(
+            expertise=profile.expertise,
             format_pref=profile.format_pref,
             depth_pref=profile.depth_pref,
             role=profile.role,
@@ -802,7 +804,7 @@ Return ONLY a JSON object:
 
         prompt = build_outline_generation_prompt(
             topic=topic,
-            expertise=profile.expertise if hasattr(profile, 'expertise') else 'beginner',
+            expertise=profile.expertise.value,
             time_available=dynamic_time or 60,
             format_pref=profile.format_pref.value,
             depth_pref=profile.depth_pref.value,
@@ -848,7 +850,7 @@ Return ONLY a JSON object:
             total_chapters=total_chapters,
             chapter_title=chapter_outline["title"],
             objectives=chapter_outline["objectives"],
-            expertise=profile.expertise if hasattr(profile, 'expertise') else 'beginner',
+            expertise=profile.expertise.value,
             format_pref=profile.format_pref.value,
             depth_pref=profile.depth_pref.value,
             role=profile.role.value,
@@ -923,7 +925,7 @@ Return ONLY a JSON object:
             messages = [{"role": "user", "content": prompt}]
             
             # Add web search if supported
-            tools = [{"type": "web_search"}] if model_config.get("supports_search") else None
+            tools = [{"type": "web_search_20250305", "name": "web_search"}] if model_config.get("supports_search") else None
             
             response = client.messages.create(
                 model=model_config["model"],
@@ -1130,6 +1132,7 @@ Return ONLY a JSON object:
         # Create default profile from context or use defaults
         default_profile = LearningProfile(
             user_id=user_id,
+            expertise=context.get("expertise", "beginner"),
             format_pref=context.get("format_pref", "reading"),
             depth_pref=context.get("depth_pref", "detailed"),
             role=context.get("role", "student"),
