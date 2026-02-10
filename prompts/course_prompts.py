@@ -247,52 +247,76 @@ MULTI-FILE ORGANIZATION:
     if suggested_chapter_count:
         chapter_instruction = f"Generate EXACTLY {suggested_chapter_count} chapters that progressively build knowledge"
     else:
-        chapter_instruction = "Generate 3-5 chapters that progressively build knowledge"
+        chapter_instruction = "Generate 3-7 chapters that progressively build knowledge"
 
-    return f"""You are an expert curriculum designer and educator. Create a structured, pedagogically sound course outline.
+    bloom_instruction = _build_bloom_taxonomy_instruction(expertise)
 
-USER CONTEXT:
+    # Goal-aware framing
+    goal_framing = {
+        "exams": f"This student is preparing for exams on {topic}. The outline should prioritize testable concepts, build from foundational to complex, and ensure every chapter covers material likely to be assessed.",
+        "career": f"This learner wants to apply {topic} professionally. The outline should balance essential theory with practical application, building toward real-world competence.",
+        "curiosity": f"This learner is exploring {topic} out of genuine interest. The outline should tell a compelling intellectual story — each chapter should answer a question that naturally leads to the next.",
+        "supplement": f"This student is supplementing classroom learning on {topic}. The outline should mirror a typical course structure but focus on the concepts students most commonly struggle with."
+    }.get(learning_goal, f"Create a well-structured course on {topic} that builds understanding progressively.")
+
+    return f"""You are a world-class curriculum designer who creates courses that students describe as "the best explanation I've ever found." Your courses are not generic — they are thoughtfully structured for the specific learner.
+
+LEARNER PROFILE:
 - Topic: {topic}
-- Expertise Level: {expertise} (beginner/intermediate/advanced)
-- Time Available: {time_available} minutes
-- Learning Format Preference: {format_pref}
-- Explanation Depth: {depth_pref}
-- User Role: {role}
+- Expertise Level: {expertise}
+- Role: {role}
 - Learning Goal: {learning_goal}
-- Example Preference: {example_pref}
+- Time Budget: {time_available} minutes
+- Depth Preference: {depth_pref}
+- Example Style: {example_pref}
+
+COURSE FRAMING:
+{goal_framing}
 {file_section}
 {org_section}
-REQUIREMENTS:
+CURRICULUM DESIGN REQUIREMENTS:
+
 1. {chapter_instruction}
-2. Structure: Foundation → Core Concepts → Applications → Synthesis
-3. Each chapter must have:
-   - Clear, descriptive title
-   - 2-4 specific learning objectives (measurable, action-oriented)
-   - 2-3 key concepts covered
-   - Estimated time (minutes)
-   - Prerequisites (if any)
-4. Total time should approximate {time_available} minutes
-5. Chapter progression must be logical (prerequisites first)
-6. Make titles engaging but descriptive
+
+2. CHAPTER SEQUENCING — Choose the structure that fits the topic's nature:
+   - For CONCEPTUAL topics (physics, philosophy, math): Build prerequisite chains. Each chapter's core concept must be necessary for understanding the next.
+   - For PROCEDURAL topics (programming, cooking, lab techniques): Follow the workflow. Chapters should mirror the order someone would actually do things.
+   - For HISTORICAL/NARRATIVE topics (history, biography, evolution of ideas): Follow chronological or thematic arcs that tell a story.
+   - For SURVEY topics (introduction to a broad field): Group by sub-domain, but start with the unifying principles that connect everything.
+
+3. CHAPTER DESIGN:
+   - Title: Must hint at the "aha moment" — what the student will understand after this chapter (not just the topic label). Bad: "Neural Networks." Good: "How Machines Learn to See Patterns."
+   - {bloom_instruction}
+   - Key Concepts: 2-4 concepts per chapter. These should be specific and concrete (not vague like "understanding basics").
+   - Prerequisites: Be explicit. If Chapter 3 requires concepts from Chapter 1, say so.
+   - Time estimates must sum to approximately {time_available} minutes.
+
+4. COURSE-LEVEL LEARNING OBJECTIVES:
+   - Write 3-4 objectives that describe what the student CAN DO after completing the full course.
+   - These should be specific and measurable, not vague ("understand the basics" is too weak).
+   - At least one objective should involve applying knowledge to a new situation.
+
+5. COURSE DESCRIPTION:
+   - 2-3 sentences. First sentence: what the student will learn. Second sentence: why it matters to THEM specifically (given their role and goal). Third sentence (optional): what makes this course different from a textbook.
 
 OUTPUT FORMAT (JSON - no markdown formatting):
 {{
-  "title": "Engaging course title (5-8 words)",
-  "description": "2-3 sentence overview of what student will learn and why it matters",
+  "title": "Engaging course title that promises a transformation (5-10 words)",
+  "description": "2-3 sentences: what you'll learn, why it matters to you, what's unique about this course",
   "learning_objectives": [
-    "By the end of this course, students will be able to...",
-    "Specific measurable outcome 2",
-    "Specific measurable outcome 3"
+    "After this course, you will be able to [specific measurable outcome]",
+    "You will be able to [apply/analyze/create something specific]",
+    "You will understand [specific concept] well enough to [concrete action]"
   ],
   "chapters": [
     {{
       "order": 1,
-      "title": "Chapter Title (descriptive, engaging)",
+      "title": "Chapter Title That Promises an Insight",
       "objectives": [
-        "After this chapter, students can...",
-        "Specific measurable objective"
+        "After this chapter, you can [specific verb] [specific thing]",
+        "You will be able to [another specific outcome]"
       ],
-      "key_concepts": ["Concept 1", "Concept 2", "Concept 3"],
+      "key_concepts": ["Specific Concept 1", "Specific Concept 2", "Specific Concept 3"],
       "estimated_time": 15,
       "prerequisites": []
     }}
@@ -352,97 +376,146 @@ def build_chapter_content_prompt(
     web_sources: Optional[List[Dict]] = None
 ) -> str:
     """Build prompt for chapter content generation"""
-    
-    prev_section = f"""
-- Previous Chapter: {prev_chapter_title}""" if prev_chapter_title else ""
-    
-    next_section = f"""
-- Next Chapter: {next_chapter_title}""" if next_chapter_title else ""
-    
+
+    prev_section = f"\n- Previous Chapter: \"{prev_chapter_title}\"" if prev_chapter_title else ""
+    next_section = f"\n- Next Chapter: \"{next_chapter_title}\"" if next_chapter_title else ""
+
     source_section = f"""
-SOURCE MATERIAL (from uploaded document - YOU MUST teach from this):
+SOURCE MATERIAL (from uploaded document — base your teaching on this):
 {source_material_context}
 
-CRITICAL INSTRUCTIONS FOR SOURCE MATERIAL:
+SOURCE MATERIAL RULES:
 - Base your chapter content PRIMARILY on the source material above
-- Do NOT invent facts or examples that aren't supported by the source material
+- Do NOT invent facts not supported by the source material
 - Use the source material's terminology and structure
 - If the source material is thin on a subtopic, note it briefly and move on
 - Inline citations [1], [2] should reference the [Source Section N] labels above
 """ if source_material_context else ""
 
-    objectives_formatted = "\n".join([f"- {obj}" for obj in objectives])
-    
-    depth_instructions = {
-        "quick": "Be concise, use bullet points, get to the point quickly. Focus on essentials only.",
-        "detailed": "Provide comprehensive, thorough explanations. Include nuances and edge cases.",
-        "conversational": "Write in a friendly, engaging, accessible tone. Use 'you' and 'we'. Make it feel like a conversation.",
-        "academic": "Use formal, rigorous, precise language. Include technical terminology. Maintain scholarly tone."
-    }.get(depth_pref, "Provide clear, comprehensive explanations.")
+    objectives_formatted = "\n".join([f"  {i+1}. {obj}" for i, obj in enumerate(objectives)])
 
-    return f"""You are an expert educator creating high-quality educational content.
+    personalization = _build_personalization_strategy(
+        expertise=expertise,
+        role=role,
+        learning_goal=learning_goal,
+        depth_pref=depth_pref,
+        example_pref=example_pref,
+        format_pref=format_pref
+    )
+
+    # Chapter position awareness
+    if total_chapters == 1:
+        position_guidance = (
+            "CHAPTER POSITION: This is a STANDALONE single-chapter course.\n"
+            "- Open with a compelling hook that makes the reader care about the topic\n"
+            "- Cover the essential concepts thoroughly since this is the only chapter\n"
+            "- End with synthesis, practical next steps, and resources for deeper learning"
+        )
+    elif chapter_num == 1:
+        position_guidance = (
+            "CHAPTER POSITION: This is the OPENING chapter.\n"
+            "- Start with a compelling hook that makes the reader care about the entire course topic\n"
+            "- Establish the 'big question' or 'big problem' that the course will answer\n"
+            "- Build foundational vocabulary and mental models needed for later chapters\n"
+            "- End by creating anticipation for what comes next"
+        )
+    elif chapter_num == total_chapters:
+        position_guidance = (
+            "CHAPTER POSITION: This is the FINAL chapter.\n"
+            "- Synthesize ideas from across the entire course into a cohesive understanding\n"
+            "- Show how individual concepts connect into a bigger picture\n"
+            "- End with: what to learn next, open questions, or how to apply this knowledge\n"
+            "- Give the reader a sense of accomplishment and direction"
+        )
+    else:
+        prev_ref = f' ("{prev_chapter_title}")' if prev_chapter_title else ""
+        next_ref = f' ("{next_chapter_title}")' if next_chapter_title else ""
+        position_guidance = (
+            f"CHAPTER POSITION: Chapter {chapter_num} of {total_chapters} (middle of course).\n"
+            f"- Bridge from previous chapter{prev_ref} — open with a 1-2 sentence connection\n"
+            "- Build on established concepts while introducing new ones\n"
+            f"- Set up what comes next{next_ref} with a forward-looking closing"
+        )
+
+    return f"""You are creating a chapter that a student will describe as "this finally made it click." You don't just explain topics — you teach. You anticipate confusion, build understanding step by step, and make complex ideas feel approachable.
 
 COURSE CONTEXT:
-- Course: {course_title}
-- Chapter {chapter_num} of {total_chapters}: {chapter_title}{prev_section}{next_section}
+- Course: "{course_title}"
+- Chapter {chapter_num} of {total_chapters}: "{chapter_title}"{prev_section}{next_section}
 
-USER PERSONALIZATION:
-- Expertise Level: {expertise}
-- Learning Format: {format_pref}
-- Depth Preference: {depth_pref}
-- Role: {role}
-- Learning Goal: {learning_goal}
-- Example Preference: {example_pref}
+{position_guidance}
 
 LEARNING OBJECTIVES FOR THIS CHAPTER:
 {objectives_formatted}
+Every section of your chapter must directly serve at least one of these objectives. If a section doesn't serve an objective, cut it.
 {source_section}
-CONTENT REQUIREMENTS:
-1. Length: 800-1200 words (aim for depth over brevity)
-2. Format: Markdown with clear hierarchy (# for title, ## for sections, ### for subsections)
-3. Structure:
-   - **Hook/Why This Matters** (2-3 sentences explaining relevance)
-   - **Core Content** with {example_pref} examples integrated throughout
-   - **Practical Applications** or real-world implications
-   - **Key Takeaways** section with 4-6 bullet points summarizing main points
-4. Tone: {depth_instructions}
-5. Include inline citations [1], [2], [3] for:
-   - Factual claims and statistics
-   - Research findings
-   - Historical events or dates
-   - Technical specifications
+PERSONALIZATION INSTRUCTIONS:
+{personalization}
+
+CHAPTER STRUCTURE (follow this arc):
+
+1. **HOOK** (2-3 sentences)
+   - Open with a concrete scenario, question, or surprising fact that makes the reader think "I need to know this"
+   - Connect to the reader's world based on their role ({role}) and goal ({learning_goal})
+
+2. **CORE TEACHING** (the main body — this is where learning happens)
+   - Introduce ONE concept at a time. Fully explain it before moving to the next.
+   - For each concept:
+     a) State what it is in one clear sentence
+     b) Explain WHY it works that way or WHY it matters
+     c) Give a concrete example that makes it tangible
+     d) Address the most common misconception or confusion point ("A common mistake is thinking X, but actually...")
+   - Use transitions that show how concepts connect: "Now that you understand X, you can see why Y works the way it does"
+
+3. **PRACTICAL APPLICATION** (show it in action)
+   - One extended example, case study, or worked problem that uses MULTIPLE concepts from this chapter together
+   - Walk through it step by step — don't just show the answer, show the thinking process
+
+4. **KEY TAKEAWAYS** (4-6 bullets)
+   - Each bullet should be a complete, standalone insight (not "Chapter covered X")
+   - Format: "[Concept]: [What to remember about it]"
+   - A student should be able to read ONLY the takeaways and recall the full chapter
+
+CONTENT QUALITY RULES:
+- Length: 1000-1500 words. Depth over breadth — better to explain 3 concepts well than 6 concepts poorly.
+- Format: Markdown with clear hierarchy (# for title, ## for sections, ### for subsections)
+- Include inline citations [1], [2], [3] for factual claims, statistics, and research findings
+- NEVER pad with filler phrases like "In today's rapidly evolving world" or "It's important to note that"
+- Every paragraph must teach something. If a paragraph just restates what was already said, delete it.
 
 QUIZ REQUIREMENTS:
-Generate 3-5 questions that test UNDERSTANDING, not memorization:
-- Mix of multiple choice (4 options) and true/false
-- Questions should require applying knowledge, not just recalling facts
-- Include explanations for correct AND incorrect answers
-- Make distractors (wrong answers) plausible
+Generate 3-5 questions that test the learning objectives above. Design them like this:
+
+- **At least 1 APPLICATION question**: Give a scenario the student hasn't seen and ask them to apply a concept from this chapter. ("A company wants to X. Based on what you learned about Y, what should they do?")
+- **At least 1 MISCONCEPTION question**: The wrong answers should represent common misunderstandings. The explanation should teach WHY each wrong answer is wrong.
+- **At least 1 CONNECTION question**: Test whether the student can relate concepts within this chapter or to previous chapters.
+- Mix of multiple choice (4 options) and true/false.
+- Write explanations for EVERY option (correct and incorrect), not just the right answer.
 
 {_build_search_section(search_mode, web_sources)}
 
 OUTPUT FORMAT (JSON - no markdown):
 {{
   "content": "Full markdown content with inline citations [1], [2]...",
-  "word_count": 1050,
+  "word_count": 1200,
   "key_concepts_explained": ["Concept 1", "Concept 2"],
   "quiz": {{
     "questions": [
       {{
         "id": "q1",
         "type": "multiple_choice",
-        "question": "Clear question text that tests understanding?",
+        "question": "Scenario-based question that tests application?",
         "options": ["Option A", "Option B", "Option C", "Option D"],
         "correct_answer": 1,
-        "explanation": "Detailed explanation: Why B is correct and why A, C, and D are incorrect"
+        "explanation": "B is correct because [reason]. A is wrong because [common misconception]. C is wrong because [different error]. D is wrong because [plausible but incorrect reasoning]."
       }},
       {{
-        "id": "q2", 
+        "id": "q2",
         "type": "true_false",
-        "question": "Statement to evaluate?",
+        "question": "Statement that tests a common misconception?",
         "options": ["True", "False"],
         "correct_answer": 0,
-        "explanation": "Explanation of why this is true/false"
+        "explanation": "True. This is correct because [explanation]. Many learners incorrectly think [misconception] because [why it's tempting]."
       }}
     ]
   }},
@@ -453,7 +526,7 @@ OUTPUT FORMAT (JSON - no markdown):
       "url": "https://...",
       "date": "2025-01-15",
       "source_type": "academic|news|documentation|book",
-      "relevance": "Brief note on what this source verifies in the content"
+      "relevance": "Supports the claim that [specific claim from content]"
     }}
   ]
 }}
