@@ -235,7 +235,13 @@ class CourseService:
                 topic=combined_topic,
                 profile=profile,
                 model_config=model_config,
-                source_files=[{"file_id": generate_uuid(), "filename": f["filename"], "extracted_topic": f["topic"]} for f in files],
+                source_files=[{
+                    "file_id": generate_uuid(),
+                    "filename": f["filename"],
+                    "extracted_topic": f["topic"],
+                    "source_url": f.get("source_url"),
+                    "source_type": f.get("source_type", "pdf"),
+                } for f in files],
                 doc_map=doc_map,
                 doc_map_context=doc_map_context,
                 all_chunks=all_chunks,
@@ -315,7 +321,13 @@ class CourseService:
             doc_map_context += f"- {t['topic']}: {t.get('description', '')} [{len(t.get('chunk_indices', []))} sections]\n"
 
         source_files = [
-            {"file_id": generate_uuid(), "filename": f["filename"], "extracted_topic": f.get("topic", "")}
+            {
+                "file_id": generate_uuid(),
+                "filename": f["filename"],
+                "extracted_topic": f.get("topic", ""),
+                "source_url": f.get("source_url"),
+                "source_type": f.get("source_type", "pdf"),
+            }
             for f in files
         ]
 
@@ -1571,7 +1583,13 @@ Return ONLY a JSON object:
         for topic in doc_map.get("topics", []):
             doc_map_context += f"- {topic['topic']}: {topic.get('description', '')} [{len(topic.get('chunk_indices', []))} sections]\n"
 
-        source_files = [{"file_id": generate_uuid(), "filename": file_data["filename"], "extracted_topic": file_data["topic"]}]
+        source_files = [{
+            "file_id": generate_uuid(),
+            "filename": file_data["filename"],
+            "extracted_topic": file_data["topic"],
+            "source_url": file_data.get("source_url"),
+            "source_type": file_data.get("source_type", "pdf"),
+        }]
 
         async for event in self._generate_full_course_from_files_stream(
             user_id=user_id,
@@ -1677,7 +1695,7 @@ Return ONLY a JSON object:
                 doc_map_context += f"- {t['topic']}: {t.get('description', '')} [{len(t.get('chunk_indices', []))} sections]\n"
 
             source_files = [
-                {"file_id": generate_uuid(), "filename": f["filename"], "extracted_topic": f.get("topic", "")}
+                {"file_id": generate_uuid(), "filename": f["filename"], "extracted_topic": f.get("topic", ""), "source_url": f.get("source_url"), "source_type": f.get("source_type", "pdf")}
                 for f in files
             ]
 
@@ -1797,7 +1815,7 @@ Return ONLY a JSON object:
                 topic=combined_topic,
                 profile=profile,
                 model_config=model_config,
-                source_files=[{"file_id": generate_uuid(), "filename": f["filename"], "extracted_topic": f["topic"]} for f in files],
+                source_files=[{"file_id": generate_uuid(), "filename": f["filename"], "extracted_topic": f["topic"], "source_url": f.get("source_url"), "source_type": f.get("source_type", "pdf")} for f in files],
                 doc_map=doc_map,
                 doc_map_context=doc_map_context,
                 all_chunks=all_chunks,
@@ -1979,16 +1997,268 @@ Return ONLY a JSON object:
         if unmatched:
             logger.info(f"{len(unmatched)} flashcards could not be matched to chapters (kept in course-level only)")
 
+    async def generate_final_exam(
+        self,
+        course_id: str,
+        user_id: str,
+        exam_size: int = 30,
+        model: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Generate an on-demand final exam with MCQ + fill-in-gap + theory questions."""
+        import asyncio
+
+        model_config = ModelConfig.get_config(model)
+        course = self.storage.get_course(course_id)
+        if not course:
+            raise ValueError(f"Course not found: {course_id}")
+
+        chapters = course.get("chapters", [])
+        if not chapters:
+            raise ValueError(f"Course {course_id} has no chapters")
+
+        chapters_summary = self._build_chapters_summary(chapters)
+
+        # Determine question counts
+        if exam_size == 50:
+            mcq_count, fill_count, theory_count = 25, 15, 10
+        else:
+            mcq_count, fill_count, theory_count = 15, 8, 7
+
+        # Generate all 3 question types in parallel
+        mcq_task = self._call_model(
+            build_final_exam_prompt("mcq", course["title"], chapters_summary, mcq_count, len(chapters)),
+            model_config, expect_json=True
+        )
+        fill_task = self._call_model(
+            build_final_exam_prompt("fill_in_gap", course["title"], chapters_summary, fill_count, len(chapters)),
+            model_config, expect_json=True
+        )
+        theory_task = self._call_model(
+            build_final_exam_prompt("theory", course["title"], chapters_summary, theory_count, len(chapters)),
+            model_config, expect_json=True
+        )
+
+        results = await asyncio.gather(mcq_task, fill_task, theory_task, return_exceptions=True)
+
+        # Check for failures
+        for r in results:
+            if isinstance(r, Exception):
+                raise CourseGenerationError(f"Exam question generation failed: {r}")
+
+        mcq_result, fill_result, theory_result = results
+
+        exam_data = {
+            "mcq": mcq_result.get("mcq", []),
+            "fill_in_gap": fill_result.get("fill_in_gap", []),
+            "theory": theory_result.get("theory", []),
+        }
+        exam_data["total_questions"] = len(exam_data["mcq"]) + len(exam_data["fill_in_gap"]) + len(exam_data["theory"])
+
+        # Save to DB
+        exam_id = self.exam_storage.save_exam(course_id, user_id, exam_size, exam_data)
+        exam_data["id"] = exam_id
+        exam_data["course_id"] = course_id
+        exam_data["exam_size"] = exam_size
+
+        logger.info(f"Final exam generated for course {course_id}: {exam_data['total_questions']} questions")
+        return exam_data
+
+    async def grade_exam_submission(
+        self,
+        exam_id: str,
+        user_id: str,
+        answers: Dict[str, Any],
+        model: Optional[str] = None,
+        time_taken_seconds: Optional[int] = None
+    ) -> Dict[str, Any]:
+        """Grade a submitted exam with MCQ, fill-in-gap, and theory answers."""
+        import asyncio
+
+        # Fetch exam
+        exam = self.exam_storage.get_exam_by_id(exam_id)
+        if not exam:
+            raise ValueError(f"Exam not found: {exam_id}")
+
+        model_config = ModelConfig.get_config(model)
+
+        mcq_questions = exam.get("mcq", [])
+        fill_questions = exam.get("fill_in_gap", [])
+        theory_questions = exam.get("theory", [])
+
+        mcq_answers = answers.get("mcq", [])
+        fill_answers = answers.get("fill_in_gap", [])
+        theory_answers = answers.get("theory", [])
+
+        # --- Grade MCQ (instant) ---
+        mcq_results = []
+        mcq_correct = 0
+        for i, q in enumerate(mcq_questions):
+            selected = mcq_answers[i] if i < len(mcq_answers) else None
+            correct = q.get("correct_answer")
+            is_correct = selected == correct
+            if is_correct:
+                mcq_correct += 1
+            mcq_results.append({
+                "question_index": i,
+                "selected": selected,
+                "correct": correct,
+                "is_correct": is_correct,
+                "explanation": q.get("explanation", "")
+            })
+
+        mcq_score = (mcq_correct / len(mcq_questions) * 100) if mcq_questions else None
+
+        # --- Grade Fill-in-gap (instant) ---
+        fill_results = []
+        fill_correct = 0
+        for i, q in enumerate(fill_questions):
+            raw_answer = fill_answers[i] if i < len(fill_answers) else ""
+            student_answer = str(raw_answer).strip() if raw_answer is not None else ""
+            correct_answer = q.get("correct_answer", "")
+            alternatives = q.get("alternatives", [])
+
+            student_lower = student_answer.lower().strip()
+            correct_lower = correct_answer.lower().strip()
+
+            if student_lower == correct_lower:
+                match_type = "exact"
+                is_correct = True
+            elif any(student_lower == alt.lower().strip() for alt in alternatives):
+                match_type = "alternative"
+                is_correct = True
+            else:
+                match_type = "no_match"
+                is_correct = False
+
+            if is_correct:
+                fill_correct += 1
+
+            fill_results.append({
+                "question_index": i,
+                "answer": student_answer,
+                "correct_answer": correct_answer,
+                "is_correct": is_correct,
+                "match_type": match_type
+            })
+
+        fill_score = (fill_correct / len(fill_questions) * 100) if fill_questions else None
+
+        # --- Grade Theory (parallel LLM calls) ---
+        theory_results = []
+        theory_score = None
+
+        if theory_questions:
+            async def grade_single_theory(i, q):
+                raw_answer = theory_answers[i] if i < len(theory_answers) else ""
+                student_answer = str(raw_answer) if raw_answer is not None else ""
+                if not student_answer.strip():
+                    rubric = q.get("rubric", [])
+                    return {
+                        "question_index": i,
+                        "rubric_breakdown": [
+                            {"point": p, "status": "missed", "feedback": "No answer provided"}
+                            for p in rubric
+                        ],
+                        "score": 0,
+                        "max_score": 10,
+                        "feedback": "No answer was provided."
+                    }
+
+                prompt = build_theory_grading_prompt(
+                    question=q.get("question", ""),
+                    student_answer=student_answer,
+                    model_answer=q.get("model_answer", ""),
+                    rubric=q.get("rubric", [])
+                )
+
+                result = await self._call_model(prompt, model_config, expect_json=True)
+                result["question_index"] = i
+                return result
+
+            tasks = [grade_single_theory(i, q) for i, q in enumerate(theory_questions)]
+            graded = await asyncio.gather(*tasks, return_exceptions=True)
+
+            total_theory_score = 0
+            total_theory_max = 0
+            for i, result in enumerate(graded):
+                if isinstance(result, Exception):
+                    logger.error(f"Theory grading failed for question {i}: {result}")
+                    rubric = theory_questions[i].get("rubric", [])
+                    result = {
+                        "question_index": i,
+                        "rubric_breakdown": [
+                            {"point": p, "status": "missed", "feedback": "Grading error"}
+                            for p in rubric
+                        ],
+                        "score": 0,
+                        "max_score": 10,
+                        "feedback": "An error occurred during grading."
+                    }
+                theory_results.append(result)
+                total_theory_score += result.get("score", 0)
+                total_theory_max += result.get("max_score", 10)
+
+            theory_score = (total_theory_score / total_theory_max * 100) if total_theory_max > 0 else 0
+
+        # --- Overall score (weighted) ---
+        weights = {"mcq": 0.40, "fill_in_gap": 0.25, "theory": 0.35}
+        weighted_sum = 0
+        weight_total = 0
+
+        if mcq_score is not None:
+            weighted_sum += mcq_score * weights["mcq"]
+            weight_total += weights["mcq"]
+        if fill_score is not None:
+            weighted_sum += fill_score * weights["fill_in_gap"]
+            weight_total += weights["fill_in_gap"]
+        if theory_score is not None:
+            weighted_sum += theory_score * weights["theory"]
+            weight_total += weights["theory"]
+
+        overall_score = round(weighted_sum / weight_total, 2) if weight_total > 0 else 0
+
+        results = {
+            "mcq": mcq_results,
+            "fill_in_gap": fill_results,
+            "theory": theory_results
+        }
+
+        # Save attempt
+        attempt_id = self.exam_attempt_storage.save_attempt(
+            exam_id=exam_id,
+            user_id=user_id,
+            answers=answers,
+            results=results,
+            score=overall_score,
+            mcq_score=round(mcq_score, 2) if mcq_score is not None else None,
+            fill_in_gap_score=round(fill_score, 2) if fill_score is not None else None,
+            theory_score=round(theory_score, 2) if theory_score is not None else None,
+            time_taken_seconds=time_taken_seconds
+        )
+
+        logger.info(f"Exam {exam_id} graded for user {user_id}: {overall_score}%")
+
+        return {
+            "attempt_id": attempt_id,
+            "score": overall_score,
+            "mcq_score": round(mcq_score, 2) if mcq_score is not None else None,
+            "fill_in_gap_score": round(fill_score, 2) if fill_score is not None else None,
+            "theory_score": round(theory_score, 2) if theory_score is not None else None,
+            "results": results
+        }
+
     async def query_course(
         self,
         course_id: str,
         question: str,
         model: Optional[str] = None,
-        top_k: int = 5
+        top_k: int = 5,
+        user_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Answer a question about a course using its source material from Pinecone.
         Searches course chunks, reranks, and generates a grounded answer.
+        Supports persistent chat history when user_id is provided.
         """
         from clients.chonkie_client import embed_query_multimodal
         from clients.pinecone_client import hybrid_search, rerank_results
@@ -1999,6 +2269,23 @@ Return ONLY a JSON object:
         course = self.get_course(course_id)
         if not course:
             raise ValueError(f"Course not found: {course_id}")
+
+        # Fetch chat history if user_id provided
+        chat_history = []
+        if user_id:
+            try:
+                from clients.redis_client import get_chat_history, push_messages
+                cached = await get_chat_history(course_id, user_id)
+                if cached:
+                    chat_history = cached
+                else:
+                    db_messages = self.chat_storage.get_messages(course_id, user_id, limit=20)
+                    if db_messages:
+                        chat_history = [{"role": m["role"], "content": m["content"]} for m in db_messages]
+                        # Warm Redis cache
+                        await push_messages(course_id, user_id, chat_history)
+            except Exception as e:
+                logger.warning(f"Chat history fetch failed (non-fatal): {e}")
 
         # Embed the question
         query_result = embed_query_multimodal(question)
@@ -2028,36 +2315,44 @@ Return ONLY a JSON object:
             source = result.get("metadata", {}).get("source_file", "")
             context_parts.append(f"[Source {i+1}] ({source})\n{text}")
 
-        context = "\n\n---\n\n".join(context_parts)
+        rag_context = "\n\n---\n\n".join(context_parts)
 
-        # Generate answer
-        prompt = f"""You are a helpful course assistant. Answer the student's question based ONLY on the source material provided.
-
-COURSE: {course.get('title', '')}
-
-SOURCE MATERIAL:
-{context}
-
-STUDENT QUESTION: {question}
-
-Instructions:
-- Answer based ONLY on the source material above
-- If the source material doesn't contain the answer, say so clearly
-- Reference specific sources using [Source N] citations
-- Keep the answer concise and educational"""
+        # Build prompt with chat history
+        prompt = build_course_chat_prompt(
+            course_title=course.get("title", ""),
+            rag_context=rag_context,
+            chat_history=chat_history[-10:],  # Last 10 messages
+            question=question
+        )
 
         response = await self._call_model(prompt, model_config, expect_json=False)
+        answer = response.get("content", "")
+
+        source_excerpts = [
+            {
+                "text": r.get("metadata", {}).get("text", "")[:200],
+                "file": r.get("metadata", {}).get("source_file", "")
+            }
+            for r in reranked
+        ]
+
+        # Save chat messages to DB and Redis if user_id provided
+        if user_id:
+            try:
+                self.chat_storage.save_message(course_id, user_id, "user", question)
+                self.chat_storage.save_message(course_id, user_id, "assistant", answer, sources=source_excerpts)
+                from clients.redis_client import push_messages
+                await push_messages(course_id, user_id, [
+                    {"role": "user", "content": question},
+                    {"role": "assistant", "content": answer}
+                ])
+            except Exception as e:
+                logger.warning(f"Chat history save failed (non-fatal): {e}")
 
         return {
             "course_id": course_id,
             "question": question,
-            "answer": response.get("content", ""),
+            "answer": answer,
             "sources_used": len(reranked),
-            "source_excerpts": [
-                {
-                    "text": r.get("metadata", {}).get("text", "")[:200],
-                    "file": r.get("metadata", {}).get("source_file", "")
-                }
-                for r in reranked
-            ]
+            "source_excerpts": source_excerpts
         }
