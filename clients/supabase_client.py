@@ -594,7 +594,8 @@ def _serialize_course_data(course_data: Dict[str, Any]) -> Dict[str, Any]:
         "id", "user_id", "space_id", "slug", "title", "description", "topic",
         "source_type", "source_files", "multi_file_organization",
         "total_chapters", "estimated_time", "status", "personalization_params",
-        "outline", "model_used", "created_at", "completed_at"
+        "outline", "model_used", "created_at", "completed_at",
+        "study_guide", "flashcards"
     }
     filtered = {k: v for k, v in course_data.items() if k in db_fields}
     return _serialize_for_supabase(filtered)
@@ -610,7 +611,7 @@ def _serialize_chapter_data(chapter_data: Dict[str, Any]) -> Dict[str, Any]:
     db_fields = {
         "id", "course_id", "order_index", "title", "learning_objectives",
         "content", "content_format", "estimated_time", "key_concepts",
-        "sources", "quiz", "word_count", "source_document_id",
+        "sources", "quiz", "flashcards", "word_count", "source_document_id",
         "source_document_type", "status", "generated_at"
     }
     return {k: v for k, v in serialized.items() if k in db_fields}
