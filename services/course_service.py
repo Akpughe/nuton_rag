@@ -15,14 +15,21 @@ from models.course_models import (
     PersonalizationParams, SourceFile, OrganizationType
 )
 from utils.file_storage import (
-    CourseStorage, LearningProfileStorage, GenerationLogger, generate_uuid, generate_slug
+    CourseStorage, LearningProfileStorage, GenerationLogger,
+    StudyGuideStorage, FlashcardStorage, ExamStorage, ExamAttemptStorage, ChatStorage,
+    generate_uuid, generate_slug
 )
 from utils.model_config import ModelConfig, estimate_course_cost, get_search_mode
 from prompts.course_prompts import (
     build_outline_generation_prompt,
     build_chapter_content_prompt,
     build_topic_extraction_prompt,
-    build_multi_file_analysis_prompt
+    build_multi_file_analysis_prompt,
+    build_study_guide_prompt,
+    build_course_flashcards_prompt,
+    build_final_exam_prompt,
+    build_theory_grading_prompt,
+    build_course_chat_prompt
 )
 
 # Import existing clients
@@ -56,6 +63,11 @@ class CourseService:
         self.storage = CourseStorage()
         self.profile_storage = LearningProfileStorage()
         self.logger = GenerationLogger()
+        self.study_guide_storage = StudyGuideStorage()
+        self.flashcard_storage = FlashcardStorage()
+        self.exam_storage = ExamStorage()
+        self.exam_attempt_storage = ExamAttemptStorage()
+        self.chat_storage = ChatStorage()
     
     async def create_course_from_topic(
         self,
@@ -601,6 +613,25 @@ Return ONLY a JSON object:
             }
             return
 
+        # Generate study guide + flashcards in parallel (after all chapters)
+        try:
+            chapters_for_extras = self.storage.get_course(course_id).get("chapters", [])
+            sg_task = self._generate_study_guide(course_id, chapters_for_extras, profile, model_config, topic)
+            fc_task = self._generate_course_flashcards(course_id, chapters_for_extras, profile, model_config)
+            sg_result, fc_result = await asyncio.gather(sg_task, fc_task, return_exceptions=True)
+
+            if not isinstance(sg_result, Exception) and sg_result:
+                yield {"type": "study_guide_ready", "course_id": course_id}
+            else:
+                logger.warning(f"Study guide generation failed: {sg_result}")
+
+            if not isinstance(fc_result, Exception) and fc_result:
+                yield {"type": "flashcards_ready", "course_id": course_id}
+            else:
+                logger.warning(f"Flashcard generation failed: {fc_result}")
+        except Exception as e:
+            logger.warning(f"Study guide / flashcard generation error (non-fatal): {e}")
+
         # Update course status
         course_data["status"] = CourseStatus.READY
         course_data["completed_at"] = datetime.utcnow()
@@ -783,6 +814,25 @@ Return ONLY a JSON object:
                 "phase": "chapter_generation"
             }
             return
+
+        # Generate study guide + flashcards in parallel (after all chapters)
+        try:
+            chapters_for_extras = self.storage.get_course(course_id).get("chapters", [])
+            sg_task = self._generate_study_guide(course_id, chapters_for_extras, profile, model_config, topic)
+            fc_task = self._generate_course_flashcards(course_id, chapters_for_extras, profile, model_config)
+            sg_result, fc_result = await asyncio.gather(sg_task, fc_task, return_exceptions=True)
+
+            if not isinstance(sg_result, Exception) and sg_result:
+                yield {"type": "study_guide_ready", "course_id": course_id}
+            else:
+                logger.warning(f"Study guide generation failed: {sg_result}")
+
+            if not isinstance(fc_result, Exception) and fc_result:
+                yield {"type": "flashcards_ready", "course_id": course_id}
+            else:
+                logger.warning(f"Flashcard generation failed: {fc_result}")
+        except Exception as e:
+            logger.warning(f"Study guide / flashcard generation error (non-fatal): {e}")
 
         # Update course status
         course_data["status"] = CourseStatus.READY
@@ -1799,6 +1849,135 @@ Return ONLY a JSON object:
         """Save learning profile"""
         profile = LearningProfile(**profile_data)
         return self.profile_storage.save_profile(profile.dict())
+
+    def _build_chapters_summary(self, chapters: List[Dict[str, Any]]) -> str:
+        """Build a text summary of all chapters for use in study guide / flashcard / exam prompts."""
+        parts = []
+        for ch in chapters:
+            title = ch.get("title", "Untitled")
+            order = ch.get("order", ch.get("order_index", "?"))
+            objectives = ch.get("learning_objectives", [])
+            key_concepts = ch.get("key_concepts", [])
+            content = ch.get("content", "")
+            # Use first 500 chars of content as summary
+            content_preview = content[:500] if content else ""
+
+            part = f"""Chapter {order}: {title}
+  Objectives: {', '.join(objectives)}
+  Key Concepts: {', '.join(key_concepts)}
+  Content Preview: {content_preview}"""
+            parts.append(part)
+        return "\n\n".join(parts)
+
+    async def _generate_study_guide(
+        self,
+        course_id: str,
+        chapters: List[Dict[str, Any]],
+        profile: 'LearningProfile',
+        model_config: Dict[str, Any],
+        topic: str
+    ) -> bool:
+        """Generate a comprehensive study guide from all chapters and save to DB."""
+        course = self.storage.get_course(course_id)
+        if not course:
+            return False
+
+        chapters_summary = self._build_chapters_summary(chapters)
+        prompt = build_study_guide_prompt(
+            course_title=course.get("title", ""),
+            topic=topic,
+            chapters_summary=chapters_summary,
+            expertise=profile.expertise.value,
+            role=profile.role.value,
+            learning_goal=profile.learning_goal.value
+        )
+
+        result = await self._call_model(prompt, model_config, expect_json=True)
+        if result:
+            self.study_guide_storage.save_study_guide(course_id, result)
+            logger.info(f"Study guide generated for course {course_id}")
+            return True
+        return False
+
+    async def _generate_course_flashcards(
+        self,
+        course_id: str,
+        chapters: List[Dict[str, Any]],
+        profile: 'LearningProfile',
+        model_config: Dict[str, Any]
+    ) -> bool:
+        """Generate course-wide flashcards, save to DB, and distribute to individual chapters."""
+        course = self.storage.get_course(course_id)
+        if not course:
+            return False
+
+        chapters_summary = self._build_chapters_summary(chapters)
+        prompt = build_course_flashcards_prompt(
+            course_title=course.get("title", ""),
+            chapters_summary=chapters_summary,
+            total_chapters=len(chapters)
+        )
+
+        result = await self._call_model(prompt, model_config, expect_json=True)
+        flashcards = result.get("flashcards", []) if result else []
+        if flashcards:
+            # Save course-level flashcards
+            self.flashcard_storage.save_flashcards(course_id, flashcards)
+            logger.info(f"Generated {len(flashcards)} flashcards for course {course_id}")
+
+            # Distribute flashcards to individual chapters by matching chapter_ref to title
+            self._distribute_flashcards_to_chapters(course_id, chapters, flashcards)
+            return True
+        return False
+
+    def _distribute_flashcards_to_chapters(
+        self,
+        course_id: str,
+        chapters: List[Dict[str, Any]],
+        flashcards: List[Dict[str, Any]]
+    ):
+        """Distribute course-level flashcards to individual chapters based on chapter_ref."""
+        from clients.supabase_client import get_supabase
+
+        # Build lookup: normalized chapter title -> chapter record
+        chapter_lookup = {}
+        for ch in chapters:
+            title = ch.get("title", "")
+            chapter_lookup[title.lower().strip()] = ch
+
+        # Group flashcards by chapter_ref
+        chapter_flashcards: Dict[str, List[Dict[str, Any]]] = {}
+        unmatched = []
+        for fc in flashcards:
+            ref = (fc.get("chapter_ref") or "").lower().strip()
+            matched = False
+            # Try exact match first
+            if ref in chapter_lookup:
+                ch_id = chapter_lookup[ref]["id"]
+                chapter_flashcards.setdefault(ch_id, []).append(fc)
+                matched = True
+            else:
+                # Fuzzy match: check if ref is a substring of any chapter title or vice versa
+                for title_lower, ch in chapter_lookup.items():
+                    if ref and (ref in title_lower or title_lower in ref):
+                        ch_id = ch["id"]
+                        chapter_flashcards.setdefault(ch_id, []).append(fc)
+                        matched = True
+                        break
+            if not matched:
+                unmatched.append(fc)
+
+        # Save per-chapter flashcards
+        for ch_id, ch_fcs in chapter_flashcards.items():
+            try:
+                get_supabase().table("chapters").update(
+                    {"flashcards": ch_fcs}
+                ).eq("id", ch_id).execute()
+            except Exception as e:
+                logger.warning(f"Failed to save flashcards for chapter {ch_id}: {e}")
+
+        if unmatched:
+            logger.info(f"{len(unmatched)} flashcards could not be matched to chapters (kept in course-level only)")
 
     async def query_course(
         self,
