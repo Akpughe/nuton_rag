@@ -165,6 +165,8 @@ class SourceFile(BaseModel):
     file_id: str
     filename: str
     extracted_topic: str
+    source_url: Optional[str] = None
+    source_type: Optional[str] = None  # "pdf", "youtube", "web"
 
 
 class PersonalizationParams(BaseModel):
