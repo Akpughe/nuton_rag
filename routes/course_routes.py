@@ -6,6 +6,7 @@ Clean, well-documented endpoints following REST conventions.
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
+import asyncio
 import json
 import logging
 import re
@@ -140,17 +141,20 @@ async def create_course_from_topic(
         if has_files and len(files) > 10:
             raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
 
-        # Build merged source list
-        all_processed = []
-
+        # Build merged source list (process all source types concurrently)
+        tasks = []
         if has_files:
-            all_processed.extend(await _process_uploaded_files(files, model=model))
-
+            tasks.append(_process_uploaded_files(files, model=model))
         if yt_urls:
-            all_processed.extend(await _process_youtube_urls(yt_urls, model=model))
-
+            tasks.append(_process_youtube_urls(yt_urls, model=model))
         if w_urls:
-            all_processed.extend(await _process_web_urls(w_urls, model=model))
+            tasks.append(_process_web_urls(w_urls, model=model))
+
+        all_processed = []
+        if tasks:
+            results = await asyncio.gather(*tasks)
+            for result in results:
+                all_processed.extend(result)
 
         # Route to appropriate service method
         if all_processed:
@@ -238,17 +242,20 @@ async def create_course_from_files(
                 detail="At least 1 source required (file, YouTube URL, or web URL)"
             )
 
-        # Build merged source list
-        all_processed = []
-
+        # Build merged source list (process all source types concurrently)
+        tasks = []
         if has_files:
-            all_processed.extend(await _process_uploaded_files(files, model=model))
-
+            tasks.append(_process_uploaded_files(files, model=model))
         if yt_urls:
-            all_processed.extend(await _process_youtube_urls(yt_urls, model=model))
-
+            tasks.append(_process_youtube_urls(yt_urls, model=model))
         if w_urls:
-            all_processed.extend(await _process_web_urls(w_urls, model=model))
+            tasks.append(_process_web_urls(w_urls, model=model))
+
+        all_processed = []
+        if tasks:
+            results = await asyncio.gather(*tasks)
+            for result in results:
+                all_processed.extend(result)
 
         if not all_processed:
             raise HTTPException(
@@ -341,12 +348,19 @@ async def create_course_from_topic_stream(
                     "source_count": source_count
                 })
 
+            # Process all source types concurrently
+            tasks = []
             if has_files:
-                all_processed.extend(await _process_uploaded_files(files, model=model))
+                tasks.append(_process_uploaded_files(files, model=model))
             if yt_urls:
-                all_processed.extend(await _process_youtube_urls(yt_urls, model=model))
+                tasks.append(_process_youtube_urls(yt_urls, model=model))
             if w_urls:
-                all_processed.extend(await _process_web_urls(w_urls, model=model))
+                tasks.append(_process_web_urls(w_urls, model=model))
+
+            if tasks:
+                results = await asyncio.gather(*tasks)
+                for result in results:
+                    all_processed.extend(result)
 
             # Route to streaming service method
             if all_processed:
@@ -427,12 +441,19 @@ async def create_course_from_files_stream(
                 "source_count": source_count
             })
 
+            # Process all source types concurrently
+            tasks = []
             if has_files:
-                all_processed.extend(await _process_uploaded_files(files, model=model))
+                tasks.append(_process_uploaded_files(files, model=model))
             if yt_urls:
-                all_processed.extend(await _process_youtube_urls(yt_urls, model=model))
+                tasks.append(_process_youtube_urls(yt_urls, model=model))
             if w_urls:
-                all_processed.extend(await _process_web_urls(w_urls, model=model))
+                tasks.append(_process_web_urls(w_urls, model=model))
+
+            if tasks:
+                results = await asyncio.gather(*tasks)
+                for result in results:
+                    all_processed.extend(result)
 
             if not all_processed:
                 yield _sse_event({
@@ -660,8 +681,10 @@ MAX_FILE_SIZE_MB = 50
 
 
 async def _process_uploaded_files(files: List[UploadFile], model: Optional[str] = None) -> List[dict]:
-    """Process uploaded files with OCR and topic extraction"""
-    processed = []
+    """Process uploaded files with OCR and topic extraction (parallel).
+    Also fires off S3 uploads in the background so source files are persisted."""
+    from clients.s3_client import build_s3_key, get_s3_url, fire_and_forget_upload, get_content_type
+    from utils.file_storage import generate_uuid as gen_uuid
 
     # Initialize Mistral OCR
     mistral_config = MistralOCRConfig(
@@ -670,72 +693,69 @@ async def _process_uploaded_files(files: List[UploadFile], model: Optional[str] 
         include_images=False
     )
     extractor = MistralOCRExtractor(config=mistral_config)
+    semaphore = asyncio.Semaphore(3)
 
+    # Validate all files first (instant, sequential)
+    file_data = []
     for file in files:
-        # Validate file extension
         ext = os.path.splitext(file.filename)[1].lower() if file.filename else ""
         if ext not in ALLOWED_EXTENSIONS:
             raise ValueError(f"Unsupported file type: {ext}. Allowed: {ALLOWED_EXTENSIONS}")
 
-        # Validate file size
         content = await file.read()
-        await file.seek(0)  # Reset for later read
+        await file.seek(0)
 
         size_mb = len(content) / (1024 * 1024)
         if size_mb > MAX_FILE_SIZE_MB:
             raise ValueError(f"File {file.filename} is {size_mb:.1f}MB. Max: {MAX_FILE_SIZE_MB}MB")
 
-        # Handle plaintext files directly (no OCR needed)
-        plaintext_extensions = {".txt", ".md"}
-        if ext in plaintext_extensions:
-            text = content.decode("utf-8", errors="replace")
+        file_data.append((file, ext, content))
 
-            if not text.strip():
-                raise ValueError(f"No text extracted from {file.filename}")
+    async def _process_single_file(file, ext, content):
+        async with semaphore:
+            # Fire off S3 upload in the background (non-blocking)
+            file_id = gen_uuid()
+            s3_key = build_s3_key(file_id, file.filename)
+            s3_url = get_s3_url(s3_key)
+            content_type = get_content_type(file.filename)
+            fire_and_forget_upload(s3_key, content, content_type)
 
-            topic = await _extract_topic(text[:2000], model=model)
+            plaintext_extensions = {".txt", ".md"}
+            if ext in plaintext_extensions:
+                text = content.decode("utf-8", errors="replace")
+                if not text.strip():
+                    raise ValueError(f"No text extracted from {file.filename}")
+                topic = await _extract_topic(text[:2000], model=model)
+                logger.info(f"Processed {file.filename}: {topic} ({len(text)} chars, plaintext)")
+                return {
+                    "filename": file.filename, "topic": topic,
+                    "extracted_text": text, "pages": 1, "char_count": len(text),
+                    "source_url": s3_url, "source_type": "pdf",
+                }
 
-            processed.append({
-                "filename": file.filename,
-                "topic": topic,
-                "extracted_text": text,
-                "pages": 1,
-                "char_count": len(text)
-            })
+            # OCR-based extraction — run sync OCR in thread
+            temp_path = _save_temp_file(file)
+            try:
+                extraction = await asyncio.to_thread(extractor.process_document, temp_path)
+                text = extraction.get('full_text', '')
+                if not text:
+                    raise ValueError(f"No text extracted from {file.filename}")
+                topic = await _extract_topic(text[:2000], model=model)
+                logger.info(f"Processed {file.filename}: {topic} ({len(text)} chars, {extraction.get('total_pages', 0)} pages)")
+                return {
+                    "filename": file.filename, "topic": topic,
+                    "extracted_text": text,
+                    "pages": extraction.get('total_pages', 0), "char_count": len(text),
+                    "source_url": s3_url, "source_type": "pdf",
+                }
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
 
-            logger.info(f"Processed {file.filename}: {topic} ({len(text)} chars, plaintext)")
-            continue
-
-        # Save temp file for OCR-based extraction
-        temp_path = _save_temp_file(file)
-
-        try:
-            # Extract text via OCR
-            extraction = extractor.process_document(temp_path)
-            text = extraction.get('full_text', '')
-
-            if not text:
-                raise ValueError(f"No text extracted from {file.filename}")
-
-            # Extract topic using Claude
-            topic = await _extract_topic(text[:2000], model=model)
-
-            processed.append({
-                "filename": file.filename,
-                "topic": topic,
-                "extracted_text": text,  # FULL text - no truncation
-                "pages": extraction.get('total_pages', 0),
-                "char_count": len(text)
-            })
-
-            logger.info(f"Processed {file.filename}: {topic} ({len(text)} chars, {extraction.get('total_pages', 0)} pages)")
-
-        finally:
-            # Cleanup
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
-
-    return processed
+    results = await asyncio.gather(*[
+        _process_single_file(f, ext, content) for f, ext, content in file_data
+    ])
+    return list(results)
 
 
 def _parse_url_list(urls_json: Optional[str]) -> List[str]:
@@ -752,100 +772,83 @@ def _parse_url_list(urls_json: Optional[str]) -> List[str]:
 
 
 async def _process_youtube_urls(urls: List[str], model: Optional[str] = None) -> List[dict]:
-    """Process YouTube URLs by extracting transcripts and packaging as source dicts.
+    """Process YouTube URLs by extracting transcripts (parallel)."""
+    semaphore = asyncio.Semaphore(4)
 
-    Follows the same pattern as process_youtube() in pipeline.py:
-    uses WetroCloudYouTubeService with extract_video_id + get_transcript + get_video_title.
-    """
-    processed = []
+    async def _process_single_youtube(url):
+        async with semaphore:
+            try:
+                video_id = yt_service.extract_video_id(url)
+                if not video_id:
+                    logger.warning(f"Invalid YouTube URL, could not extract video ID: {url}")
+                    return None
 
-    for url in urls:
-        try:
-            # Extract video ID first (validates the URL)
-            video_id = yt_service.extract_video_id(url)
-            if not video_id:
-                logger.warning(f"Invalid YouTube URL, could not extract video ID: {url}")
-                continue
+                result = await asyncio.to_thread(yt_service.get_transcript, url)
+                if not result.get("success"):
+                    logger.warning(f"YouTube transcript failed for {url}: {result.get('message', 'Unknown error')}")
+                    return None
 
-            # Get transcript (WetroCloud -> Vcyon -> yt-dlp fallback chain)
-            result = yt_service.get_transcript(url)
-            if not result.get("success"):
-                logger.warning(f"YouTube transcript failed for {url}: {result.get('message', 'Unknown error')}")
-                continue
+                text = result.get("text", "")
+                if len(text) < 50:
+                    logger.warning(f"YouTube transcript too short for {url}: {len(text)} chars")
+                    return None
 
-            text = result.get("text", "")
-            if len(text) < 50:
-                logger.warning(f"YouTube transcript too short for {url}: {len(text)} chars")
-                continue
+                if "video_title" in result and result["video_title"]:
+                    video_title = result["video_title"]
+                else:
+                    video_title = await asyncio.to_thread(yt_service.get_video_title, url)
 
-            # Get video title — matches pipeline.py pattern
-            if "video_title" in result and result["video_title"]:
-                video_title = result["video_title"]
-            else:
-                video_title = yt_service.get_video_title(url)
+                if not video_title or video_title.startswith("YouTube Video:") or len(video_title) < 5:
+                    video_title = await _extract_topic(text[:2000], model=model)
 
-            # Fall back to LLM topic extraction if title is still missing or generic
-            if not video_title or video_title.startswith("YouTube Video:") or len(video_title) < 5:
-                video_title = await _extract_topic(text[:2000], model=model)
+                logger.info(f"Processed YouTube {video_id}: {video_title} ({len(text)} chars, method={result.get('method', 'unknown')})")
+                return {
+                    "filename": f"youtube_{video_id}.txt",
+                    "topic": video_title, "extracted_text": text,
+                    "pages": 1, "char_count": len(text),
+                    "source_url": url, "source_type": "youtube",
+                }
+            except Exception as e:
+                logger.warning(f"YouTube processing error for {url}: {e}")
+                return None
 
-            processed.append({
-                "filename": f"youtube_{video_id}.txt",
-                "topic": video_title,
-                "extracted_text": text,
-                "pages": 1,
-                "char_count": len(text),
-                "source_url": url,
-                "source_type": "youtube",
-            })
-
-            logger.info(f"Processed YouTube {video_id}: {video_title} ({len(text)} chars, method={result.get('method', 'unknown')})")
-
-        except Exception as e:
-            logger.warning(f"YouTube processing error for {url}: {e}")
-            continue
-
-    return processed
+    results = await asyncio.gather(*[_process_single_youtube(url) for url in urls])
+    return [r for r in results if r is not None]
 
 
 async def _process_web_urls(urls: List[str], model: Optional[str] = None) -> List[dict]:
-    """Process web URLs by extracting content via Jina Reader and packaging as source dicts."""
-    processed = []
+    """Process web URLs by extracting content via Jina Reader (parallel)."""
+    semaphore = asyncio.Semaphore(4)
 
-    for url in urls:
-        try:
-            result = extract_web_content(url)
-            if not result.get("success"):
-                logger.warning(f"Web extraction failed for {url}: {result.get('message', 'Unknown error')}")
-                continue
+    async def _process_single_web_url(url):
+        async with semaphore:
+            try:
+                result = await asyncio.to_thread(extract_web_content, url)
+                if not result.get("success"):
+                    logger.warning(f"Web extraction failed for {url}: {result.get('message', 'Unknown error')}")
+                    return None
 
-            text = result.get("text", "")
-            if len(text) < 50:
-                logger.warning(f"Web content too short for {url}: {len(text)} chars")
-                continue
+                text = result.get("text", "")
+                if len(text) < 50:
+                    logger.warning(f"Web content too short for {url}: {len(text)} chars")
+                    return None
 
-            # Extract topic from content via LLM
-            topic = await _extract_topic(text[:2000], model=model)
+                topic = await _extract_topic(text[:2000], model=model)
+                safe_domain = re.sub(r"[^a-zA-Z0-9]", "_", url.split("//")[-1].split("/")[0])
 
-            # Build safe filename from domain
-            safe_domain = re.sub(r"[^a-zA-Z0-9]", "_", url.split("//")[-1].split("/")[0])
+                logger.info(f"Processed web URL {url}: {topic} ({len(text)} chars)")
+                return {
+                    "filename": f"web_{safe_domain}.txt",
+                    "topic": topic, "extracted_text": text,
+                    "pages": 1, "char_count": len(text),
+                    "source_url": url, "source_type": "web",
+                }
+            except Exception as e:
+                logger.warning(f"Web URL processing error for {url}: {e}")
+                return None
 
-            processed.append({
-                "filename": f"web_{safe_domain}.txt",
-                "topic": topic,
-                "extracted_text": text,
-                "pages": 1,
-                "char_count": len(text),
-                "source_url": url,
-                "source_type": "web",
-            })
-
-            logger.info(f"Processed web URL {url}: {topic} ({len(text)} chars)")
-
-        except Exception as e:
-            logger.warning(f"Web URL processing error for {url}: {e}")
-            continue
-
-    return processed
+    results = await asyncio.gather(*[_process_single_web_url(url) for url in urls])
+    return [r for r in results if r is not None]
 
 
 def _save_temp_file(file: UploadFile) -> str:
