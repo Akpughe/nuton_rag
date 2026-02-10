@@ -429,6 +429,170 @@ class FlashcardStorage:
             return None
 
 
+class ExamStorage:
+    """Save/get exams from course_exams table"""
+
+    @staticmethod
+    def save_exam(course_id: str, user_id: str, exam_size: int, exam_data: Dict[str, Any]) -> str:
+        try:
+            data = {
+                "course_id": course_id,
+                "user_id": user_id,
+                "exam_size": exam_size,
+                "mcq": exam_data.get("mcq", []),
+                "fill_in_gap": exam_data.get("fill_in_gap", []),
+                "theory": exam_data.get("theory", []),
+            }
+            response = get_supabase().table("course_exams").insert(data).execute()
+            if not response.data:
+                raise Exception(f"Failed to insert exam: {response}")
+            return str(response.data[0]["id"])
+        except Exception as e:
+            logger.error(f"Error saving exam for {course_id}: {e}")
+            raise
+
+    @staticmethod
+    def get_exam(course_id: str, user_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        try:
+            query = get_supabase().table("course_exams").select("*").eq("course_id", course_id)
+            if user_id:
+                query = query.eq("user_id", user_id)
+            response = query.order("created_at", desc=True).limit(1).execute()
+            if response.data and len(response.data) > 0:
+                return response.data[0]
+            return None
+        except Exception as e:
+            logger.error(f"Error getting exam for {course_id}: {e}")
+            return None
+
+    @staticmethod
+    def get_exam_by_id(exam_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            response = get_supabase().table("course_exams").select("*").eq("id", exam_id).limit(1).execute()
+            if response.data and len(response.data) > 0:
+                return response.data[0]
+            return None
+        except Exception as e:
+            logger.error(f"Error getting exam by id {exam_id}: {e}")
+            return None
+
+
+class ExamAttemptStorage:
+    """Save/get exam attempt results from course_exam_attempts table"""
+
+    @staticmethod
+    def save_attempt(
+        exam_id: str,
+        user_id: str,
+        answers: Dict[str, Any],
+        results: Dict[str, Any],
+        score: float,
+        mcq_score: Optional[float],
+        fill_in_gap_score: Optional[float],
+        theory_score: Optional[float],
+        time_taken_seconds: Optional[int] = None
+    ) -> str:
+        try:
+            data = {
+                "exam_id": exam_id,
+                "user_id": user_id,
+                "answers": answers,
+                "results": results,
+                "score": score,
+                "mcq_score": mcq_score,
+                "fill_in_gap_score": fill_in_gap_score,
+                "theory_score": theory_score,
+                "time_taken_seconds": time_taken_seconds,
+            }
+            response = get_supabase().table("course_exam_attempts").insert(data).execute()
+            if not response.data:
+                raise Exception(f"Failed to insert exam attempt: {response}")
+            return str(response.data[0]["id"])
+        except Exception as e:
+            logger.error(f"Error saving exam attempt for exam {exam_id}: {e}")
+            raise
+
+    @staticmethod
+    def get_attempts(exam_id: str, user_id: str) -> List[Dict[str, Any]]:
+        try:
+            response = get_supabase().table("course_exam_attempts") \
+                .select("id, exam_id, score, mcq_score, fill_in_gap_score, theory_score, time_taken_seconds, created_at") \
+                .eq("exam_id", exam_id) \
+                .eq("user_id", user_id) \
+                .order("created_at", desc=True) \
+                .execute()
+            return response.data or []
+        except Exception as e:
+            logger.error(f"Error getting attempts for exam {exam_id}: {e}")
+            return []
+
+    @staticmethod
+    def get_attempt_by_id(attempt_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            response = get_supabase().table("course_exam_attempts") \
+                .select("*") \
+                .eq("id", attempt_id) \
+                .limit(1) \
+                .execute()
+            if response.data and len(response.data) > 0:
+                return response.data[0]
+            return None
+        except Exception as e:
+            logger.error(f"Error getting attempt {attempt_id}: {e}")
+            return None
+
+
+class ChatStorage:
+    """Save/get chat messages from course_chat_messages table"""
+
+    @staticmethod
+    def save_message(course_id: str, user_id: str, role: str, content: str, sources: Optional[List] = None) -> bool:
+        try:
+            data = {
+                "course_id": course_id,
+                "user_id": user_id,
+                "role": role,
+                "content": content,
+            }
+            if sources:
+                data["sources"] = sources
+            get_supabase().table("course_chat_messages").insert(data).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error saving chat message for {course_id}: {e}")
+            return False
+
+    @staticmethod
+    def get_messages(course_id: str, user_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        try:
+            response = get_supabase().table("course_chat_messages") \
+                .select("role, content, sources, created_at") \
+                .eq("course_id", course_id) \
+                .eq("user_id", user_id) \
+                .order("created_at", desc=True) \
+                .limit(limit) \
+                .execute()
+            messages = response.data or []
+            messages.reverse()  # Oldest first
+            return messages
+        except Exception as e:
+            logger.error(f"Error getting chat messages for {course_id}: {e}")
+            return []
+
+    @staticmethod
+    def clear_messages(course_id: str, user_id: str) -> bool:
+        try:
+            get_supabase().table("course_chat_messages") \
+                .delete() \
+                .eq("course_id", course_id) \
+                .eq("user_id", user_id) \
+                .execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error clearing chat messages for {course_id}: {e}")
+            return False
+
+
 # Generation Logging (stays local — no DB table)
 class GenerationLogger:
     """Log course generation for debugging and cost tracking"""
