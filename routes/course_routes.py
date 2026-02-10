@@ -654,18 +654,25 @@ async def get_user_progress(user_id: str):
     }
 
 
-# Course Q&A Endpoint
+# Course Q&A Endpoint (with chat history)
 @router.post("/courses/{course_id}/ask")
-async def ask_course_question(course_id: str, question: str = Form(...), model: Optional[str] = Form(None)):
+async def ask_course_question(
+    course_id: str,
+    question: str = Form(...),
+    model: Optional[str] = Form(None),
+    user_id: Optional[str] = Form(None)
+):
     """
     Ask a question about a course. Answers are grounded in the uploaded source material.
     Uses Pinecone vector search to find relevant chunks from the original documents.
+    When user_id is provided, maintains persistent chat history (Redis cache + Supabase).
     """
     try:
         result = await course_service.query_course(
             course_id=course_id,
             question=question,
-            model=model
+            model=model,
+            user_id=user_id
         )
         return result
     except ValueError as e:
@@ -673,6 +680,198 @@ async def ask_course_question(course_id: str, question: str = Form(...), model: 
     except Exception as e:
         logger.error(f"Course Q&A error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# Study Guide Endpoint
+@router.get("/courses/{course_id}/study-guide")
+async def get_study_guide(course_id: str):
+    """Get the study guide for a course."""
+    from utils.file_storage import StudyGuideStorage
+    study_guide = StudyGuideStorage.get_study_guide(course_id)
+    if not study_guide:
+        raise HTTPException(status_code=404, detail="Study guide not found. It may still be generating.")
+    return {"course_id": course_id, "study_guide": study_guide}
+
+
+# Flashcards Endpoint
+@router.get("/courses/{course_id}/flashcards")
+async def get_flashcards(course_id: str):
+    """Get the flashcards for a course."""
+    from utils.file_storage import FlashcardStorage
+    flashcards = FlashcardStorage.get_flashcards(course_id)
+    if not flashcards:
+        raise HTTPException(status_code=404, detail="Flashcards not found. They may still be generating.")
+    return {"course_id": course_id, "total": len(flashcards), "flashcards": flashcards}
+
+
+@router.get("/courses/{course_id}/chapters/{chapter_order}/flashcards")
+async def get_chapter_flashcards(course_id: str, chapter_order: int):
+    """Get flashcards for a specific chapter."""
+    from clients.supabase_client import get_chapter_by_order
+    chapter = get_chapter_by_order(course_id, chapter_order)
+    if not chapter:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    flashcards = chapter.get("flashcards") or []
+    return {
+        "course_id": course_id,
+        "chapter_order": chapter_order,
+        "chapter_title": chapter.get("title", ""),
+        "total": len(flashcards),
+        "flashcards": flashcards
+    }
+
+
+# Final Exam Endpoints
+@router.post("/courses/{course_id}/generate-exam")
+async def generate_exam(
+    course_id: str,
+    user_id: str = Form(...),
+    exam_size: int = Form(30),
+    model: Optional[str] = Form(None)
+):
+    """
+    Generate a final exam for a course (on-demand).
+    exam_size: 30 (15 MCQ / 8 fill-in / 7 theory) or 50 (25 MCQ / 15 fill-in / 10 theory)
+    """
+    if exam_size not in (30, 50):
+        raise HTTPException(status_code=400, detail="exam_size must be 30 or 50")
+
+    if model and model not in ModelConfig.get_available_models():
+        raise HTTPException(status_code=400, detail=f"Invalid model. Available: {ModelConfig.get_available_models()}")
+
+    try:
+        result = await course_service.generate_final_exam(
+            course_id=course_id,
+            user_id=user_id,
+            exam_size=exam_size,
+            model=model
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Exam generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/courses/{course_id}/exam")
+async def get_exam(course_id: str, user_id: Optional[str] = None):
+    """Get the most recent exam for a course (optionally filtered by user)."""
+    from utils.file_storage import ExamStorage
+    exam = ExamStorage.get_exam(course_id, user_id)
+    if not exam:
+        raise HTTPException(status_code=404, detail="No exam found. Generate one first.")
+    return exam
+
+
+# Exam Submission & Grading Endpoints
+@router.post("/courses/{course_id}/exam/{exam_id}/submit")
+async def submit_exam(
+    course_id: str,
+    exam_id: str,
+    user_id: str = Form(...),
+    answers: str = Form(...),
+    model: Optional[str] = Form(None),
+    time_taken_seconds: Optional[int] = Form(None)
+):
+    """
+    Submit exam answers for grading.
+
+    answers: JSON string with shape {"mcq": [2,0,3,...], "fill_in_gap": ["answer1",...], "theory": ["essay text",...]}
+    - mcq: array of selected option indices (0-3)
+    - fill_in_gap: array of answer strings
+    - theory: array of essay answer strings
+
+    Returns graded results with per-question breakdown and rubric analysis for theory.
+    """
+    # Parse answers JSON
+    try:
+        parsed_answers = json.loads(answers)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="answers must be valid JSON")
+
+    # Validate answer structure
+    for key in ("mcq", "fill_in_gap", "theory"):
+        if key not in parsed_answers:
+            raise HTTPException(status_code=400, detail=f"answers must contain '{key}' array")
+        if not isinstance(parsed_answers[key], list):
+            raise HTTPException(status_code=400, detail=f"answers.{key} must be an array")
+
+    if model and model not in ModelConfig.get_available_models():
+        raise HTTPException(status_code=400, detail=f"Invalid model. Available: {ModelConfig.get_available_models()}")
+
+    try:
+        result = await course_service.grade_exam_submission(
+            exam_id=exam_id,
+            user_id=user_id,
+            answers=parsed_answers,
+            model=model,
+            time_taken_seconds=time_taken_seconds
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Exam submission error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/courses/{course_id}/exam/{exam_id}/attempts")
+async def get_exam_attempts(course_id: str, exam_id: str, user_id: Optional[str] = None):
+    """
+    Get all attempts for an exam by a specific user.
+    Returns a list of attempts with scores and timestamps (without full results for brevity).
+    """
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id query parameter is required")
+
+    from utils.file_storage import ExamAttemptStorage
+    attempts = ExamAttemptStorage.get_attempts(exam_id, user_id)
+    return {
+        "exam_id": exam_id,
+        "user_id": user_id,
+        "total_attempts": len(attempts),
+        "attempts": attempts
+    }
+
+
+@router.get("/courses/{course_id}/exam/{exam_id}/attempts/{attempt_id}")
+async def get_exam_attempt_detail(course_id: str, exam_id: str, attempt_id: str):
+    """
+    Get full details of a specific exam attempt including rubric breakdowns.
+    """
+    from utils.file_storage import ExamAttemptStorage
+    attempt = ExamAttemptStorage.get_attempt_by_id(attempt_id)
+    if not attempt:
+        raise HTTPException(status_code=404, detail="Attempt not found")
+    return attempt
+
+
+# Chat History Endpoints
+@router.get("/courses/{course_id}/chat-history")
+async def get_chat_history(course_id: str, user_id: Optional[str] = None, limit: int = 20):
+    """Get chat history for a course+user pair."""
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    from utils.file_storage import ChatStorage
+    messages = ChatStorage.get_messages(course_id, user_id, limit=limit)
+    return {"course_id": course_id, "user_id": user_id, "messages": messages}
+
+
+@router.delete("/courses/{course_id}/chat-history")
+async def clear_chat_history(course_id: str, user_id: Optional[str] = None):
+    """Clear chat history for a course+user pair."""
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+    from utils.file_storage import ChatStorage
+    ChatStorage.clear_messages(course_id, user_id)
+    # Also clear Redis cache
+    try:
+        from clients.redis_client import clear_chat
+        await clear_chat(course_id, user_id)
+    except Exception:
+        pass
+    return {"success": True, "message": "Chat history cleared"}
 
 
 # Helper functions
