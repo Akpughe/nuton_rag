@@ -50,3 +50,4 @@ jina>=1.0.0
 google-generativeai>=0.3.0
 docchunker>=0.3.0
 chonkie[all]>=1.4.0
+redis[hiredis]>=5.0.0
