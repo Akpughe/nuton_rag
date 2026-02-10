@@ -89,7 +89,7 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
     }
 }
 
-DEFAULT_MODEL = "claude-haiku-4-5"
+DEFAULT_MODEL = "llama-4-scout"
 
 
 def get_search_mode(model_key: Optional[str] = None) -> str:
