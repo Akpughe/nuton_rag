@@ -13,6 +13,7 @@ import logging
 import uuid
 
 from clients.supabase_client import (
+    get_supabase,
     get_learning_profile,
     upsert_learning_profile,
     upsert_course,
@@ -373,6 +374,59 @@ class ProgressStorage:
         except Exception as e:
             logger.error(f"Error saving progress: {e}")
             return False
+
+
+# Study Guide & Flashcards Storage (stored on courses table)
+class StudyGuideStorage:
+    """Save/get study guide from courses.study_guide JSONB column"""
+
+    @staticmethod
+    def save_study_guide(course_id: str, study_guide: Dict[str, Any]) -> bool:
+        try:
+            get_supabase().table("courses").update(
+                {"study_guide": study_guide}
+            ).eq("id", course_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error saving study guide for {course_id}: {e}")
+            return False
+
+    @staticmethod
+    def get_study_guide(course_id: str) -> Optional[Dict[str, Any]]:
+        try:
+            response = get_supabase().table("courses").select("study_guide").eq("id", course_id).execute()
+            if response.data and response.data[0].get("study_guide"):
+                return response.data[0]["study_guide"]
+            return None
+        except Exception as e:
+            logger.error(f"Error getting study guide for {course_id}: {e}")
+            return None
+
+
+class FlashcardStorage:
+    """Save/get course flashcards from courses.flashcards JSONB column"""
+
+    @staticmethod
+    def save_flashcards(course_id: str, flashcards: List[Dict[str, Any]]) -> bool:
+        try:
+            get_supabase().table("courses").update(
+                {"flashcards": flashcards}
+            ).eq("id", course_id).execute()
+            return True
+        except Exception as e:
+            logger.error(f"Error saving flashcards for {course_id}: {e}")
+            return False
+
+    @staticmethod
+    def get_flashcards(course_id: str) -> Optional[List[Dict[str, Any]]]:
+        try:
+            response = get_supabase().table("courses").select("flashcards").eq("id", course_id).execute()
+            if response.data and response.data[0].get("flashcards"):
+                return response.data[0]["flashcards"]
+            return None
+        except Exception as e:
+            logger.error(f"Error getting flashcards for {course_id}: {e}")
+            return None
 
 
 # Generation Logging (stays local — no DB table)
