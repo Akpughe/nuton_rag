@@ -280,6 +280,70 @@ class MultiFileAnalysis(BaseModel):
     options: Optional[List[OrganizationType]] = None
 
 
+# Study Guide Models
+class StudyGuide(BaseModel):
+    """Structured study guide generated from all course chapters"""
+    core_concepts: List[Dict[str, Any]]
+    must_remember: List[Dict[str, Any]]
+    key_terms: List[Dict[str, Any]]
+    key_comparisons: List[Dict[str, Any]]
+    common_mistakes: List[Dict[str, Any]]
+    timeline: Optional[List[Dict[str, Any]]] = None
+    processes: Optional[List[Dict[str, Any]]] = None
+    formulas: Optional[List[Dict[str, Any]]] = None
+
+
+# Flashcard Models
+class Flashcard(BaseModel):
+    """Individual flashcard"""
+    id: str
+    front: str
+    back: str
+    hint: Optional[str] = None
+    chapter_ref: Optional[str] = None
+    concept: Optional[str] = None
+    difficulty: Literal["basic", "intermediate", "advanced"] = "basic"
+
+
+# Final Exam Models
+class MCQExamQuestion(BaseModel):
+    """Multiple choice exam question"""
+    question: str
+    options: List[str]
+    correct_answer: int
+    explanation: str
+    chapter_ref: Optional[str] = None
+    difficulty: Literal["easy", "medium", "hard"] = "medium"
+
+
+class FillInGapQuestion(BaseModel):
+    """Fill-in-the-gap exam question"""
+    sentence_with_gap: str
+    correct_answer: str
+    alternatives: List[str] = []
+    explanation: str
+    chapter_ref: Optional[str] = None
+    difficulty: Literal["easy", "medium", "hard"] = "medium"
+
+
+class TheoryQuestion(BaseModel):
+    """Open-ended theory exam question"""
+    question: str
+    model_answer: str
+    rubric: List[str] = []
+    chapter_ref: Optional[str] = None
+    difficulty: Literal["easy", "medium", "hard"] = "medium"
+
+
+class FinalExam(BaseModel):
+    """Complete final exam"""
+    mcq: List[Dict[str, Any]]
+    fill_in_gap: List[Dict[str, Any]]
+    theory: List[Dict[str, Any]]
+    total_questions: int
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+
 # Model Configuration
 class ModelConfig(BaseModel):
     """Configuration for AI model"""
