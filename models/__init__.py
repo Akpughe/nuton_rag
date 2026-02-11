@@ -12,6 +12,7 @@ from .course_models import (
     CourseFromFilesRequest,
     ProgressUpdateRequest,
     CourseGenerationResponse,
+    SingleCourseInfo,
     MultiFileAnalysis,
     PersonalizationParams,
     SourceFile,
@@ -24,7 +25,16 @@ from .course_models import (
     LearningGoal,
     ExamplePreference,
     ExpertiseLevel,
-    ModelProvider
+    ModelProvider,
+    StudyGuide,
+    Flashcard,
+    MCQExamQuestion,
+    FillInGapQuestion,
+    TheoryQuestion,
+    FinalExam,
+    CourseProgress,
+    ChapterProgress,
+    QuizAttempt,
 )
 
 __all__ = [
@@ -40,6 +50,7 @@ __all__ = [
     'CourseFromFilesRequest',
     'ProgressUpdateRequest',
     'CourseGenerationResponse',
+    'SingleCourseInfo',
     'MultiFileAnalysis',
     'PersonalizationParams',
     'SourceFile',
@@ -52,5 +63,14 @@ __all__ = [
     'LearningGoal',
     'ExamplePreference',
     'ExpertiseLevel',
-    'ModelProvider'
+    'ModelProvider',
+    'StudyGuide',
+    'Flashcard',
+    'MCQExamQuestion',
+    'FillInGapQuestion',
+    'TheoryQuestion',
+    'FinalExam',
+    'CourseProgress',
+    'ChapterProgress',
+    'QuizAttempt',
 ]
