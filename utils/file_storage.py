@@ -35,7 +35,7 @@ from clients.supabase_client import (
 logger = logging.getLogger(__name__)
 
 # Base paths (only used for generation logs now)
-BASE_DIR = Path("/Users/davak/Documents/nuton_rag")
+BASE_DIR = Path(__file__).parent.parent
 GENERATION_LOGS_FILE = BASE_DIR / "course_generation_logs.json"
 
 

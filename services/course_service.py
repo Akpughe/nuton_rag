@@ -111,7 +111,7 @@ class CourseService:
                 "chapters": course["total_chapters"],
                 "generation_time": generation_time,
                 "status": "success",
-                "estimated_cost": estimate_course_cost(model_config["model"], course["total_chapters"])
+                "estimated_cost": estimate_course_cost(model or "llama-4-scout", course["total_chapters"])
             })
             
             return {
@@ -1181,7 +1181,7 @@ Return ONLY a JSON object:
             for match in matches:
                 try:
                     return json.loads(match)
-                except:
+                except (json.JSONDecodeError, ValueError):
                     continue
         
         logger.error(f"Could not extract JSON from: {text[:500]}")

@@ -929,11 +929,11 @@ async def _process_uploaded_files(files: List[UploadFile], model: Optional[str] 
                 return {
                     "filename": file.filename, "topic": topic,
                     "extracted_text": text, "pages": 1, "char_count": len(text),
-                    "source_url": s3_url, "source_type": "pdf",
+                    "source_url": s3_url, "source_type": "text",
                 }
 
             # OCR-based extraction — run sync OCR in thread
-            temp_path = _save_temp_file(file)
+            temp_path = _save_temp_file(file, content)
             try:
                 extraction = await asyncio.to_thread(extractor.process_document, temp_path)
                 text = extraction.get('full_text', '')
@@ -1050,14 +1050,14 @@ async def _process_web_urls(urls: List[str], model: Optional[str] = None) -> Lis
     return [r for r in results if r is not None]
 
 
-def _save_temp_file(file: UploadFile) -> str:
-    """Save uploaded file to temp location"""
+def _save_temp_file(file: UploadFile, content: bytes = None) -> str:
+    """Save uploaded file to temp location. Uses pre-read content if provided."""
     suffix = os.path.splitext(file.filename)[1] if file.filename else ""
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        content = file.file.read()
-        if not content:
+        data = content if content is not None else file.file.read()
+        if not data:
             raise ValueError(f"Empty file: {file.filename}")
-        tmp.write(content)
+        tmp.write(data)
         return tmp.name
 
 
