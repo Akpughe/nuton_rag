@@ -1,0 +1,74 @@
+{
+  "profiles": [
+    {
+      "user_id": "test-user-1",
+      "format_pref": "reading",
+      "depth_pref": "detailed",
+      "role": "student",
+      "learning_goal": "curiosity",
+      "example_pref": "real_world",
+      "created_at": "2026-02-06 15:09:49.237205",
+      "updated_at": "2026-02-06 15:09:49.237216"
+    },
+    {
+      "user_id": "user-1-student",
+      "format_pref": "reading",
+      "depth_pref": "detailed",
+      "role": "student",
+      "learning_goal": "exams",
+      "example_pref": "real_world",
+      "created_at": "2026-02-06 15:41:54.953782",
+      "updated_at": "2026-02-06 15:41:54.953802"
+    },
+    {
+      "user_id": "user-2-professional",
+      "format_pref": "mixed",
+      "depth_pref": "quick",
+      "role": "professional",
+      "learning_goal": "career",
+      "example_pref": "technical",
+      "created_at": "2026-02-06 15:41:55.049023",
+      "updated_at": "2026-02-06 15:41:55.049027"
+    },
+    {
+      "user_id": "user-3-grad",
+      "format_pref": "testing",
+      "depth_pref": "academic",
+      "role": "graduate_student",
+      "learning_goal": "supplement",
+      "example_pref": "technical",
+      "created_at": "2026-02-06 15:41:55.138333",
+      "updated_at": "2026-02-06 15:41:55.138335"
+    },
+    {
+      "user_id": "user-4-curious",
+      "format_pref": "listening",
+      "depth_pref": "conversational",
+      "role": "student",
+      "learning_goal": "curiosity",
+      "example_pref": "stories",
+      "created_at": "2026-02-06 15:41:55.192635",
+      "updated_at": "2026-02-06 15:41:55.192639"
+    },
+    {
+      "user_id": "user-5-hobbyist",
+      "format_pref": "reading",
+      "depth_pref": "conversational",
+      "role": "professional",
+      "learning_goal": "curiosity",
+      "example_pref": "analogies",
+      "created_at": "2026-02-06 15:41:55.245195",
+      "updated_at": "2026-02-06 15:41:55.245200"
+    },
+    {
+      "user_id": "test-user",
+      "format_pref": "reading",
+      "depth_pref": "detailed",
+      "role": "student",
+      "learning_goal": "curiosity",
+      "example_pref": "real_world",
+      "created_at": "2026-02-06 23:40:57.383767",
+      "updated_at": "2026-02-06 23:40:57.383771"
+    }
+  ]
+}
