@@ -401,6 +401,158 @@ def insert_quiz_set(
             
         return str(response.data[0]["id"])
 
+def insert_course_flashcard_set(
+    course_id: str,
+    flashcards: List[Dict[str, Any]],
+    set_number: int,
+    created_by: Optional[str] = None,
+    is_shared: bool = False
+) -> str:
+    """
+    Insert or update a batch of flashcards in the 'flashcard_sets' table using course_id.
+    Same pattern as insert_flashcard_set() but uses course_id instead of content_id.
+    content_id is left NULL since these are course-generated, not content-generated.
+    """
+    check_response = get_supabase().table("flashcard_sets").select("id").eq("course_id", course_id).eq("set_number", set_number).execute()
+
+    if check_response.data and len(check_response.data) > 0:
+        existing_id = check_response.data[0]["id"]
+        logging.info(f"Updating existing course flashcard set {existing_id} (course_id: {course_id}, set: {set_number})")
+
+        update_data = {"flashcards": flashcards}
+        if created_by is not None:
+            update_data["created_by"] = created_by
+        if is_shared is not None:
+            update_data["is_shared"] = is_shared
+
+        response = get_supabase().table("flashcard_sets").update(update_data).eq("id", existing_id).execute()
+        if not response.data or len(response.data) == 0:
+            raise Exception(f"Course flashcard set update failed: {response}")
+        return existing_id
+    else:
+        logging.info(f"Creating new course flashcard set (course_id: {course_id}, set: {set_number})")
+        insert_data = {
+            "course_id": course_id,
+            "flashcards": flashcards,
+            "set_number": set_number,
+            "is_shared": is_shared if is_shared is not None else False
+        }
+        if created_by is not None:
+            insert_data["created_by"] = created_by
+
+        response = get_supabase().table("flashcard_sets").insert(insert_data).execute()
+        if not response.data or "id" not in response.data[0]:
+            raise Exception(f"Course flashcard set insertion failed: {response}")
+        return str(response.data[0]["id"])
+
+
+def insert_course_quiz_set(
+    course_id: str,
+    quiz_obj: Dict[str, Any],
+    set_number: int,
+    title: str = None,
+    description: str = None,
+    created_by: Optional[str] = None,
+    is_shared: bool = False
+) -> str:
+    """
+    Insert or update a quiz in the 'quiz_sets' table using course_id.
+    Same pattern as insert_quiz_set() but uses course_id instead of content_id.
+    content_id is left NULL since these are course-generated, not content-generated.
+    """
+    check_response = get_supabase().table("quiz_sets").select("id").eq("course_id", course_id).eq("set_number", set_number).execute()
+
+    if check_response.data and len(check_response.data) > 0:
+        existing_id = check_response.data[0]["id"]
+        logging.info(f"Updating existing course quiz set {existing_id} (course_id: {course_id}, set: {set_number})")
+
+        update_data = {"quiz": quiz_obj}
+        if title:
+            update_data["title"] = title
+        if description:
+            update_data["description"] = description
+        if created_by is not None:
+            update_data["created_by"] = created_by
+        if is_shared is not None:
+            update_data["is_shared"] = is_shared
+
+        response = get_supabase().table("quiz_sets").update(update_data).eq("id", existing_id).execute()
+        if not response.data or len(response.data) == 0:
+            raise Exception(f"Course quiz set update failed: {response}")
+        return existing_id
+    else:
+        logging.info(f"Creating new course quiz set (course_id: {course_id}, set: {set_number})")
+        insert_data = {
+            "course_id": course_id,
+            "quiz": quiz_obj,
+            "set_number": set_number,
+            "is_shared": is_shared if is_shared is not None else False
+        }
+        if title:
+            insert_data["title"] = title
+        if description:
+            insert_data["description"] = description
+        if created_by is not None:
+            insert_data["created_by"] = created_by
+
+        response = get_supabase().table("quiz_sets").insert(insert_data).execute()
+        if not response.data or "id" not in response.data[0]:
+            raise Exception(f"Course quiz set insertion failed: {response}")
+        return str(response.data[0]["id"])
+
+
+def delete_course_flashcard_sets(course_id: str) -> int:
+    """
+    Delete all flashcard_sets rows for a course_id.
+    Called at start of generation to clear stale data from previous runs.
+    Returns number of deleted rows.
+    """
+    response = get_supabase().table("flashcard_sets") \
+        .delete().eq("course_id", course_id).execute()
+    deleted = len(response.data) if response.data else 0
+    logging.info(f"Deleted {deleted} flashcard sets for course {course_id}")
+    return deleted
+
+
+def delete_course_quiz_sets(course_id: str) -> int:
+    """
+    Delete all quiz_sets rows for a course_id.
+    Called at start of generation to clear stale data from previous runs.
+    Returns number of deleted rows.
+    """
+    response = get_supabase().table("quiz_sets") \
+        .delete().eq("course_id", course_id).execute()
+    deleted = len(response.data) if response.data else 0
+    logging.info(f"Deleted {deleted} quiz sets for course {course_id}")
+    return deleted
+
+
+def get_course_flashcard_sets(course_id: str) -> List[Dict[str, Any]]:
+    """
+    Get all flashcard_sets rows for a course, ordered by set_number.
+    Used by the GET /notes-flashcards endpoint to retrieve incrementally-inserted sets.
+    """
+    response = get_supabase().table("flashcard_sets") \
+        .select("set_number, flashcards, created_by, is_shared") \
+        .eq("course_id", course_id) \
+        .order("set_number") \
+        .execute()
+    return response.data or []
+
+
+def get_course_quiz_sets(course_id: str) -> List[Dict[str, Any]]:
+    """
+    Get all quiz_sets rows for a course, ordered by set_number.
+    Used by the GET /notes-quiz endpoint to retrieve incrementally-inserted sets.
+    """
+    response = get_supabase().table("quiz_sets") \
+        .select("set_number, quiz, title, description, created_by, is_shared") \
+        .eq("course_id", course_id) \
+        .order("set_number") \
+        .execute()
+    return response.data or []
+
+
 def determine_shared_status(user_id: str, content_id: str) -> bool:
     """
     Determines if content (flashcards/quiz) should be shared based on ownership.
@@ -595,7 +747,7 @@ def _serialize_course_data(course_data: Dict[str, Any]) -> Dict[str, Any]:
         "source_type", "source_files", "multi_file_organization",
         "total_chapters", "estimated_time", "status", "personalization_params",
         "outline", "model_used", "created_at", "completed_at",
-        "study_guide", "flashcards"
+        "study_guide", "flashcards", "summary_md", "visibility"
     }
     filtered = {k: v for k, v in course_data.items() if k in db_fields}
     return _serialize_for_supabase(filtered)
@@ -678,6 +830,16 @@ def get_course_by_slug(slug: str) -> Optional[Dict[str, Any]]:
     if response.data and len(response.data) > 0:
         return response.data[0]
     return None
+
+
+def update_course_summary_md(course_id: str, summary_md: str) -> None:
+    """Update the summary_md column for a course."""
+    response = get_supabase().table("courses").update({
+        "summary_md": summary_md
+    }).eq("id", course_id).execute()
+    if not response.data:
+        raise Exception(f"Failed to update summary_md for course {course_id}")
+    logging.info(f"Updated summary_md for course {course_id} ({len(summary_md)} chars)")
 
 
 def is_slug_taken(slug: str) -> bool:
@@ -805,6 +967,14 @@ def get_course_quiz_attempts(user_id: str, chapter_id: str) -> List[Dict[str, An
 # ============================================================================
 # Existing document functions
 # ============================================================================
+
+def get_yt_extracted_text(yt_id: str) -> Optional[str]:
+    """Fetch extracted_text from the yts table by ID."""
+    response = get_supabase().table("yts").select("extracted_text").eq("id", yt_id).execute()
+    if response.data:
+        return response.data[0].get("extracted_text")
+    return None
+
 
 def get_documents_in_space(space_id: str) -> Dict[str, List[Dict[str, Any]]]:
     """
