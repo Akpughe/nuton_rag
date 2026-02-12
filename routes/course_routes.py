@@ -682,6 +682,187 @@ async def ask_course_question(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# Notes Generation Endpoints
+@router.post("/courses/{course_id}/generate-notes", status_code=201)
+async def generate_notes(
+    course_id: str,
+    user_id: str = Form(...),
+    model: Optional[str] = Form(None)
+):
+    """
+    Generate comprehensive study notes from course source materials.
+    Stores notes in courses.summary_md. Also updates course title/topic/slug
+    from document analysis and generates a study guide.
+
+    This is a blocking operation that may take 30-120s depending on material size.
+    """
+    if model and model not in ModelConfig.get_available_models():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid model. Available: {ModelConfig.get_available_models()}"
+        )
+
+    try:
+        result = await course_service.generate_notes(
+            course_id=course_id,
+            user_id=user_id,
+            model=model
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Notes generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/courses/{course_id}/generate-notes-flashcards", status_code=201)
+async def generate_notes_flashcards(
+    course_id: str,
+    user_id: str = Form(...),
+    model: Optional[str] = Form(None)
+):
+    """
+    Generate flashcards from course source materials.
+    Standalone operation — does not require generate-notes to run first.
+    Saves to both courses.flashcards JSONB and flashcard_sets table.
+
+    This is a blocking operation that may take 30-90s depending on material size.
+    """
+    if model and model not in ModelConfig.get_available_models():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid model. Available: {ModelConfig.get_available_models()}"
+        )
+
+    try:
+        result = await course_service.generate_notes_flashcards(
+            course_id=course_id,
+            user_id=user_id,
+            model=model
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Notes flashcard generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/courses/{course_id}/generate-notes-quiz", status_code=201)
+async def generate_notes_quiz(
+    course_id: str,
+    user_id: str = Form(...),
+    model: Optional[str] = Form(None)
+):
+    """
+    Generate a comprehensive quiz from course source materials.
+    Standalone operation — does not require generate-notes to run first.
+    Saves to quiz_sets table with MCQ, fill-in-gap, and scenario questions.
+
+    This is a blocking operation that may take 30-90s depending on material size.
+    """
+    if model and model not in ModelConfig.get_available_models():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid model. Available: {ModelConfig.get_available_models()}"
+        )
+
+    try:
+        result = await course_service.generate_notes_quiz(
+            course_id=course_id,
+            user_id=user_id,
+            model=model
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Notes quiz generation error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/courses/{course_id}/notes-flashcards")
+async def get_notes_flashcards(course_id: str):
+    """
+    Retrieve incrementally-inserted flashcards from flashcard_sets table.
+    Returns partial results while generation is still running, or full set after.
+    """
+    from clients.supabase_client import get_course_flashcard_sets
+
+    sets = get_course_flashcard_sets(course_id)
+    if not sets:
+        raise HTTPException(status_code=404, detail="No flashcard sets found for this course. Generate them first via POST /generate-notes-flashcards.")
+
+    all_cards = []
+    for s in sets:
+        cards = s.get("flashcards", [])
+        if isinstance(cards, list):
+            all_cards.extend(cards)
+
+    return {
+        "course_id": course_id,
+        "total": len(all_cards),
+        "sets_count": len(sets),
+        "flashcards": all_cards
+    }
+
+
+@router.get("/courses/{course_id}/notes-quiz")
+async def get_notes_quiz(course_id: str):
+    """
+    Retrieve incrementally-inserted quiz questions from quiz_sets table.
+    Returns partial results while generation is still running, or full set after.
+    """
+    from clients.supabase_client import get_course_quiz_sets
+
+    sets = get_course_quiz_sets(course_id)
+    if not sets:
+        raise HTTPException(status_code=404, detail="No quiz sets found for this course. Generate them first via POST /generate-notes-quiz.")
+
+    merged = {"mcq": [], "fill_in_gap": [], "scenario": []}
+    for s in sets:
+        quiz = s.get("quiz", {})
+        if isinstance(quiz, dict):
+            for q_type in ("mcq", "fill_in_gap", "scenario"):
+                merged[q_type].extend(quiz.get(q_type, []))
+
+    total = sum(len(v) for v in merged.values())
+    by_type = {k: len(v) for k, v in merged.items()}
+
+    return {
+        "course_id": course_id,
+        "total_questions": total,
+        "sets_count": len(sets),
+        "by_type": by_type,
+        "quiz": merged
+    }
+
+
+@router.get("/courses/{course_id}/notes")
+async def get_course_notes(course_id: str):
+    """
+    Retrieve stored notes (summary_md) for a course.
+    Returns 404 if notes have not been generated yet.
+    """
+    from clients.supabase_client import get_course_by_id
+
+    course = get_course_by_id(course_id)
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    summary_md = course.get("summary_md")
+    if not summary_md:
+        raise HTTPException(status_code=404, detail="Notes not yet generated. Call POST /generate-notes first.")
+
+    return {
+        "course_id": course_id,
+        "title": course.get("title", ""),
+        "notes_length": len(summary_md),
+        "summary_md": summary_md
+    }
+
+
 # Study Guide Endpoint
 @router.get("/courses/{course_id}/study-guide")
 async def get_study_guide(course_id: str):
