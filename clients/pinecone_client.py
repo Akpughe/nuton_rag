@@ -1098,4 +1098,87 @@ def fetch_all_document_chunks(
 
     except Exception as e:
         logging.error(f"❌ Error fetching chunks: {e}")
-        return [] 
+        return []
+
+
+def update_vector_metadata(
+    vector_ids: List[str],
+    metadata_update: Dict[str, Any],
+    max_workers: int = 10
+) -> int:
+    """
+    Update metadata on existing Pinecone vectors (best-effort, parallel).
+
+    Args:
+        vector_ids: List of vector IDs to update.
+        metadata_update: Dict of metadata fields to set/overwrite.
+        max_workers: Max parallel threads for updates.
+
+    Returns:
+        Count of successfully updated vectors.
+    """
+    if not vector_ids:
+        return 0
+
+    dense_index = pc.Index(DENSE_INDEX)
+    success_count = 0
+
+    def _update_single(vid: str) -> bool:
+        try:
+            dense_index.update(id=vid, set_metadata=metadata_update)
+            return True
+        except Exception as e:
+            logging.warning(f"Failed to update metadata for vector {vid}: {e}")
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_update_single, vid): vid for vid in vector_ids}
+        for future in concurrent.futures.as_completed(futures):
+            if future.result():
+                success_count += 1
+
+    logging.info(f"Updated metadata on {success_count}/{len(vector_ids)} vectors")
+    return success_count
+
+
+def fetch_chunks_by_space(
+    space_id: str,
+    document_ids: List[str],
+    max_chunks_per_doc: int = 2000,
+    target_coverage: float = 0.80,
+    enable_gap_filling: bool = True
+) -> List[Dict[str, Any]]:
+    """
+    Fetch chunks for multiple documents in a space by calling
+    fetch_all_document_chunks() per document and merging results.
+
+    Args:
+        space_id: The space ID that all documents belong to.
+        document_ids: List of document IDs to fetch chunks for.
+        max_chunks_per_doc: Max chunks per individual document fetch.
+        target_coverage: Target coverage for gap-filling.
+        enable_gap_filling: Whether to enable gap-filling.
+
+    Returns:
+        Merged list of chunks from all documents, sorted by position.
+    """
+    all_chunks = []
+    chunk_ids_seen = set()
+
+    for doc_id in document_ids:
+        logging.info(f"Fetching chunks for document {doc_id} in space {space_id}")
+        doc_chunks = fetch_all_document_chunks(
+            document_id=doc_id,
+            space_id=space_id,
+            max_chunks=max_chunks_per_doc,
+            target_coverage=target_coverage,
+            enable_gap_filling=enable_gap_filling
+        )
+        for chunk in doc_chunks:
+            cid = chunk.get("id")
+            if cid not in chunk_ids_seen:
+                chunk_ids_seen.add(cid)
+                all_chunks.append(chunk)
+
+    logging.info(f"Fetched {len(all_chunks)} total chunks across {len(document_ids)} documents in space {space_id}")
+    return all_chunks 
