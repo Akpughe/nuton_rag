@@ -29,7 +29,12 @@ from prompts.course_prompts import (
     build_course_flashcards_prompt,
     build_final_exam_prompt,
     build_theory_grading_prompt,
-    build_course_chat_prompt
+    build_course_chat_prompt,
+    build_course_notes_intro_prompt,
+    build_course_notes_section_prompt,
+    build_course_notes_conclusion_prompt,
+    build_notes_flashcards_prompt,
+    build_notes_quiz_prompt
 )
 
 # Import existing clients
@@ -2355,4 +2360,898 @@ Return ONLY a JSON object:
             "answer": answer,
             "sources_used": len(reranked),
             "source_excerpts": source_excerpts
+        }
+
+    # ================================================================
+    # Notes Generation
+    # ================================================================
+
+    async def _auto_ingest_documents(
+        self,
+        docs: Dict[str, Any],
+        space_id: str
+    ) -> None:
+        """
+        Auto-ingest documents that exist in a space but haven't been
+        chunked/embedded/upserted to Pinecone yet.
+
+        Processes YouTube videos (via extracted_text) and PDFs (via Mistral OCR).
+        """
+        from clients.chonkie_client import embed_chunks_multimodal
+        from clients.pinecone_client import upsert_vectors
+        from clients.supabase_client import get_yt_extracted_text
+
+        # Process YouTube videos
+        for yt in docs.get("yts", []):
+            yt_id = yt["id"]
+            yt_name = yt.get("file_name", "YouTube Video")
+            logger.info(f"Auto-ingesting YouTube video: {yt_name} ({yt_id})")
+
+            extracted_text = get_yt_extracted_text(yt_id)
+            if not extracted_text:
+                logger.warning(f"No extracted_text for YT {yt_id}, skipping")
+                continue
+
+            chunks = self._chunk_document_for_course(extracted_text, yt_name)
+            if not chunks:
+                logger.warning(f"Chunking produced 0 chunks for YT {yt_id}, skipping")
+                continue
+
+            embedded = embed_chunks_multimodal(chunks)
+            if embedded and isinstance(embedded[0], dict) and "message" in embedded[0]:
+                logger.error(f"Embedding failed for YT {yt_id}: {embedded[0]}")
+                continue
+
+            upsert_vectors(
+                doc_id=yt_id,
+                space_id=space_id,
+                embeddings=embedded,
+                chunks=chunks,
+                source_file=yt.get("yt_url", yt_name)
+            )
+            logger.info(f"Ingested YT {yt_id}: {len(chunks)} chunks")
+
+        # Process PDFs
+        for pdf in docs.get("pdfs", []):
+            pdf_id = pdf["id"]
+            pdf_name = pdf.get("file_name", "PDF Document")
+            file_path = pdf.get("file_path", "")
+            logger.info(f"Auto-ingesting PDF: {pdf_name} ({pdf_id})")
+
+            if not file_path:
+                logger.warning(f"No file_path for PDF {pdf_id}, skipping")
+                continue
+
+            try:
+                from processors.mistral_ocr_extractor import MistralOCRExtractor
+                ocr_result = MistralOCRExtractor().process_document(file_path)
+                full_text = ocr_result.get("full_text", "")
+            except Exception as e:
+                logger.error(f"OCR extraction failed for PDF {pdf_id}: {e}")
+                continue
+
+            if not full_text:
+                logger.warning(f"OCR produced empty text for PDF {pdf_id}, skipping")
+                continue
+
+            chunks = self._chunk_document_for_course(full_text, pdf_name)
+            if not chunks:
+                logger.warning(f"Chunking produced 0 chunks for PDF {pdf_id}, skipping")
+                continue
+
+            embedded = embed_chunks_multimodal(chunks)
+            if embedded and isinstance(embedded[0], dict) and "message" in embedded[0]:
+                logger.error(f"Embedding failed for PDF {pdf_id}: {embedded[0]}")
+                continue
+
+            upsert_vectors(
+                doc_id=pdf_id,
+                space_id=space_id,
+                embeddings=embedded,
+                chunks=chunks,
+                source_file=pdf_name
+            )
+            logger.info(f"Ingested PDF {pdf_id}: {len(chunks)} chunks")
+
+    async def generate_notes(
+        self,
+        course_id: str,
+        user_id: str,
+        model: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Generate comprehensive study notes from course source materials.
+        Stores result in courses.summary_md and generates a study guide.
+
+        Flow:
+        1. Validate course exists and user owns it
+        2. Fetch all source chunks from Pinecone (space-based or file-based)
+        3. Build document map from chunks
+        4. Update course title/topic/slug from document map
+        5. Generate notes: intro + sections (batched parallel) + conclusion
+        6. Save summary_md
+        7. Generate study guide
+        """
+        import asyncio
+        from clients.pinecone_client import (
+            fetch_all_document_chunks, fetch_chunks_by_space, update_vector_metadata
+        )
+        from clients.supabase_client import (
+            get_course_by_id, get_documents_in_space, update_course_summary_md
+        )
+
+        start_time = time.time()
+        model_config = ModelConfig.get_config(model)
+
+        # 1. Validate course
+        course = get_course_by_id(course_id)
+        if not course:
+            raise ValueError(f"Course not found: {course_id}")
+        if course.get("user_id") != user_id:
+            raise ValueError("Not authorized to generate notes for this course")
+
+        space_id = course.get("space_id")
+        source_urls: List[Dict[str, str]] = []
+
+        # 2. Fetch source chunks
+        if space_id:
+            # Space-based course: fetch chunks from all documents in the space
+            docs = get_documents_in_space(space_id)
+            doc_ids = []
+            print('docs', docs)
+
+
+            for pdf in docs.get("pdfs", []):
+                doc_ids.append(pdf["id"])
+                url = pdf.get("file_path", "")
+                name = pdf.get("file_name", "PDF Document")
+                if url:
+                    source_urls.append({"name": name, "url": url})
+
+            for yt in docs.get("yts", []):
+                doc_ids.append(yt["id"])
+                url = yt.get("yt_url", "")
+                name = yt.get("file_name", "YouTube Video")
+                if url:
+                    source_urls.append({"name": name, "url": url})
+
+            print('')
+            if not doc_ids:
+                raise ValueError(f"No documents found in space {space_id}")
+
+            raw_chunks = fetch_chunks_by_space(
+                space_id=space_id,
+                document_ids=doc_ids,
+                max_chunks_per_doc=2000,
+                target_coverage=0.80
+            )
+
+            # Tag vectors with course_id (best-effort)
+            vector_ids = [c.get("id") for c in raw_chunks if c.get("id")]
+            if vector_ids:
+                update_vector_metadata(vector_ids, {"course_id": course_id})
+        else:
+            # File-based course: chunks stored with document_id=course_id
+            raw_chunks = fetch_all_document_chunks(
+                document_id=course_id,
+                space_id=f"course_{course_id}",
+                max_chunks=2000,
+                target_coverage=0.80
+            )
+
+            # Collect source URLs from course.source_files
+            for sf in (course.get("source_files") or []):
+                url = sf.get("source_url", "")
+                name = sf.get("filename", "Source")
+                if url:
+                    source_urls.append({"name": name, "url": url})
+
+        if not raw_chunks and space_id:
+            logger.info("No chunks in Pinecone, auto-ingesting documents...")
+            await self._auto_ingest_documents(docs, space_id)
+
+            # Re-fetch chunks after ingestion
+            raw_chunks = fetch_chunks_by_space(
+                space_id=space_id,
+                document_ids=doc_ids,
+                max_chunks_per_doc=2000,
+                target_coverage=0.80
+            )
+
+        if not raw_chunks:
+            raise ValueError("No source material found for this course. Upload files or add to a space first.")
+
+        logger.info(f"Fetched {len(raw_chunks)} raw chunks for notes generation")
+
+        # 3. Normalize chunks for document map
+        normalized_chunks = []
+        for i, chunk in enumerate(raw_chunks):
+            metadata = chunk.get("metadata", {})
+            text = metadata.get("text", "")
+            source_file = metadata.get("source_file", "")
+            normalized_chunks.append({
+                "chunk_index": i,
+                "text": text,
+                "source_file": source_file
+            })
+
+        # 4. Build document map
+        doc_map = await self._build_document_map(normalized_chunks, model_config)
+        topics = doc_map.get("topics", [])
+        if not topics:
+            raise ValueError("Document map produced no topics")
+
+        # 5. Update course title, topic, and slug from document map
+        new_title = doc_map.get("document_title", course.get("title", ""))
+        new_topic = topics[0].get("topic", course.get("topic", "")) if topics else course.get("topic", "")
+        new_slug = generate_slug(new_title)
+
+        # Use partial update (not upsert) to avoid overwriting other columns
+        from clients.supabase_client import get_supabase
+        get_supabase().table("courses").update({
+            "title": new_title,
+            "topic": new_topic,
+            "slug": new_slug,
+        }).eq("id", course_id).execute()
+        logger.info(f"Updated course metadata: title='{new_title}', topic='{new_topic}', slug='{new_slug}'")
+
+        # 6. Get learning profile for personalization
+        profile = self._get_or_create_profile(user_id, {})
+
+        # 7. Generate notes in 3 phases
+        markdown_parts = []
+
+        # 7a. Intro
+        logger.info("Generating notes intro...")
+        intro_prompt = build_course_notes_intro_prompt(
+            document_title=new_title,
+            topics=topics,
+            expertise=profile.expertise.value,
+            role=profile.role.value,
+            learning_goal=profile.learning_goal.value,
+            depth_pref=profile.depth_pref.value,
+            example_pref=profile.example_pref.value,
+            format_pref=profile.format_pref.value
+        )
+        intro_result = await self._call_model(intro_prompt, model_config, expect_json=False)
+        markdown_parts.append(intro_result.get("content", ""))
+
+        # 7b. Sections (batched parallel)
+        BATCH_SIZE = 4
+        section_markdowns = [""] * len(topics)
+
+        async def generate_section(idx: int, topic: Dict[str, Any]) -> tuple:
+            section_context = self._get_chunks_for_notes_section(
+                topic=topic,
+                all_chunks=normalized_chunks,
+                max_context_tokens=6000
+            )
+            prev_title = topics[idx - 1]["topic"] if idx > 0 else None
+            next_title = topics[idx + 1]["topic"] if idx < len(topics) - 1 else None
+
+            prompt = build_course_notes_section_prompt(
+                section_title=topic["topic"],
+                section_description=topic.get("description", ""),
+                source_material=section_context,
+                section_number=idx + 1,
+                total_sections=len(topics),
+                prev_section_title=prev_title,
+                next_section_title=next_title,
+                expertise=profile.expertise.value,
+                role=profile.role.value,
+                learning_goal=profile.learning_goal.value,
+                depth_pref=profile.depth_pref.value,
+                example_pref=profile.example_pref.value,
+                format_pref=profile.format_pref.value
+            )
+            result = await self._call_model(prompt, model_config, expect_json=False)
+            return idx, result.get("content", "")
+
+        logger.info(f"Generating {len(topics)} note sections in batches of {BATCH_SIZE}...")
+        all_sections_indexed = list(enumerate(topics))
+        for batch_start in range(0, len(all_sections_indexed), BATCH_SIZE):
+            batch = all_sections_indexed[batch_start:batch_start + BATCH_SIZE]
+            batch_tasks = [generate_section(idx, topic) for idx, topic in batch]
+            results = await asyncio.gather(*batch_tasks)
+            for idx, content in results:
+                section_markdowns[idx] = content
+                logger.info(f"Generated section {idx + 1}/{len(topics)}: {topics[idx]['topic']}")
+            if batch_start + BATCH_SIZE < len(all_sections_indexed):
+                await asyncio.sleep(1)
+
+        markdown_parts.extend(section_markdowns)
+
+        # 7c. Conclusion + Sources
+        logger.info("Generating notes conclusion...")
+        conclusion_prompt = build_course_notes_conclusion_prompt(
+            document_title=new_title,
+            topics=topics,
+            source_urls=source_urls,
+            expertise=profile.expertise.value,
+            role=profile.role.value,
+            learning_goal=profile.learning_goal.value
+        )
+        conclusion_result = await self._call_model(conclusion_prompt, model_config, expect_json=False)
+        markdown_parts.append(conclusion_result.get("content", ""))
+
+        # 8. Concatenate and save
+        full_markdown = "\n\n---\n\n".join([p for p in markdown_parts if p.strip()])
+        update_course_summary_md(course_id, full_markdown)
+        logger.info(f"Saved summary_md for course {course_id} ({len(full_markdown)} chars)")
+
+        # 9. Generate study guide
+        has_study_guide = False
+        try:
+            chapters_summary = self._build_notes_chapters_summary(topics, normalized_chunks)
+            sg_prompt = build_study_guide_prompt(
+                course_title=new_title,
+                topic=new_topic,
+                chapters_summary=chapters_summary,
+                expertise=profile.expertise.value,
+                role=profile.role.value,
+                learning_goal=profile.learning_goal.value
+            )
+            sg_result = await self._call_model(sg_prompt, model_config, expect_json=True)
+            if sg_result:
+                self.study_guide_storage.save_study_guide(course_id, sg_result)
+                has_study_guide = True
+                logger.info(f"Study guide generated for notes-based course {course_id}")
+        except Exception as e:
+            logger.warning(f"Study guide generation failed (non-fatal): {e}")
+
+        generation_time = round(time.time() - start_time, 2)
+
+        return {
+            "course_id": course_id,
+            "title": new_title,
+            "slug": new_slug,
+            "topic": new_topic,
+            "notes_length": len(full_markdown),
+            "sections_generated": len(topics),
+            "model_used": model_config["model"],
+            "has_study_guide": has_study_guide,
+            "generation_time_seconds": generation_time,
+            "summary_md": full_markdown
+        }
+
+    def _get_chunks_for_notes_section(
+        self,
+        topic: Dict[str, Any],
+        all_chunks: List[Dict[str, Any]],
+        max_context_tokens: int = 6000
+    ) -> str:
+        """
+        Retrieve relevant chunks for a notes section using chunk_indices from doc map.
+        Simpler than _get_chunks_for_chapter — uses direct index mapping.
+        """
+        chunk_indices = topic.get("chunk_indices", [])
+
+        context_parts = []
+        token_count = 0
+        for idx in chunk_indices:
+            if idx < len(all_chunks):
+                chunk_text = all_chunks[idx].get("text", "")
+                chunk_tokens = len(chunk_text) // 4  # Rough estimate
+                if token_count + chunk_tokens > max_context_tokens:
+                    break
+                context_parts.append(f"[Source Section {idx + 1}]\n{chunk_text}")
+                token_count += chunk_tokens
+
+        context = "\n\n---\n\n".join(context_parts)
+        logger.info(f"Notes section '{topic['topic']}': {len(context_parts)} chunks, ~{token_count} tokens")
+        return context
+
+    def _build_notes_chapters_summary(
+        self,
+        topics: List[Dict[str, Any]],
+        all_chunks: List[Dict[str, Any]]
+    ) -> str:
+        """
+        Convert doc map topics + chunk text into a chapters_summary string
+        that build_study_guide_prompt() expects.
+        """
+        parts = []
+        for i, topic in enumerate(topics, 1):
+            chunk_indices = topic.get("chunk_indices", [])
+            # Build a content preview from the first few chunks
+            preview_parts = []
+            for idx in chunk_indices[:3]:
+                if idx < len(all_chunks):
+                    text = all_chunks[idx].get("text", "")
+                    preview_parts.append(text[:300])
+            content_preview = " ".join(preview_parts)[:500]
+
+            part = f"""Chapter {i}: {topic['topic']}
+  Objectives: Understand {topic.get('description', topic['topic'])}
+  Key Concepts: {topic.get('description', '')}
+  Content Preview: {content_preview}"""
+            parts.append(part)
+        return "\n\n".join(parts)
+
+    # ================================================================
+    # Flashcard & Quiz Text Parsers
+    # ================================================================
+
+    def _parse_flashcards_text(self, text: str) -> List[Dict[str, Any]]:
+        """
+        Parse structured text output from LLM into flashcard JSON objects.
+        Splits on --- delimiter, extracts labeled fields via regex.
+        Returns list of flashcard dicts. Skips malformed cards.
+        """
+        import re
+
+        cards = []
+        raw_blocks = re.split(r'\n\s*---\s*\n|\n\s*---\s*$|^\s*---\s*\n', text.strip())
+
+        for block in raw_blocks:
+            block = block.strip()
+            if not block or "CARD" not in block.upper():
+                continue
+
+            # Extract fields — case-insensitive, handles multi-line values
+            field_pattern = r'^\s*(Type|Front|Back|Hint|Concept|Difficulty)\s*:\s*(.+?)(?=\n\s*(?:Type|Front|Back|Hint|Concept|Difficulty)\s*:|$)'
+            matches = re.findall(field_pattern, block, re.MULTILINE | re.DOTALL | re.IGNORECASE)
+
+            fields = {}
+            for key, value in matches:
+                fields[key.strip().lower()] = value.strip()
+
+            front = fields.get("front", "")
+            back = fields.get("back", "")
+            if not front or not back:
+                logger.warning(f"Skipping malformed flashcard block (missing front/back): {block[:200]}")
+                continue
+
+            cards.append({
+                "front": front,
+                "back": back,
+                "hint": fields.get("hint", ""),
+                "concept": fields.get("concept", ""),
+                "difficulty": fields.get("difficulty", "intermediate"),
+                "type": fields.get("type", "application"),
+            })
+
+        return cards
+
+    def _parse_quiz_text(self, text: str) -> Dict[str, Any]:
+        """
+        Parse structured text output from LLM into quiz JSON object.
+        Splits on --- delimiter, extracts fields, groups by question type.
+        Returns {mcq: [...], fill_in_gap: [...], scenario: [...]}.
+        """
+        import re
+
+        questions = {"mcq": [], "fill_in_gap": [], "scenario": []}
+        raw_blocks = re.split(r'\n\s*---\s*\n|\n\s*---\s*$|^\s*---\s*\n', text.strip())
+
+        def _parse_correct_answer(raw: str, options: List[str]) -> int:
+            """Parse correct answer from letter, number, or text. Returns 0-based index."""
+            raw = raw.strip()
+            # Try single letter: A, B, C, D
+            if len(raw) == 1 and raw.upper().isalpha():
+                return ord(raw.upper()) - ord('A')
+            # Try letter with paren/period: "A)" or "A."
+            letter_match = re.match(r'^([A-Da-d])[).\s]', raw)
+            if letter_match:
+                return ord(letter_match.group(1).upper()) - ord('A')
+            # Try numeric: "0", "1", "2", "3"
+            if raw.isdigit():
+                return int(raw)
+            # Fallback: try matching against option text
+            for i, opt in enumerate(options):
+                if raw.lower() in opt.lower() or opt.lower() in raw.lower():
+                    return i
+            return 0
+
+        for block in raw_blocks:
+            block = block.strip()
+            if not block or "QUESTION" not in block.upper():
+                continue
+
+            # Case-insensitive field extraction
+            field_pattern = r'^\s*(Type|Bloom|Question|Options|Correct|Answer|Explanation|Section|Difficulty)\s*:\s*(.+?)(?=\n\s*(?:Type|Bloom|Question|Options|Correct|Answer|Explanation|Section|Difficulty)\s*:|$)'
+            matches = re.findall(field_pattern, block, re.MULTILINE | re.DOTALL | re.IGNORECASE)
+
+            fields = {}
+            for key, value in matches:
+                fields[key.strip().lower()] = value.strip()
+
+            q_type = fields.get("type", "mcq").lower().strip()
+            question_text = fields.get("question", "")
+            if not question_text:
+                logger.warning(f"Skipping quiz block with no question text: {block[:200]}")
+                continue
+
+            base_q = {
+                "question": question_text,
+                "bloom": fields.get("bloom", "understand"),
+                "explanation": fields.get("explanation", ""),
+                "section": fields.get("section", ""),
+                "difficulty": fields.get("difficulty", "medium"),
+            }
+
+            if q_type == "mcq":
+                options_raw = fields.get("options", "")
+                options = [o.strip() for o in re.split(r'\s*\|\s*', options_raw) if o.strip()]
+                if not options:
+                    options = [o.strip() for o in options_raw.split('\n') if o.strip()]
+
+                correct_raw = fields.get("correct", "A")
+                correct_index = _parse_correct_answer(correct_raw, options)
+
+                base_q["options"] = options
+                base_q["correct_answer"] = min(correct_index, len(options) - 1) if options else 0
+                questions["mcq"].append(base_q)
+
+            elif q_type in ("fill_in_gap", "fill_in_the_gap", "fill-in-gap", "fill"):
+                base_q["correct_answer"] = fields.get("answer", "")
+                questions["fill_in_gap"].append(base_q)
+
+            elif q_type == "scenario":
+                base_q["correct_answer"] = fields.get("answer", "")
+                questions["scenario"].append(base_q)
+
+            else:
+                if fields.get("options"):
+                    options_raw = fields.get("options", "")
+                    options = [o.strip() for o in re.split(r'\s*\|\s*', options_raw) if o.strip()]
+                    correct_raw = fields.get("correct", "A")
+                    correct_index = _parse_correct_answer(correct_raw, options)
+                    base_q["options"] = options
+                    base_q["correct_answer"] = min(correct_index, len(options) - 1) if options else 0
+                    questions["mcq"].append(base_q)
+                else:
+                    base_q["correct_answer"] = fields.get("answer", "")
+                    questions["scenario"].append(base_q)
+
+        return questions
+
+    # ================================================================
+    # Notes Flashcard & Quiz Generation
+    # ================================================================
+
+    async def _generate_notes_flashcards(
+        self,
+        course_id: str,
+        user_id: str,
+        topics: List[Dict[str, Any]],
+        all_chunks: List[Dict[str, Any]],
+        profile: 'LearningProfile',
+        model_config: Dict[str, Any],
+        course_title: str
+    ) -> int:
+        """
+        Generate flashcards for notes-based course using per-section text prompts.
+        Inserts each section's flashcards to DB incrementally (one set_number per section).
+        Returns total flashcard count.
+        """
+        import asyncio
+        from clients.supabase_client import insert_course_flashcard_set, delete_course_flashcard_sets
+
+        BATCH_SIZE = 4
+        all_flashcards = []
+
+        # Clear previous flashcard sets for this course before regenerating
+        try:
+            delete_course_flashcard_sets(course_id)
+        except Exception as e:
+            logger.warning(f"Failed to delete old flashcard sets for course {course_id}: {e}")
+
+        async def generate_section_flashcards(idx: int, topic: Dict[str, Any]) -> List[Dict[str, Any]]:
+            section_context = self._get_chunks_for_notes_section(
+                topic=topic,
+                all_chunks=all_chunks,
+                max_context_tokens=6000
+            )
+
+            prompt = build_notes_flashcards_prompt(
+                section_title=topic["topic"],
+                section_content=section_context,
+                section_number=idx + 1,
+                total_sections=len(topics),
+                expertise=profile.expertise.value,
+                role=profile.role.value,
+                learning_goal=profile.learning_goal.value
+            )
+
+            result = await self._call_model(prompt, model_config, expect_json=False)
+            text = result.get("content", "")
+            cards = self._parse_flashcards_text(text)
+
+            if not cards:
+                logger.warning(f"No flashcards parsed from LLM output for section '{topic['topic']}' (raw length: {len(text)})")
+                return []
+
+            for card in cards:
+                card["section_ref"] = topic["topic"]
+
+            logger.info(f"Flashcards for section '{topic['topic']}': {len(cards)} cards parsed")
+
+            # Incremental insert: save this section's cards immediately
+            try:
+                insert_course_flashcard_set(
+                    course_id=course_id,
+                    flashcards=cards,
+                    set_number=idx + 1,
+                    created_by=user_id,
+                    is_shared=True
+                )
+            except Exception as e:
+                logger.warning(f"Failed to insert flashcard set {idx+1} for course {course_id}: {e}")
+
+            return cards
+
+        all_sections_indexed = list(enumerate(topics))
+        for batch_start in range(0, len(all_sections_indexed), BATCH_SIZE):
+            batch = all_sections_indexed[batch_start:batch_start + BATCH_SIZE]
+            batch_tasks = [generate_section_flashcards(idx, topic) for idx, topic in batch]
+            results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Flashcard generation failed for a section: {result}")
+                    continue
+                all_flashcards.extend(result)
+            if batch_start + BATCH_SIZE < len(all_sections_indexed):
+                await asyncio.sleep(1)
+
+        if not all_flashcards:
+            logger.warning("No flashcards generated across any section")
+            return 0
+
+        for i, card in enumerate(all_flashcards, 1):
+            card["id"] = f"fc_{i}"
+
+        # Still write full set to courses.flashcards JSONB for backward compat
+        self.flashcard_storage.save_flashcards(course_id, all_flashcards)
+
+        return len(all_flashcards)
+
+    async def _generate_notes_quiz(
+        self,
+        course_id: str,
+        user_id: str,
+        topics: List[Dict[str, Any]],
+        all_chunks: List[Dict[str, Any]],
+        profile: 'LearningProfile',
+        model_config: Dict[str, Any],
+        course_title: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Generate quiz for notes-based course using per-section text prompts.
+        Inserts each section's quiz to DB incrementally (one set_number per section).
+        Returns quiz metadata dict or None on failure.
+        """
+        import asyncio
+        from clients.supabase_client import insert_course_quiz_set, delete_course_quiz_sets
+
+        BATCH_SIZE = 4
+        all_questions = {"mcq": [], "fill_in_gap": [], "scenario": []}
+
+        # Clear previous quiz sets for this course before regenerating
+        try:
+            delete_course_quiz_sets(course_id)
+        except Exception as e:
+            logger.warning(f"Failed to delete old quiz sets for course {course_id}: {e}")
+
+        all_topics_summary = "\n".join([
+            f"{i+1}. {t['topic']}: {t.get('description', '')}"
+            for i, t in enumerate(topics)
+        ])
+
+        async def generate_section_quiz(idx: int, topic: Dict[str, Any]) -> Dict[str, Any]:
+            section_context = self._get_chunks_for_notes_section(
+                topic=topic,
+                all_chunks=all_chunks,
+                max_context_tokens=6000
+            )
+
+            prompt = build_notes_quiz_prompt(
+                section_title=topic["topic"],
+                section_content=section_context,
+                all_topics_summary=all_topics_summary,
+                section_number=idx + 1,
+                total_sections=len(topics),
+                expertise=profile.expertise.value,
+                role=profile.role.value,
+                learning_goal=profile.learning_goal.value
+            )
+
+            result = await self._call_model(prompt, model_config, expect_json=False)
+            text = result.get("content", "")
+            parsed = self._parse_quiz_text(text)
+
+            total = sum(len(v) for v in parsed.values())
+            if total == 0:
+                logger.warning(f"No quiz questions parsed from LLM output for section '{topic['topic']}' (raw length: {len(text)})")
+            else:
+                logger.info(f"Quiz for section '{topic['topic']}': {total} questions parsed")
+
+            # Incremental insert: save this section's quiz immediately
+            if total > 0:
+                section_quiz_obj = {
+                    **parsed,
+                    "metadata": {
+                        "total": total,
+                        "by_type": {k: len(v) for k, v in parsed.items()},
+                    }
+                }
+                try:
+                    insert_course_quiz_set(
+                        course_id=course_id,
+                        quiz_obj=section_quiz_obj,
+                        set_number=idx + 1,
+                        title=f"Section {idx+1}: {topic['topic']}",
+                        created_by=user_id,
+                        is_shared=True
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to insert quiz set {idx+1} for course {course_id}: {e}")
+
+            return parsed
+
+        all_sections_indexed = list(enumerate(topics))
+        for batch_start in range(0, len(all_sections_indexed), BATCH_SIZE):
+            batch = all_sections_indexed[batch_start:batch_start + BATCH_SIZE]
+            batch_tasks = [generate_section_quiz(idx, topic) for idx, topic in batch]
+            results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning(f"Quiz generation failed for a section: {result}")
+                    continue
+                for q_type in ("mcq", "fill_in_gap", "scenario"):
+                    all_questions[q_type].extend(result.get(q_type, []))
+            if batch_start + BATCH_SIZE < len(all_sections_indexed):
+                await asyncio.sleep(1)
+
+        total_questions = sum(len(v) for v in all_questions.values())
+        if total_questions == 0:
+            logger.warning("No quiz questions generated across any section")
+            return None
+
+        bloom_counts = {}
+        difficulty_counts = {}
+        for q_type_questions in all_questions.values():
+            for q in q_type_questions:
+                bloom = q.get("bloom", "understand")
+                difficulty = q.get("difficulty", "medium")
+                bloom_counts[bloom] = bloom_counts.get(bloom, 0) + 1
+                difficulty_counts[difficulty] = difficulty_counts.get(difficulty, 0) + 1
+
+        return {
+            "total": total_questions,
+            "by_type": {k: len(v) for k, v in all_questions.items()},
+            "by_bloom": bloom_counts,
+            "by_difficulty": difficulty_counts
+        }
+
+    async def _fetch_notes_context(
+        self,
+        course_id: str,
+        user_id: str,
+        model_config: Dict[str, Any]
+    ) -> tuple:
+        """
+        Shared setup for notes-based flashcard/quiz generation.
+        Fetches chunks, builds doc map, returns (course, topics, normalized_chunks, profile).
+        """
+        from clients.pinecone_client import (
+            fetch_all_document_chunks, fetch_chunks_by_space
+        )
+        from clients.supabase_client import (
+            get_course_by_id, get_documents_in_space
+        )
+
+        course = get_course_by_id(course_id)
+        if not course:
+            raise ValueError(f"Course not found: {course_id}")
+        if course.get("user_id") != user_id:
+            raise ValueError("Not authorized for this course")
+
+        space_id = course.get("space_id")
+
+        if space_id:
+            docs = get_documents_in_space(space_id)
+            doc_ids = [pdf["id"] for pdf in docs.get("pdfs", [])]
+            doc_ids += [yt["id"] for yt in docs.get("yts", [])]
+            if not doc_ids:
+                raise ValueError(f"No documents found in space {space_id}")
+            raw_chunks = fetch_chunks_by_space(
+                space_id=space_id,
+                document_ids=doc_ids,
+                max_chunks_per_doc=2000,
+                target_coverage=0.80
+            )
+        else:
+            raw_chunks = fetch_all_document_chunks(
+                document_id=course_id,
+                space_id=f"course_{course_id}",
+                max_chunks=2000,
+                target_coverage=0.80
+            )
+
+        if not raw_chunks:
+            raise ValueError("No source material found for this course.")
+
+        normalized_chunks = []
+        for i, chunk in enumerate(raw_chunks):
+            metadata = chunk.get("metadata", {})
+            normalized_chunks.append({
+                "chunk_index": i,
+                "text": metadata.get("text", ""),
+                "source_file": metadata.get("source_file", "")
+            })
+
+        doc_map = await self._build_document_map(normalized_chunks, model_config)
+        topics = doc_map.get("topics", [])
+        if not topics:
+            raise ValueError("Document map produced no topics")
+
+        profile = self._get_or_create_profile(user_id, {})
+        title = course.get("title", "")
+
+        return course, topics, normalized_chunks, profile, title
+
+    async def generate_notes_flashcards(
+        self,
+        course_id: str,
+        user_id: str,
+        model: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Public method: generate flashcards from course source materials.
+        Standalone endpoint — does not require generate_notes() to run first.
+        """
+        start_time = time.time()
+        model_config = ModelConfig.get_config(model)
+
+        course, topics, normalized_chunks, profile, title = await self._fetch_notes_context(
+            course_id, user_id, model_config
+        )
+
+        flashcard_count = await self._generate_notes_flashcards(
+            course_id, user_id, topics, normalized_chunks, profile, model_config, title
+        )
+
+        generation_time = round(time.time() - start_time, 2)
+        logger.info(f"Generated {flashcard_count} flashcards for course {course_id} in {generation_time}s")
+
+        return {
+            "course_id": course_id,
+            "flashcard_count": flashcard_count,
+            "sections_processed": len(topics),
+            "model_used": model_config["model"],
+            "generation_time_seconds": generation_time
+        }
+
+    async def generate_notes_quiz(
+        self,
+        course_id: str,
+        user_id: str,
+        model: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Public method: generate quiz from course source materials.
+        Standalone endpoint — does not require generate_notes() to run first.
+        """
+        start_time = time.time()
+        model_config = ModelConfig.get_config(model)
+
+        course, topics, normalized_chunks, profile, title = await self._fetch_notes_context(
+            course_id, user_id, model_config
+        )
+
+        quiz_meta = await self._generate_notes_quiz(
+            course_id, user_id, topics, normalized_chunks, profile, model_config, title
+        )
+
+        generation_time = round(time.time() - start_time, 2)
+        logger.info(f"Generated quiz for course {course_id} in {generation_time}s: {quiz_meta}")
+
+        return {
+            "course_id": course_id,
+            "has_quiz": quiz_meta is not None,
+            "quiz_summary": quiz_meta,
+            "sections_processed": len(topics),
+            "model_used": model_config["model"],
+            "generation_time_seconds": generation_time
         }
