@@ -22,6 +22,9 @@ Complete POC for AI-powered course generation with the following features:
 13. **Final Exam**: On-demand exam generation (MCQ + fill-in-the-gap + theory, configurable 30 or 50 questions)
 15. **Exam Grading**: Submit answers for automated grading — instant MCQ/fill-in-gap, LLM-based theory with per-rubric-point breakdown, persistent attempt history
 14. **Parallel Document Processing**: Files, YouTube URLs, and web URLs processed concurrently with semaphores
+16. **Course Notes Generation**: On-demand comprehensive study notes from source materials (space-based or file-based), stored in `courses.summary_md`. Auto-updates course title/topic/slug from document analysis, generates study guide.
+17. **Notes Flashcards**: On-demand spaced-repetition flashcards from source materials. Text-based LLM output parsed into JSON. Format mix: cloze, application, compare/contrast, cause-effect, reversal. Saved to both `courses.flashcards` JSONB and `flashcard_sets` table.
+18. **Notes Quiz**: On-demand comprehensive quiz from source materials. Bloom's taxonomy distribution, MCQ + fill-in-gap + scenario question types. Saved to `quiz_sets` table.
 
 ### File Structure
 ```
@@ -62,6 +65,16 @@ nuton_rag/
 - `POST /api/v1/courses/{course_id}/ask` - Ask questions (with optional `user_id` for persistent chat)
 - `GET /api/v1/courses/{course_id}/chat-history?user_id=X` - Get chat history
 - `DELETE /api/v1/courses/{course_id}/chat-history?user_id=X` - Clear chat history
+
+### Course Notes (on-demand from source materials)
+- `POST /api/v1/courses/{course_id}/generate-notes` - Generate comprehensive notes from source materials (30-120s)
+- `GET /api/v1/courses/{course_id}/notes` - Get stored notes (markdown)
+
+### Notes Flashcards & Quiz (on-demand from source materials)
+- `POST /api/v1/courses/{course_id}/generate-notes-flashcards` - Generate spaced-repetition flashcards (incrementally saved per section)
+- `GET /api/v1/courses/{course_id}/notes-flashcards` - Get flashcards (partial during generation, full after)
+- `POST /api/v1/courses/{course_id}/generate-notes-quiz` - Generate Bloom's taxonomy quiz (incrementally saved per section)
+- `GET /api/v1/courses/{course_id}/notes-quiz` - Get quiz questions (partial during generation, full after)
 
 ### Study Guide & Flashcards (auto-generated during course creation)
 - `GET /api/v1/courses/{course_id}/study-guide` - Get study guide
@@ -344,7 +357,161 @@ curl "http://localhost:8000/api/v1/courses/{course_id}/exam/{exam_id}/attempts?u
 curl http://localhost:8000/api/v1/courses/{course_id}/exam/{exam_id}/attempts/{attempt_id}
 ```
 
+### 18. Generate Course Notes
+```bash
+curl -X POST http://localhost:8000/api/v1/courses/{course_id}/generate-notes \
+  -F "user_id=user-123" \
+  -F "model=claude-haiku-4-5"
+```
+
+**Response** (30-120s depending on source material size):
+```json
+{
+  "course_id": "uuid",
+  "title": "Updated Title from Document Analysis",
+  "slug": "updated-title-from-document-analysis",
+  "topic": "Main Topic",
+  "notes_length": 15000,
+  "sections_generated": 8,
+  "model_used": "claude-haiku-4-5",
+  "has_study_guide": true,
+  "generation_time_seconds": 65.2,
+  "summary_md": "# Full Markdown Notes\n\n## Section 1: ...\n\n..."
+}
+```
+
+Notes generation flow:
+1. Fetches all source chunks from Pinecone (space-based or file-based courses)
+2. Builds a document map (topic-to-chunk mapping)
+3. Updates course title, topic, and slug from document analysis
+4. Generates intro + sections (batched parallel, 4 at a time) + conclusion with sources
+5. Saves to `courses.summary_md` column
+6. Generates a study guide from the notes content
+
+### 19. Get Course Notes
+```bash
+curl http://localhost:8000/api/v1/courses/{course_id}/notes
+```
+
+**Response**:
+```json
+{
+  "course_id": "uuid",
+  "title": "Course Title",
+  "notes_length": 15000,
+  "summary_md": "# Full Markdown Notes\n\n## Table of Contents\n..."
+}
+```
+
+### 20. Generate Notes Flashcards
+```bash
+curl -X POST http://localhost:8000/api/v1/courses/{course_id}/generate-notes-flashcards \
+  -F "user_id=user-123" \
+  -F "model=claude-haiku-4-5"
+```
+
+**Response**:
+```json
+{
+  "course_id": "uuid",
+  "flashcard_count": 42,
+  "model_used": "claude-haiku-4-5",
+  "generation_time_seconds": 35.1
+}
+```
+
+Flashcard format mix: cloze (~40%), application (~25%), compare/contrast (~15%), cause-effect (~10%), reversal (~10%). Each card includes front, back, hint, concept, difficulty, and section reference. Saved to both `courses.flashcards` JSONB and `flashcard_sets` table.
+
+### 21. Generate Notes Quiz
+```bash
+curl -X POST http://localhost:8000/api/v1/courses/{course_id}/generate-notes-quiz \
+  -F "user_id=user-123" \
+  -F "model=claude-haiku-4-5"
+```
+
+**Response**:
+```json
+{
+  "course_id": "uuid",
+  "total_questions": 28,
+  "by_type": {"mcq": 14, "fill_in_gap": 7, "scenario": 7},
+  "by_bloom": {"remember": 4, "understand": 7, "apply": 9, "analyze": 6, "evaluate": 2},
+  "by_difficulty": {"easy": 8, "medium": 14, "hard": 6},
+  "model_used": "claude-haiku-4-5",
+  "generation_time_seconds": 40.3
+}
+```
+
+Quiz uses Bloom's taxonomy distribution calibrated to learner expertise. Question types: MCQ (~50%), fill-in-gap (~25%), scenario-based (~25%). Saved to `quiz_sets` table.
+
+### 22. Get Notes Flashcards (incremental)
+```bash
+curl http://localhost:8000/api/v1/courses/{course_id}/notes-flashcards
+```
+
+**Response** (partial results appear during generation, full set after):
+```json
+{
+  "course_id": "uuid",
+  "total": 42,
+  "sets_count": 8,
+  "flashcards": [
+    {"front": "...", "back": "...", "hint": "...", "concept": "...", "difficulty": "medium", "section_ref": "Section Title"}
+  ]
+}
+```
+
+### 23. Get Notes Quiz (incremental)
+```bash
+curl http://localhost:8000/api/v1/courses/{course_id}/notes-quiz
+```
+
+**Response** (partial results appear during generation, full set after):
+```json
+{
+  "course_id": "uuid",
+  "total_questions": 28,
+  "sets_count": 8,
+  "by_type": {"mcq": 14, "fill_in_gap": 7, "scenario": 7},
+  "quiz": {
+    "mcq": [...],
+    "fill_in_gap": [...],
+    "scenario": [...]
+  }
+}
+```
+
 ## Key Features
+
+### Course Notes Generation (On-Demand)
+Generates comprehensive study notes from course source materials stored in Pinecone:
+- **Space-based courses**: Fetches chunks from all documents in the space (PDFs + YouTube), tags vectors with `course_id`
+- **File-based courses**: Fetches chunks stored during course creation with `document_id=course_id`
+- **Document map**: Builds structured topic-to-chunk mapping, then generates notes section-by-section
+- **3-phase generation**: Intro (with TOC) + sections (batched parallel, 4 at a time) + conclusion (with sources)
+- **Personalized**: Full learner profile integration (12 role-goal combos, expertise/depth/example/format modifiers)
+- **Auto-updates**: Course title, topic, and slug derived from document analysis
+- **Study guide**: Automatically generated from the notes content
+
+### Notes Flashcards (On-Demand from Source Materials)
+Generates spaced-repetition optimized flashcards directly from course source materials:
+- **Incremental insertion**: Each section's flashcards are saved to `flashcard_sets` immediately as they complete — poll `GET /notes-flashcards` to see partial progress
+- **Format mix**: Cloze (~40%), application (~25%), compare/contrast (~15%), cause-effect (~10%), reversal (~10%)
+- **Anti-patterns enforced**: No "What is X?" definitional cards, no yes/no, no enumeration/listing cards
+- **Per-card fields**: Front, back, hint (activates recall without giving away answer), concept, difficulty, type
+- **Dual storage**: `courses.flashcards` JSONB column (full set at end) + `flashcard_sets` table (one row per section, incremental)
+- **Text-to-JSON parsing**: LLM generates structured text, parsed via regex into JSON (more reliable than direct JSON generation)
+- **Re-generation safe**: Previous sets are deleted before new generation starts
+
+### Notes Quiz (On-Demand from Source Materials)
+Generates comprehensive assessment quizzes using Bloom's cognitive taxonomy:
+- **Incremental insertion**: Each section's quiz is saved to `quiz_sets` immediately as it completes — poll `GET /notes-quiz` to see partial progress
+- **Bloom's distribution** (calibrated to expertise): Remember 15%, Understand 25%, Apply 30%, Analyze 20%, Evaluate 10%
+- **Question types**: MCQ (~50%), fill-in-gap (~25%), scenario-based (~25%)
+- **Cross-section interleaving**: Questions reference connections between topics for deeper learning
+- **MCQ quality**: All distractors test common misconceptions, explanations cover every option
+- **Saved to** `quiz_sets` table with one row per section (incremental) and full metadata (by_bloom, by_type, by_difficulty breakdowns)
+- **Re-generation safe**: Previous sets are deleted before new generation starts
 
 ### Parallel Document Processing
 Files, YouTube URLs, and web URLs are processed concurrently using `asyncio.gather` with semaphores:
@@ -405,13 +572,15 @@ All data stored in Supabase (PostgreSQL):
 | Table | Purpose |
 |-------|---------|
 | `learning_profiles` | User learning preferences (format, depth, role, goal, examples) |
-| `courses` | Course metadata, outline, personalization params, study_guide (jsonb), flashcards (jsonb) |
+| `courses` | Course metadata, outline, personalization params, study_guide (jsonb), flashcards (jsonb), summary_md (text) |
 | `chapters` | Full chapter content, quiz, sources, key concepts |
 | `course_progress` | Per-chapter completion status and time tracking |
 | `course_quiz_attempts` | Individual quiz attempt scores and answers |
 | `course_exams` | On-demand final exams (MCQ + fill-in-gap + theory) |
 | `course_chat_messages` | Persistent chat history per course per user |
 | `course_exam_attempts` | Graded exam submissions with scores and rubric breakdowns |
+| `flashcard_sets` | Standalone flashcard sets (course-based via `course_id` or content-based via `content_id`) |
+| `quiz_sets` | Standalone quiz sets with Bloom's taxonomy metadata |
 
 Generation logs are still stored locally in `course_generation_logs.json` for debugging.
 
