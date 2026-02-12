@@ -902,6 +902,358 @@ INSTRUCTIONS:
 
 
 # Error recovery prompts
+def build_course_notes_intro_prompt(
+    document_title: str,
+    topics: List[Dict[str, Any]],
+    expertise: str,
+    role: str,
+    learning_goal: str,
+    depth_pref: str,
+    example_pref: str,
+    format_pref: str
+) -> str:
+    """Build prompt for generating the introduction section of course notes."""
+    personalization = _build_personalization_strategy(
+        expertise=expertise,
+        role=role,
+        learning_goal=learning_goal,
+        depth_pref=depth_pref,
+        example_pref=example_pref,
+        format_pref=format_pref
+    )
+
+    toc_lines = []
+    for i, topic in enumerate(topics, 1):
+        toc_lines.append(f"{i}. **{topic['topic']}** — {topic.get('description', '')}")
+    toc_text = "\n".join(toc_lines)
+
+    return f"""You are an expert academic note-taker producing the most comprehensive, well-structured study notes a student has ever seen.
+
+Generate the INTRODUCTION section for study notes on "{document_title}".
+
+LEARNER PROFILE:
+- Role: {role}
+- Learning Goal: {learning_goal}
+- Expertise: {expertise}
+
+PERSONALIZATION:
+{personalization}
+
+DOCUMENT SECTIONS (Table of Contents):
+{toc_text}
+
+GENERATE THE FOLLOWING (raw markdown, NOT JSON):
+
+1. **Title heading**: Start with `# {document_title}` as an H1
+2. **Overview paragraph**: 2-3 sentences explaining what these notes cover and why this material matters to the learner. Be specific, not generic.
+3. **Table of Contents**: A numbered list of all sections (use the topics above) — each as a markdown link anchor like `[Section Name](#section-name)`
+4. **How to Use These Notes**: A brief section (3-4 bullets) explaining how the learner should approach these notes given their role and goal.
+
+OUTPUT: Raw markdown only. Start with the H1 title. No JSON. No code blocks."""
+
+
+def build_course_notes_section_prompt(
+    section_title: str,
+    section_description: str,
+    source_material: str,
+    section_number: int,
+    total_sections: int,
+    prev_section_title: Optional[str],
+    next_section_title: Optional[str],
+    expertise: str,
+    role: str,
+    learning_goal: str,
+    depth_pref: str,
+    example_pref: str,
+    format_pref: str
+) -> str:
+    """Build prompt for generating a single section of course notes."""
+    personalization = _build_personalization_strategy(
+        expertise=expertise,
+        role=role,
+        learning_goal=learning_goal,
+        depth_pref=depth_pref,
+        example_pref=example_pref,
+        format_pref=format_pref
+    )
+
+    position_context = ""
+    if prev_section_title:
+        position_context += f"Previous section: \"{prev_section_title}\"\n"
+    if next_section_title:
+        position_context += f"Next section: \"{next_section_title}\"\n"
+
+    return f"""You are an expert academic note-taker producing the most comprehensive, well-structured study notes a student has ever seen.
+
+TASK: Generate thorough study notes for section {section_number} of {total_sections}.
+
+SECTION: "{section_title}"
+DESCRIPTION: {section_description}
+{position_context}
+PERSONALIZATION:
+{personalization}
+
+SOURCE MATERIAL:
+{source_material}
+
+INSTRUCTIONS:
+
+First, analyze ALL the source material above. Identify every concept, definition, relationship, example, and key insight. Then organize into clear, logical notes following the structure below.
+
+REQUIRED STRUCTURE (raw markdown, starting with ## {section_title}):
+
+1. **Opening**: 1-2 sentences connecting this section to the learner's context. If this is not the first section, briefly bridge from the previous section.
+
+2. **Core Content**: For EVERY concept found in the source material:
+   - **Definition/Explanation**: What it is, stated clearly
+   - **Why It Matters**: Why the learner should care (1-2 sentences)
+   - **Example or Application**: A concrete illustration
+   - **Relationships**: How it connects to other concepts in this section or earlier sections
+
+3. **Visual Aids** (where appropriate):
+   - Comparison tables for related concepts
+   - Numbered process/step lists
+   - Structured hierarchies with bullet points
+
+4. **Key Insight Callouts**: Use `> **Key Insight:** ...` blockquote format for critical understanding moments — the "aha" ideas.
+
+5. **Common Pitfalls**: Use `> **Common Pitfall:** ...` for frequent misunderstandings or errors.
+
+6. **Section Summary**: 3-5 bullet points capturing the essential takeaways.
+
+QUALITY RULES:
+- Never skip a concept from the source material. Every piece of information should appear.
+- Never be superficial — explain WHY, not just WHAT.
+- Never use filler phrases like "it's important to note" or "in today's world".
+- Use inline citations: `[Source Section N]` referencing the source material labels.
+- Build from foundational concepts to advanced nuances (progressive disclosure).
+- If this section relates to previous or next sections, include brief cross-references.
+
+OUTPUT: Raw markdown only. Start with `## {section_title}`. No JSON. No code blocks."""
+
+
+def build_course_notes_conclusion_prompt(
+    document_title: str,
+    topics: List[Dict[str, Any]],
+    source_urls: List[Dict[str, str]],
+    expertise: str,
+    role: str,
+    learning_goal: str
+) -> str:
+    """Build prompt for generating the conclusion + sources section of course notes."""
+    topics_text = "\n".join([
+        f"- {t['topic']}: {t.get('description', '')}"
+        for t in topics
+    ])
+
+    sources_text = ""
+    if source_urls:
+        for src in source_urls:
+            name = src.get("name", "Source")
+            url = src.get("url", "")
+            if url:
+                sources_text += f"- [{name}]({url})\n"
+            else:
+                sources_text += f"- {name}\n"
+
+    return f"""You are an expert academic note-taker completing the study notes for "{document_title}".
+
+LEARNER PROFILE:
+- Role: {role}
+- Learning Goal: {learning_goal}
+- Expertise: {expertise}
+
+ALL SECTIONS COVERED:
+{topics_text}
+
+SOURCE MATERIALS:
+{sources_text if sources_text else "No external source URLs available."}
+
+GENERATE THE FOLLOWING (raw markdown, NOT JSON):
+
+1. **Conclusion heading**: Start with `## Key Relationships & Synthesis`
+   - 3-5 bullet points showing how the major topics connect to each other
+   - Highlight the most important cross-cutting themes
+
+2. **Master Review Checklist**: `## Review Checklist`
+   - A checklist (using `- [ ]`) of 8-12 items the learner should be able to explain or do after studying these notes
+   - Ordered from foundational to advanced
+
+3. **Further Study**: `## Further Study`
+   - 3-5 specific recommendations for deepening understanding
+   - Tailored to the learner's role ({role}) and goal ({learning_goal})
+
+4. **Sources**: `## Sources`
+   - List ALL source materials as clickable markdown links (provided above)
+   - If no URLs are available, note that these notes were generated from uploaded materials
+
+OUTPUT: Raw markdown only. Start with the `## Key Relationships & Synthesis` heading. No JSON. No code blocks."""
+
+
+def build_notes_flashcards_prompt(
+    section_title: str,
+    section_content: str,
+    section_number: int,
+    total_sections: int,
+    expertise: str,
+    role: str,
+    learning_goal: str
+) -> str:
+    """Build prompt for generating flashcards from a notes section. Text output, not JSON."""
+
+    expertise_calibration = {
+        "beginner": "Use simple, clear language. Define technical terms on the card back. Hints should activate prior knowledge from everyday experience.",
+        "intermediate": "Assume foundational vocabulary is known. Cards should test application and connections, not definitions. Hints should reference related concepts.",
+        "advanced": "Skip basic definitions entirely. Cards should test nuance, edge cases, trade-offs, and synthesis across concepts. Hints should reference underlying principles."
+    }
+
+    return f"""You are an expert educator specializing in creating flashcards optimized for long-term retention using spaced repetition principles.
+
+TASK: Create flashcards for section {section_number} of {total_sections}: "{section_title}"
+
+LEARNER PROFILE:
+- Expertise: {expertise}
+- Role: {role}
+- Learning Goal: {learning_goal}
+
+{expertise_calibration.get(expertise, expertise_calibration["intermediate"])}
+
+SOURCE MATERIAL:
+{section_content}
+
+INSTRUCTIONS:
+First, identify every testable concept in the source material above. Then for each concept, determine the best card format from the distribution below.
+
+CARD FORMAT DISTRIBUTION (follow approximately):
+- Cloze (~40%): "The {{{{c1::process name}}}} converts X to Y by..." — tests recall in context
+- Application (~25%): "Given scenario X, what approach would..." — tests transfer to new situations
+- Compare/Contrast (~15%): "How does X differ from Y in terms of..." — tests discrimination
+- Cause-Effect (~10%): "What happens to X when Y changes because..." — tests causal reasoning
+- Reversal (~10%): Front=answer/definition, Back=question — reverse testing strengthens recall
+
+STRICTLY FORBIDDEN (do NOT create these):
+- "What is X?" definitional cards — test understanding, not dictionary recall
+- Yes/no or true/false cards — too easy to guess
+- Cards requiring enumeration ("List all...") — untestable via flashcard
+- Cards with answers longer than 2-3 sentences — break into atomic cards
+- Cards answerable without understanding the material — test comprehension
+
+REQUIREMENTS:
+- Generate 6-10 cards depending on content density
+- Every card must cite a specific concept from the source material
+- Hints should activate recall without giving away the answer
+- Each card tests ONE concept only (atomic)
+
+OUTPUT FORMAT — structured text, each card separated by ---:
+
+CARD 1
+Type: cloze
+Front: The {{{{c1::process name}}}} is responsible for converting raw input into...
+Back: [process name] — because it handles [specific mechanism from source]
+Hint: Think about what happens during the first stage of [topic]
+Concept: [specific concept from source material]
+Difficulty: basic
+---
+CARD 2
+Type: application
+Front: A {role} needs to [scenario]. Based on {section_title}, what approach should they take?
+Back: They should [specific approach] because [reasoning from source material]
+Hint: Consider the principle of [related concept]
+Concept: [specific concept]
+Difficulty: intermediate
+---
+
+Output ONLY the structured text cards. No JSON. No code blocks. No preamble. Start with "CARD 1"."""
+
+
+def build_notes_quiz_prompt(
+    section_title: str,
+    section_content: str,
+    all_topics_summary: str,
+    section_number: int,
+    total_sections: int,
+    expertise: str,
+    role: str,
+    learning_goal: str
+) -> str:
+    """Build prompt for generating quiz questions from a notes section. Text output, not JSON."""
+
+    bloom_calibration = {
+        "beginner": "Weight toward Remember (25%) and Understand (35%). Use Apply (25%) with guided scenarios. Limit Analyze (10%) and Evaluate (5%).",
+        "intermediate": "Follow standard distribution: Remember 15%, Understand 25%, Apply 30%, Analyze 20%, Evaluate 10%.",
+        "advanced": "Weight toward higher levels: Remember 5%, Understand 15%, Apply 25%, Analyze 30%, Evaluate/Create 25%."
+    }
+
+    return f"""You are an expert assessment designer creating quizzes that test genuine understanding across Bloom's cognitive taxonomy.
+
+TASK: Create quiz questions for section {section_number} of {total_sections}: "{section_title}"
+
+LEARNER PROFILE:
+- Expertise: {expertise}
+- Role: {role}
+- Learning Goal: {learning_goal}
+
+BLOOM'S DISTRIBUTION:
+{bloom_calibration.get(expertise, bloom_calibration["intermediate"])}
+
+SOURCE MATERIAL FOR THIS SECTION:
+{section_content}
+
+ALL TOPICS IN THIS COURSE (for cross-referencing):
+{all_topics_summary}
+
+INSTRUCTIONS:
+Generate 5-8 questions that test genuine understanding. Mix question types as follows:
+- MCQ (~50%): 4 options, exactly 1 correct. All distractors must be plausible (based on common misconceptions). Explanation must cover ALL options.
+- Fill-in-gap (~25%): Meaningful context sentence with one blank. Tests key terminology in context, NOT just "X is _____".
+- Scenario-based (~25%): Realistic application situations requiring multi-step reasoning.
+
+STRICTLY FORBIDDEN:
+- Trivia or obscure detail questions
+- Ambiguous questions with multiple defensible answers
+- "All of the above" or "None of the above" options
+- Questions answerable from general knowledge alone
+
+REQUIREMENTS:
+- Interleave: questions CAN reference earlier sections to reinforce connections
+- Each question must specify its Bloom's level
+- MCQ explanations must explain why EACH option is right or wrong
+- Fill-in-gap must use meaningful context sentences
+
+OUTPUT FORMAT — structured text, each question separated by ---:
+
+QUESTION 1
+Type: mcq
+Bloom: apply
+Question: A {role} encounters [realistic scenario]. Based on the principles of {section_title}, which approach would be most effective?
+Options: A) [plausible but wrong — common misconception] | B) [correct answer] | C) [plausible but wrong — different error] | D) [plausible but wrong — oversimplification]
+Correct: B
+Explanation: B is correct because [detailed reasoning]. A is wrong because [specific misconception it represents]. C fails because [why]. D oversimplifies by [what it misses].
+Section: {section_title}
+Difficulty: medium
+---
+QUESTION 2
+Type: fill_in_gap
+Bloom: remember
+Question: In the context of {section_title}, the _____ is responsible for [meaningful process description].
+Answer: [correct term]
+Explanation: [Why this term is important and how it fits in context]
+Section: {section_title}
+Difficulty: easy
+---
+QUESTION 3
+Type: scenario
+Bloom: analyze
+Question: [Multi-sentence scenario describing a realistic situation]. Analyze the situation and determine [specific analytical question].
+Answer: [Detailed answer with reasoning steps]
+Explanation: [Step-by-step breakdown of the analysis]
+Section: {section_title}
+Difficulty: hard
+---
+
+Output ONLY the structured text questions. No JSON. No code blocks. No preamble. Start with "QUESTION 1"."""
+
+
 RETRY_PROMPT_ADDENDUM = """
 
 Note: A previous generation attempt had issues. Please:
