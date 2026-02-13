@@ -2275,6 +2275,12 @@ Return ONLY a JSON object:
         if not course:
             raise ValueError(f"Course not found: {course_id}")
 
+        # Determine the correct space_id for Pinecone search
+        # Space-based courses store chunks under the original space_id,
+        # while file-based courses use "course_{course_id}"
+        original_space_id = course.get("space_id")
+        pinecone_space_id = original_space_id if original_space_id else f"course_{course_id}"
+
         # Fetch chat history if user_id provided
         chat_history = []
         if user_id:
@@ -2296,10 +2302,10 @@ Return ONLY a JSON object:
         query_result = embed_query_multimodal(question)
         query_emb = query_result["embedding"]
 
-        # Search Pinecone filtered by course namespace
+        # Search Pinecone filtered by course's space
         search_results = hybrid_search(
             query_emb=query_emb,
-            space_id=f"course_{course_id}",
+            space_id=pinecone_space_id,
             top_k=top_k * 2  # Over-fetch for reranking
         )
 
