@@ -3,7 +3,7 @@ FastAPI routes for Course Generation.
 Clean, well-documented endpoints following REST conventions.
 """
 
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from typing import List, Optional
 import asyncio
@@ -12,7 +12,7 @@ import logging
 import re
 import time
 
-from services.course_service import CourseService, CourseGenerationError
+from services.course_service import CourseService
 from services.wetrocloud_youtube import WetroCloudYouTubeService
 from clients.jina_reader_client import extract_web_content
 from utils.file_storage import ProgressStorage
@@ -23,6 +23,9 @@ from clients.supabase_client import (
 )
 from models.course_models import (
     LearningProfileRequest, ProgressUpdateRequest
+)
+from utils.exceptions import (
+    NutonError, ValidationError, NotFoundError, GenerationError,
 )
 
 # File processing imports
@@ -54,19 +57,15 @@ async def create_learning_profile(request: LearningProfileRequest):
     5. learning_goal: exams/career/curiosity/supplement
     6. example_pref: real_world/technical/stories/analogies
     """
-    try:
-        success = course_service.save_learning_profile(request.dict())
-        if not success:
-            raise HTTPException(status_code=500, detail="Failed to save profile")
-        
-        return {
-            "success": True,
-            "profile": request.dict(),
-            "message": "Learning preferences saved"
-        }
-    except Exception as e:
-        logger.error(f"Error saving learning profile: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    success = course_service.save_learning_profile(request.dict())
+    if not success:
+        raise GenerationError("Failed to save profile", error_code="INTERNAL_ERROR")
+
+    return {
+        "success": True,
+        "profile": request.dict(),
+        "message": "Learning preferences saved"
+    }
 
 
 @router.get("/learning-profile/{user_id}")
@@ -106,7 +105,7 @@ async def create_course_from_topic(
     provide supplementary context.
 
     Source params (all optional, can be combined):
-    - files: PDF/PPTX/DOCX/TXT/MD uploads (max 10, 50MB each)
+    - files: PDF/PPTX/DOCX/TXT/MD/PNG/JPG/WEBP uploads (max 10, 50MB each)
     - youtube_urls: JSON array of YouTube URLs, e.g. '["https://youtube.com/watch?v=abc"]'
     - web_urls: JSON array of web URLs, e.g. '["https://example.com/article"]'
 
@@ -120,69 +119,59 @@ async def create_course_from_topic(
     - llama-4-scout: Fastest, cheapest, Perplexity search fallback
     - llama-4-maverick: Fast, affordable, Perplexity search fallback
     """
+    # Validate model if provided
+    if model and model not in ModelConfig.get_available_models():
+        raise ValidationError(
+            f"Invalid model. Available: {ModelConfig.get_available_models()}",
+            error_code="INVALID_MODEL",
+            context={"model": model},
+        )
+
+    # Parse URL lists
     try:
-        # Validate model if provided
-        if model and model not in ModelConfig.get_available_models():
-            available = ModelConfig.get_available_models()
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid model. Available: {available}"
-            )
+        yt_urls = _parse_url_list(youtube_urls)
+        w_urls = _parse_url_list(web_urls)
+    except ValueError as e:
+        raise ValidationError(str(e), error_code="INVALID_URL_FORMAT")
 
-        # Parse URL lists
-        try:
-            yt_urls = _parse_url_list(youtube_urls)
-            w_urls = _parse_url_list(web_urls)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+    # Validate file count
+    has_files = files and len(files) > 0 and files[0].filename
+    if has_files and len(files) > 10:
+        raise ValidationError("Maximum 10 files allowed", error_code="FILE_LIMIT_EXCEEDED")
 
-        # Validate file count
-        has_files = files and len(files) > 0 and files[0].filename
-        if has_files and len(files) > 10:
-            raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
+    # Build merged source list (process all source types concurrently)
+    tasks = []
+    if has_files:
+        tasks.append(_process_uploaded_files(files, model=model))
+    if yt_urls:
+        tasks.append(_process_youtube_urls(yt_urls, model=model))
+    if w_urls:
+        tasks.append(_process_web_urls(w_urls, model=model))
 
-        # Build merged source list (process all source types concurrently)
-        tasks = []
-        if has_files:
-            tasks.append(_process_uploaded_files(files, model=model))
-        if yt_urls:
-            tasks.append(_process_youtube_urls(yt_urls, model=model))
-        if w_urls:
-            tasks.append(_process_web_urls(w_urls, model=model))
+    all_processed = []
+    if tasks:
+        results = await asyncio.gather(*tasks)
+        for result in results:
+            all_processed.extend(result)
 
-        all_processed = []
-        if tasks:
-            results = await asyncio.gather(*tasks)
-            for result in results:
-                all_processed.extend(result)
+    # Route to appropriate service method
+    if all_processed:
+        result = await course_service.create_course_from_topic_with_files(
+            user_id=user_id,
+            topic=topic,
+            files=all_processed,
+            model=model
+        )
+    else:
+        # Pure topic path
+        result = await course_service.create_course_from_topic(
+            user_id=user_id,
+            topic=topic,
+            context={},
+            model=model
+        )
 
-        # Route to appropriate service method
-        if all_processed:
-            result = await course_service.create_course_from_topic_with_files(
-                user_id=user_id,
-                topic=topic,
-                files=all_processed,
-                model=model
-            )
-        else:
-            # Pure topic path
-            result = await course_service.create_course_from_topic(
-                user_id=user_id,
-                topic=topic,
-                context={},
-                model=model
-            )
-
-        return result
-
-    except HTTPException:
-        raise
-    except CourseGenerationError as e:
-        logger.error(f"Course generation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    return result
 
 
 @router.post("/courses/from-files", status_code=201)
@@ -200,7 +189,7 @@ async def create_course_from_files(
     At least one source is required (file, YouTube URL, or web URL).
 
     **Multi-source support:**
-    - Files: PDF/PPTX/DOCX/TXT/MD (max 10, 50MB each)
+    - Files: PDF/PPTX/DOCX/TXT/MD/PNG/JPG/WEBP (max 10, 50MB each)
     - youtube_urls: JSON array of YouTube URLs, e.g. '["https://youtube.com/watch?v=abc"]'
     - web_urls: JSON array of web URLs, e.g. '["https://example.com/article"]'
 
@@ -214,73 +203,63 @@ async def create_course_from_files(
     - Single course: `{course_id, status, course, generation_time_seconds, ...}`
     - Separate courses: `{organization: "separate_courses", total_courses, courses: [...]}`
     """
-    try:
-        # Validate model
-        if model and model not in ModelConfig.get_available_models():
-            available = ModelConfig.get_available_models()
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid model. Available: {available}"
-            )
-
-        # Parse URL lists
-        try:
-            yt_urls = _parse_url_list(youtube_urls)
-            w_urls = _parse_url_list(web_urls)
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-        # Validate file count
-        has_files = files and len(files) > 0 and files[0].filename
-        if has_files and len(files) > 10:
-            raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
-
-        # Require at least one source
-        if not has_files and not yt_urls and not w_urls:
-            raise HTTPException(
-                status_code=400,
-                detail="At least 1 source required (file, YouTube URL, or web URL)"
-            )
-
-        # Build merged source list (process all source types concurrently)
-        tasks = []
-        if has_files:
-            tasks.append(_process_uploaded_files(files, model=model))
-        if yt_urls:
-            tasks.append(_process_youtube_urls(yt_urls, model=model))
-        if w_urls:
-            tasks.append(_process_web_urls(w_urls, model=model))
-
-        all_processed = []
-        if tasks:
-            results = await asyncio.gather(*tasks)
-            for result in results:
-                all_processed.extend(result)
-
-        if not all_processed:
-            raise HTTPException(
-                status_code=400,
-                detail="No usable content extracted from provided sources"
-            )
-
-        # Generate course
-        result = await course_service.create_course_from_files(
-            user_id=user_id,
-            files=all_processed,
-            organization=organization,
-            model=model
+    # Validate model
+    if model and model not in ModelConfig.get_available_models():
+        raise ValidationError(
+            f"Invalid model. Available: {ModelConfig.get_available_models()}",
+            error_code="INVALID_MODEL",
+            context={"model": model},
         )
 
-        return result
+    # Parse URL lists
+    try:
+        yt_urls = _parse_url_list(youtube_urls)
+        w_urls = _parse_url_list(web_urls)
+    except ValueError as e:
+        raise ValidationError(str(e), error_code="INVALID_URL_FORMAT")
 
-    except HTTPException:
-        raise
-    except CourseGenerationError as e:
-        logger.error(f"File course generation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    # Validate file count
+    has_files = files and len(files) > 0 and files[0].filename
+    if has_files and len(files) > 10:
+        raise ValidationError("Maximum 10 files allowed", error_code="FILE_LIMIT_EXCEEDED")
+
+    # Require at least one source
+    if not has_files and not yt_urls and not w_urls:
+        raise ValidationError(
+            "At least 1 source required (file, YouTube URL, or web URL)",
+            error_code="MISSING_SOURCE",
+        )
+
+    # Build merged source list (process all source types concurrently)
+    tasks = []
+    if has_files:
+        tasks.append(_process_uploaded_files(files, model=model))
+    if yt_urls:
+        tasks.append(_process_youtube_urls(yt_urls, model=model))
+    if w_urls:
+        tasks.append(_process_web_urls(w_urls, model=model))
+
+    all_processed = []
+    if tasks:
+        results = await asyncio.gather(*tasks)
+        for result in results:
+            all_processed.extend(result)
+
+    if not all_processed:
+        raise ValidationError(
+            "No usable content extracted from provided sources",
+            error_code="NO_CONTENT_EXTRACTED",
+        )
+
+    # Generate course
+    result = await course_service.create_course_from_files(
+        user_id=user_id,
+        files=all_processed,
+        organization=organization,
+        model=model
+    )
+
+    return result
 
 
 # SSE Streaming Helpers
@@ -288,6 +267,31 @@ async def create_course_from_files(
 def _sse_event(data: dict) -> str:
     """Format a dict as an SSE data line."""
     return f"data: {json.dumps(data, default=str)}\n\n"
+
+
+def _sse_error_event(
+    exc: Exception,
+    phase: str = "stream",
+    error_code: str = "INTERNAL_ERROR",
+    status_code: int = 500,
+    context: Optional[dict] = None,
+) -> str:
+    """Build a structured SSE error event from an exception."""
+    if isinstance(exc, NutonError):
+        error_code = exc.error_code
+        status_code = exc.status_code
+        context = exc.context
+        message = exc.message
+    else:
+        message = str(exc)
+    return _sse_event({
+        "type": "error",
+        "error": error_code,
+        "message": message,
+        "status_code": status_code,
+        "phase": phase,
+        "context": context,
+    })
 
 
 # SSE Streaming Endpoints
@@ -310,23 +314,23 @@ async def create_course_from_topic_stream(
     - course_complete: all done with timing
     - error: on failure
     """
-    # Pre-stream validation (can still return HTTP errors)
+    # Pre-stream validation (raises before stream starts → global handler returns JSON)
     if model and model not in ModelConfig.get_available_models():
-        available = ModelConfig.get_available_models()
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid model. Available: {available}"
+        raise ValidationError(
+            f"Invalid model. Available: {ModelConfig.get_available_models()}",
+            error_code="INVALID_MODEL",
+            context={"model": model},
         )
 
     try:
         yt_urls = _parse_url_list(youtube_urls)
         w_urls = _parse_url_list(web_urls)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise ValidationError(str(e), error_code="INVALID_URL_FORMAT")
 
     has_files = files and len(files) > 0 and files[0].filename
     if has_files and len(files) > 10:
-        raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
+        raise ValidationError("Maximum 10 files allowed", error_code="FILE_LIMIT_EXCEEDED")
 
     async def event_generator():
         try:
@@ -383,11 +387,7 @@ async def create_course_from_topic_stream(
 
         except Exception as e:
             logger.error(f"SSE stream error: {e}")
-            yield _sse_event({
-                "type": "error",
-                "message": str(e),
-                "phase": "stream"
-            })
+            yield _sse_error_event(e, phase="stream")
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -407,26 +407,26 @@ async def create_course_from_files_stream(
     """
     # Pre-stream validation
     if model and model not in ModelConfig.get_available_models():
-        available = ModelConfig.get_available_models()
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid model. Available: {available}"
+        raise ValidationError(
+            f"Invalid model. Available: {ModelConfig.get_available_models()}",
+            error_code="INVALID_MODEL",
+            context={"model": model},
         )
 
     try:
         yt_urls = _parse_url_list(youtube_urls)
         w_urls = _parse_url_list(web_urls)
     except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        raise ValidationError(str(e), error_code="INVALID_URL_FORMAT")
 
     has_files = files and len(files) > 0 and files[0].filename
     if has_files and len(files) > 10:
-        raise HTTPException(status_code=400, detail="Maximum 10 files allowed")
+        raise ValidationError("Maximum 10 files allowed", error_code="FILE_LIMIT_EXCEEDED")
 
     if not has_files and not yt_urls and not w_urls:
-        raise HTTPException(
-            status_code=400,
-            detail="At least 1 source required (file, YouTube URL, or web URL)"
+        raise ValidationError(
+            "At least 1 source required (file, YouTube URL, or web URL)",
+            error_code="MISSING_SOURCE",
         )
 
     async def event_generator():
@@ -456,11 +456,10 @@ async def create_course_from_files_stream(
                     all_processed.extend(result)
 
             if not all_processed:
-                yield _sse_event({
-                    "type": "error",
-                    "message": "No usable content extracted from provided sources",
-                    "phase": "source_processing"
-                })
+                yield _sse_error_event(
+                    ValidationError("No usable content extracted from provided sources", error_code="NO_CONTENT_EXTRACTED"),
+                    phase="source_processing",
+                )
                 return
 
             # Stream course generation
@@ -474,11 +473,7 @@ async def create_course_from_files_stream(
 
         except Exception as e:
             logger.error(f"SSE stream error: {e}")
-            yield _sse_event({
-                "type": "error",
-                "message": str(e),
-                "phase": "stream"
-            })
+            yield _sse_error_event(e, phase="stream")
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
@@ -495,14 +490,14 @@ async def get_course(course_id: str):
     - Progress information (if available)
     """
     course = course_service.get_course(course_id)
-    
+
     if not course:
-        raise HTTPException(status_code=404, detail="Course not found")
-    
+        raise NotFoundError("Course not found", error_code="COURSE_NOT_FOUND", context={"course_id": course_id})
+
     # Get progress if available
     progress_storage = ProgressStorage()
     progress = progress_storage.load_progress(course["user_id"], course_id)
-    
+
     return {
         "course": course,
         "progress": progress
@@ -519,7 +514,7 @@ async def get_course_by_slug(slug: str):
 
     course = db_get_course_by_slug(slug)
     if not course:
-        raise HTTPException(status_code=404, detail="Course not found")
+        raise NotFoundError("Course not found", error_code="COURSE_NOT_FOUND", context={"slug": slug})
 
     # Attach chapters
     chapters = get_chapters_by_course(course["id"])
@@ -539,17 +534,17 @@ async def get_course_by_slug(slug: str):
 async def get_chapter(course_id: str, chapter_order: int):
     """
     Retrieve specific chapter by order number (1-indexed).
-    
+
     Returns full chapter content including:
     - Markdown content
     - Quiz questions
     - Source citations
     """
     chapter = course_service.get_chapter(course_id, chapter_order)
-    
+
     if not chapter:
-        raise HTTPException(status_code=404, detail="Chapter not found")
-    
+        raise NotFoundError("Chapter not found", error_code="CHAPTER_NOT_FOUND", context={"course_id": course_id, "chapter_order": chapter_order})
+
     return {"chapter": chapter}
 
 
@@ -575,54 +570,47 @@ async def update_progress(course_id: str, request: ProgressUpdateRequest):
     - Quiz scores
     - Time spent
     """
-    try:
-        course = course_service.get_course(course_id)
-        if not course:
-            raise HTTPException(status_code=404, detail="Course not found")
+    course = course_service.get_course(course_id)
+    if not course:
+        raise NotFoundError("Course not found", error_code="COURSE_NOT_FOUND", context={"course_id": course_id})
 
-        user_id = course["user_id"]
-        now = time.strftime("%Y-%m-%dT%H:%M:%SZ")
+    user_id = course["user_id"]
+    now = time.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        # Upsert chapter progress directly to Supabase
-        upsert_chapter_progress(
+    # Upsert chapter progress directly to Supabase
+    upsert_chapter_progress(
+        user_id=user_id,
+        course_id=course_id,
+        chapter_id=request.chapter_id,
+        completed=request.completed,
+        time_spent_minutes=request.time_spent_minutes or 0,
+        completed_at=now if request.completed else None,
+    )
+
+    # Insert quiz attempt if score provided
+    if request.quiz_score is not None:
+        insert_course_quiz_attempt(
             user_id=user_id,
-            course_id=course_id,
             chapter_id=request.chapter_id,
-            completed=request.completed,
-            time_spent_minutes=request.time_spent_minutes or 0,
-            completed_at=now if request.completed else None,
+            score=request.quiz_score,
+            completed_at=now,
         )
 
-        # Insert quiz attempt if score provided
-        if request.quiz_score is not None:
-            insert_course_quiz_attempt(
-                user_id=user_id,
-                chapter_id=request.chapter_id,
-                score=request.quiz_score,
-                completed_at=now,
-            )
+    # Re-query to compute overall stats
+    rows = get_chapter_progress_for_course(user_id, course_id)
+    total = course["total_chapters"]
+    completed_count = sum(1 for r in rows if r.get("completed"))
+    percentage = round((completed_count / total) * 100) if total > 0 else 0
 
-        # Re-query to compute overall stats
-        rows = get_chapter_progress_for_course(user_id, course_id)
-        total = course["total_chapters"]
-        completed_count = sum(1 for r in rows if r.get("completed"))
-        percentage = round((completed_count / total) * 100) if total > 0 else 0
-
-        return {
-            "success": True,
-            "overall_progress": {
-                "completed_chapters": completed_count,
-                "total_chapters": total,
-                "percentage": percentage,
-                "last_activity": now,
-            }
+    return {
+        "success": True,
+        "overall_progress": {
+            "completed_chapters": completed_count,
+            "total_chapters": total,
+            "percentage": percentage,
+            "last_activity": now,
         }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error updating progress: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    }
 
 
 @router.get("/users/{user_id}/progress")
@@ -667,19 +655,13 @@ async def ask_course_question(
     Uses Pinecone vector search to find relevant chunks from the original documents.
     When user_id is provided, maintains persistent chat history (Redis cache + Supabase).
     """
-    try:
-        result = await course_service.query_course(
-            course_id=course_id,
-            question=question,
-            model=model,
-            user_id=user_id
-        )
-        return result
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error(f"Course Q&A error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    result = await course_service.query_course(
+        course_id=course_id,
+        question=question,
+        model=model,
+        user_id=user_id
+    )
+    return result
 
 
 # Notes Generation Endpoints
@@ -697,23 +679,18 @@ async def generate_notes(
     This is a blocking operation that may take 30-120s depending on material size.
     """
     if model and model not in ModelConfig.get_available_models():
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid model. Available: {ModelConfig.get_available_models()}"
+        raise ValidationError(
+            f"Invalid model. Available: {ModelConfig.get_available_models()}",
+            error_code="INVALID_MODEL",
+            context={"model": model},
         )
 
-    try:
-        result = await course_service.generate_notes(
-            course_id=course_id,
-            user_id=user_id,
-            model=model
-        )
-        return result
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error(f"Notes generation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    result = await course_service.generate_notes(
+        course_id=course_id,
+        user_id=user_id,
+        model=model
+    )
+    return result
 
 
 @router.post("/courses/{course_id}/generate-notes-flashcards", status_code=201)
@@ -730,23 +707,18 @@ async def generate_notes_flashcards(
     This is a blocking operation that may take 30-90s depending on material size.
     """
     if model and model not in ModelConfig.get_available_models():
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid model. Available: {ModelConfig.get_available_models()}"
+        raise ValidationError(
+            f"Invalid model. Available: {ModelConfig.get_available_models()}",
+            error_code="INVALID_MODEL",
+            context={"model": model},
         )
 
-    try:
-        result = await course_service.generate_notes_flashcards(
-            course_id=course_id,
-            user_id=user_id,
-            model=model
-        )
-        return result
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error(f"Notes flashcard generation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    result = await course_service.generate_notes_flashcards(
+        course_id=course_id,
+        user_id=user_id,
+        model=model
+    )
+    return result
 
 
 @router.post("/courses/{course_id}/generate-notes-quiz", status_code=201)
@@ -763,23 +735,18 @@ async def generate_notes_quiz(
     This is a blocking operation that may take 30-90s depending on material size.
     """
     if model and model not in ModelConfig.get_available_models():
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid model. Available: {ModelConfig.get_available_models()}"
+        raise ValidationError(
+            f"Invalid model. Available: {ModelConfig.get_available_models()}",
+            error_code="INVALID_MODEL",
+            context={"model": model},
         )
 
-    try:
-        result = await course_service.generate_notes_quiz(
-            course_id=course_id,
-            user_id=user_id,
-            model=model
-        )
-        return result
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error(f"Notes quiz generation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    result = await course_service.generate_notes_quiz(
+        course_id=course_id,
+        user_id=user_id,
+        model=model
+    )
+    return result
 
 
 @router.get("/courses/{course_id}/notes-flashcards")
@@ -792,7 +759,7 @@ async def get_notes_flashcards(course_id: str):
 
     sets = get_course_flashcard_sets(course_id)
     if not sets:
-        raise HTTPException(status_code=404, detail="No flashcard sets found for this course. Generate them first via POST /generate-notes-flashcards.")
+        raise NotFoundError("No flashcard sets found for this course. Generate them first via POST /generate-notes-flashcards.", error_code="FLASHCARDS_NOT_FOUND", context={"course_id": course_id})
 
     all_cards = []
     for s in sets:
@@ -818,7 +785,7 @@ async def get_notes_quiz(course_id: str):
 
     sets = get_course_quiz_sets(course_id)
     if not sets:
-        raise HTTPException(status_code=404, detail="No quiz sets found for this course. Generate them first via POST /generate-notes-quiz.")
+        raise NotFoundError("No quiz sets found for this course. Generate them first via POST /generate-notes-quiz.", error_code="QUIZ_NOT_FOUND", context={"course_id": course_id})
 
     merged = {"mcq": [], "fill_in_gap": [], "scenario": []}
     for s in sets:
@@ -849,11 +816,11 @@ async def get_course_notes(course_id: str):
 
     course = get_course_by_id(course_id)
     if not course:
-        raise HTTPException(status_code=404, detail="Course not found")
+        raise NotFoundError("Course not found", error_code="COURSE_NOT_FOUND", context={"course_id": course_id})
 
     summary_md = course.get("summary_md")
     if not summary_md:
-        raise HTTPException(status_code=404, detail="Notes not yet generated. Call POST /generate-notes first.")
+        raise NotFoundError("Notes not yet generated. Call POST /generate-notes first.", error_code="NOTES_NOT_FOUND", context={"course_id": course_id})
 
     return {
         "course_id": course_id,
@@ -870,7 +837,7 @@ async def get_study_guide(course_id: str):
     from utils.file_storage import StudyGuideStorage
     study_guide = StudyGuideStorage.get_study_guide(course_id)
     if not study_guide:
-        raise HTTPException(status_code=404, detail="Study guide not found. It may still be generating.")
+        raise NotFoundError("Study guide not found. It may still be generating.", error_code="STUDY_GUIDE_NOT_FOUND", context={"course_id": course_id})
     return {"course_id": course_id, "study_guide": study_guide}
 
 
@@ -881,7 +848,7 @@ async def get_flashcards(course_id: str):
     from utils.file_storage import FlashcardStorage
     flashcards = FlashcardStorage.get_flashcards(course_id)
     if not flashcards:
-        raise HTTPException(status_code=404, detail="Flashcards not found. They may still be generating.")
+        raise NotFoundError("Flashcards not found. They may still be generating.", error_code="FLASHCARDS_NOT_FOUND", context={"course_id": course_id})
     return {"course_id": course_id, "total": len(flashcards), "flashcards": flashcards}
 
 
@@ -891,7 +858,7 @@ async def get_chapter_flashcards(course_id: str, chapter_order: int):
     from clients.supabase_client import get_chapter_by_order
     chapter = get_chapter_by_order(course_id, chapter_order)
     if not chapter:
-        raise HTTPException(status_code=404, detail="Chapter not found")
+        raise NotFoundError("Chapter not found", error_code="CHAPTER_NOT_FOUND", context={"course_id": course_id, "chapter_order": chapter_order})
     flashcards = chapter.get("flashcards") or []
     return {
         "course_id": course_id,
@@ -915,24 +882,18 @@ async def generate_exam(
     exam_size: 30 (15 MCQ / 8 fill-in / 7 theory) or 50 (25 MCQ / 15 fill-in / 10 theory)
     """
     if exam_size not in (30, 50):
-        raise HTTPException(status_code=400, detail="exam_size must be 30 or 50")
+        raise ValidationError("exam_size must be 30 or 50", error_code="INVALID_EXAM_SIZE", context={"exam_size": exam_size})
 
     if model and model not in ModelConfig.get_available_models():
-        raise HTTPException(status_code=400, detail=f"Invalid model. Available: {ModelConfig.get_available_models()}")
+        raise ValidationError(f"Invalid model. Available: {ModelConfig.get_available_models()}", error_code="INVALID_MODEL", context={"model": model})
 
-    try:
-        result = await course_service.generate_final_exam(
-            course_id=course_id,
-            user_id=user_id,
-            exam_size=exam_size,
-            model=model
-        )
-        return result
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error(f"Exam generation error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    result = await course_service.generate_final_exam(
+        course_id=course_id,
+        user_id=user_id,
+        exam_size=exam_size,
+        model=model
+    )
+    return result
 
 
 @router.get("/courses/{course_id}/exam")
@@ -941,7 +902,7 @@ async def get_exam(course_id: str, user_id: Optional[str] = None):
     from utils.file_storage import ExamStorage
     exam = ExamStorage.get_exam(course_id, user_id)
     if not exam:
-        raise HTTPException(status_code=404, detail="No exam found. Generate one first.")
+        raise NotFoundError("No exam found. Generate one first.", error_code="EXAM_NOT_FOUND", context={"course_id": course_id})
     return exam
 
 
@@ -969,32 +930,26 @@ async def submit_exam(
     try:
         parsed_answers = json.loads(answers)
     except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="answers must be valid JSON")
+        raise ValidationError("answers must be valid JSON", error_code="INVALID_JSON")
 
     # Validate answer structure
     for key in ("mcq", "fill_in_gap", "theory"):
         if key not in parsed_answers:
-            raise HTTPException(status_code=400, detail=f"answers must contain '{key}' array")
+            raise ValidationError(f"answers must contain '{key}' array", error_code="INVALID_ANSWERS_FORMAT")
         if not isinstance(parsed_answers[key], list):
-            raise HTTPException(status_code=400, detail=f"answers.{key} must be an array")
+            raise ValidationError(f"answers.{key} must be an array", error_code="INVALID_ANSWERS_FORMAT")
 
     if model and model not in ModelConfig.get_available_models():
-        raise HTTPException(status_code=400, detail=f"Invalid model. Available: {ModelConfig.get_available_models()}")
+        raise ValidationError(f"Invalid model. Available: {ModelConfig.get_available_models()}", error_code="INVALID_MODEL", context={"model": model})
 
-    try:
-        result = await course_service.grade_exam_submission(
-            exam_id=exam_id,
-            user_id=user_id,
-            answers=parsed_answers,
-            model=model,
-            time_taken_seconds=time_taken_seconds
-        )
-        return result
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
-    except Exception as e:
-        logger.error(f"Exam submission error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    result = await course_service.grade_exam_submission(
+        exam_id=exam_id,
+        user_id=user_id,
+        answers=parsed_answers,
+        model=model,
+        time_taken_seconds=time_taken_seconds
+    )
+    return result
 
 
 @router.get("/courses/{course_id}/exam/{exam_id}/attempts")
@@ -1004,7 +959,7 @@ async def get_exam_attempts(course_id: str, exam_id: str, user_id: Optional[str]
     Returns a list of attempts with scores and timestamps (without full results for brevity).
     """
     if not user_id:
-        raise HTTPException(status_code=400, detail="user_id query parameter is required")
+        raise ValidationError("user_id query parameter is required", error_code="MISSING_REQUIRED_FIELD")
 
     from utils.file_storage import ExamAttemptStorage
     attempts = ExamAttemptStorage.get_attempts(exam_id, user_id)
@@ -1024,7 +979,7 @@ async def get_exam_attempt_detail(course_id: str, exam_id: str, attempt_id: str)
     from utils.file_storage import ExamAttemptStorage
     attempt = ExamAttemptStorage.get_attempt_by_id(attempt_id)
     if not attempt:
-        raise HTTPException(status_code=404, detail="Attempt not found")
+        raise NotFoundError("Attempt not found", error_code="ATTEMPT_NOT_FOUND", context={"attempt_id": attempt_id})
     return attempt
 
 
@@ -1033,7 +988,7 @@ async def get_exam_attempt_detail(course_id: str, exam_id: str, attempt_id: str)
 async def get_chat_history(course_id: str, user_id: Optional[str] = None, limit: int = 20):
     """Get chat history for a course+user pair."""
     if not user_id:
-        raise HTTPException(status_code=400, detail="user_id is required")
+        raise ValidationError("user_id is required", error_code="MISSING_REQUIRED_FIELD")
     from utils.file_storage import ChatStorage
     messages = ChatStorage.get_messages(course_id, user_id, limit=limit)
     return {"course_id": course_id, "user_id": user_id, "messages": messages}
@@ -1043,7 +998,7 @@ async def get_chat_history(course_id: str, user_id: Optional[str] = None, limit:
 async def clear_chat_history(course_id: str, user_id: Optional[str] = None):
     """Clear chat history for a course+user pair."""
     if not user_id:
-        raise HTTPException(status_code=400, detail="user_id is required")
+        raise ValidationError("user_id is required", error_code="MISSING_REQUIRED_FIELD")
     from utils.file_storage import ChatStorage
     ChatStorage.clear_messages(course_id, user_id)
     # Also clear Redis cache
@@ -1056,24 +1011,38 @@ async def clear_chat_history(course_id: str, user_id: Optional[str] = None):
 
 
 # Helper functions
-ALLOWED_EXTENSIONS = {".pdf", ".pptx", ".ppt", ".docx", ".doc", ".txt", ".md"}
+ALLOWED_EXTENSIONS = {".pdf", ".pptx", ".docx", ".txt", ".md", ".png", ".jpg", ".jpeg", ".webp"}
 MAX_FILE_SIZE_MB = 50
 
 
 async def _process_uploaded_files(files: List[UploadFile], model: Optional[str] = None) -> List[dict]:
     """Process uploaded files with OCR and topic extraction (parallel).
-    Also fires off S3 uploads in the background so source files are persisted."""
-    from clients.s3_client import build_s3_key, get_s3_url, fire_and_forget_upload, get_content_type
+    Also fires off S3 uploads in the background so source files are persisted.
+
+    Extraction strategy by format:
+    - .txt/.md          → plaintext read (UTF-8)
+    - .pdf              → Mistral OCR (with legacy fallback)
+    - .png/.jpg/.jpeg/.webp → Mistral OCR image processing
+    - .docx/.pptx       → S3 upload (blocking) → Jina Reader → python-docx/pptx fallback
+    """
+    from clients.s3_client import (
+        build_s3_key, get_s3_url, get_s3_presigned_url,
+        fire_and_forget_upload, upload_bytes_to_s3_async, get_content_type,
+    )
     from utils.file_storage import generate_uuid as gen_uuid
 
-    # Initialize Mistral OCR
+    # Initialize Mistral OCR (for PDFs and images)
     mistral_config = MistralOCRConfig(
         enhance_metadata_with_llm=True,
         fallback_method="legacy",
-        include_images=False
+        include_images=True,
     )
     extractor = MistralOCRExtractor(config=mistral_config)
     semaphore = asyncio.Semaphore(3)
+
+    PLAINTEXT_EXTS = {".txt", ".md"}
+    OFFICE_EXTS = {".docx", ".pptx"}
+    IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
 
     # Validate all files first (instant, sequential)
     file_data = []
@@ -1093,15 +1062,14 @@ async def _process_uploaded_files(files: List[UploadFile], model: Optional[str] 
 
     async def _process_single_file(file, ext, content):
         async with semaphore:
-            # Fire off S3 upload in the background (non-blocking)
             file_id = gen_uuid()
             s3_key = build_s3_key(file_id, file.filename)
             s3_url = get_s3_url(s3_key)
             content_type = get_content_type(file.filename)
-            fire_and_forget_upload(s3_key, content, content_type)
 
-            plaintext_extensions = {".txt", ".md"}
-            if ext in plaintext_extensions:
+            # --- Plaintext ---
+            if ext in PLAINTEXT_EXTS:
+                fire_and_forget_upload(s3_key, content, content_type)
                 text = content.decode("utf-8", errors="replace")
                 if not text.strip():
                     raise ValueError(f"No text extracted from {file.filename}")
@@ -1113,7 +1081,47 @@ async def _process_uploaded_files(files: List[UploadFile], model: Optional[str] 
                     "source_url": s3_url, "source_type": "text",
                 }
 
-            # OCR-based extraction — run sync OCR in thread
+            # --- Office documents (DOCX/PPTX) via Jina Reader ---
+            if ext in OFFICE_EXTS:
+                # Blocking S3 upload — we need the URL before calling Jina
+                uploaded = await upload_bytes_to_s3_async(s3_key, content, content_type)
+                if not uploaded:
+                    raise ValueError(f"S3 upload failed for {file.filename}")
+
+                # Presigned URL for Jina (temporary access, 15 min)
+                presigned_url = get_s3_presigned_url(s3_key)
+                text = await _extract_office_via_jina(presigned_url, file.filename, ext, content)
+                topic = await _extract_topic(text[:2000], model=model)
+                source_type = "pptx" if ext == ".pptx" else "docx"
+                logger.info(f"Processed {file.filename}: {topic} ({len(text)} chars, {source_type})")
+                return {
+                    "filename": file.filename, "topic": topic,
+                    "extracted_text": text, "pages": 0, "char_count": len(text),
+                    "source_url": s3_url, "source_type": source_type,
+                }
+
+            # --- Images via Mistral OCR ---
+            if ext in IMAGE_EXTS:
+                fire_and_forget_upload(s3_key, content, content_type)
+                temp_path = _save_temp_file(file, content)
+                try:
+                    extraction = await asyncio.to_thread(extractor.process_document, temp_path)
+                    text = extraction.get('full_text', '')
+                    if not text:
+                        raise ValueError(f"No text extracted from {file.filename}")
+                    topic = await _extract_topic(text[:2000], model=model)
+                    logger.info(f"Processed {file.filename}: {topic} ({len(text)} chars, image OCR)")
+                    return {
+                        "filename": file.filename, "topic": topic,
+                        "extracted_text": text, "pages": 1, "char_count": len(text),
+                        "source_url": s3_url, "source_type": "image",
+                    }
+                finally:
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+
+            # --- PDF via Mistral OCR (existing path) ---
+            fire_and_forget_upload(s3_key, content, content_type)
             temp_path = _save_temp_file(file, content)
             try:
                 extraction = await asyncio.to_thread(extractor.process_document, temp_path)
@@ -1136,6 +1144,70 @@ async def _process_uploaded_files(files: List[UploadFile], model: Optional[str] 
         _process_single_file(f, ext, content) for f, ext, content in file_data
     ])
     return list(results)
+
+
+async def _extract_office_via_jina(s3_url: str, filename: str, ext: str, content: bytes) -> str:
+    """Extract text from office documents via Jina Reader (S3 URL), with native fallback.
+
+    Primary:  Jina Reader API via S3 URL
+    Fallback: python-docx (for .docx) or python-pptx (for .pptx)
+    """
+    # Primary: Jina Reader
+    try:
+        logger.info(f"Extracting {filename} via Jina Reader: {s3_url}")
+        result = await asyncio.to_thread(extract_web_content, s3_url, 60)
+        if result.get("success") and result.get("text", "").strip():
+            text = result["text"]
+            logger.info(f"Jina Reader extracted {len(text)} chars from {filename}")
+            return text
+        logger.warning(f"Jina Reader returned no content for {filename}, trying native fallback")
+    except Exception as e:
+        logger.warning(f"Jina Reader failed for {filename}: {e}, trying native fallback")
+
+    # Fallback: python-docx / python-pptx
+    return _extract_office_native(filename, ext, content)
+
+
+def _extract_office_native(filename: str, ext: str, content: bytes) -> str:
+    """Fallback extraction using python-docx or python-pptx."""
+    import io
+
+    if ext == ".docx":
+        try:
+            from docx import Document
+            doc = Document(io.BytesIO(content))
+            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+            text = "\n\n".join(paragraphs)
+            if not text.strip():
+                raise ValueError(f"No text extracted from {filename}")
+            logger.info(f"python-docx extracted {len(text)} chars from {filename}")
+            return text
+        except ImportError:
+            raise ValueError(f"python-docx not installed, cannot extract {filename}")
+
+    if ext == ".pptx":
+        try:
+            from pptx import Presentation
+            prs = Presentation(io.BytesIO(content))
+            slides_text = []
+            for slide_num, slide in enumerate(prs.slides, 1):
+                slide_parts = []
+                for shape in slide.shapes:
+                    if shape.has_text_frame:
+                        for para in shape.text_frame.paragraphs:
+                            if para.text.strip():
+                                slide_parts.append(para.text)
+                if slide_parts:
+                    slides_text.append(f"## Slide {slide_num}\n\n" + "\n".join(slide_parts))
+            text = "\n\n".join(slides_text)
+            if not text.strip():
+                raise ValueError(f"No text extracted from {filename}")
+            logger.info(f"python-pptx extracted {len(text)} chars from {filename}")
+            return text
+        except ImportError:
+            raise ValueError(f"python-pptx not installed, cannot extract {filename}")
+
+    raise ValueError(f"Unsupported office format: {ext}")
 
 
 def _parse_url_list(urls_json: Optional[str]) -> List[str]:
