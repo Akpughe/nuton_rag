@@ -25,6 +25,7 @@ Complete POC for AI-powered course generation with the following features:
 16. **Course Notes Generation**: On-demand comprehensive study notes from source materials (space-based or file-based), stored in `courses.summary_md`. Auto-updates course title/topic/slug from document analysis, generates study guide.
 17. **Notes Flashcards**: On-demand spaced-repetition flashcards from source materials. Text-based LLM output parsed into JSON. Format mix: cloze, application, compare/contrast, cause-effect, reversal. Saved to both `courses.flashcards` JSONB and `flashcard_sets` table.
 18. **Notes Quiz**: On-demand comprehensive quiz from source materials. Bloom's taxonomy distribution, MCQ + fill-in-gap + scenario question types. Saved to `quiz_sets` table.
+19. **Unified Error Responses**: Machine-readable error codes across all ~29 endpoints. Structured `{error, message, detail, status_code, context}` shape for REST, `{type, error, message, status_code, phase, context}` for SSE streams. Global exception handlers eliminate per-route try/except boilerplate.
 
 ### File Structure
 ```
@@ -36,6 +37,7 @@ nuton_rag/
 ├── clients/redis_client.py           # Async Redis client for chat caching
 ├── utils/file_storage.py             # Storage layer (Supabase-backed)
 ├── utils/model_config.py             # Model switching
+├── utils/exceptions.py               # Unified exception hierarchy (NutonError base)
 ├── prompts/course_prompts.py         # All prompts
 ├── supabase/migrations/              # DB schema migrations
 └── pipeline.py                       # Main app (updated with routes)
@@ -479,6 +481,80 @@ curl http://localhost:8000/api/v1/courses/{course_id}/notes-quiz
     "scenario": [...]
   }
 }
+```
+
+## Error Response Format
+
+All endpoints return structured, machine-readable error responses. No more inconsistent `{"detail": "string"}` shapes.
+
+### REST Endpoints
+```json
+{
+  "error": "COURSE_NOT_FOUND",
+  "message": "Course not found",
+  "detail": "Course not found",
+  "status_code": 404,
+  "context": {"course_id": "abc-123"}
+}
+```
+
+- `error`: Machine-readable error code (see table below)
+- `message`: Human-readable description
+- `detail`: Same as `message` (backward compat with FastAPI's default `{"detail":"..."}`)
+- `status_code`: HTTP status code echoed in body
+- `context`: Optional structured metadata (IDs, field names, etc.)
+
+### SSE Streaming Endpoints (error event)
+```json
+{
+  "type": "error",
+  "error": "CHAPTER_GENERATION_FAILED",
+  "message": "Chapter 3 generation failed: JSON parse error",
+  "status_code": 500,
+  "phase": "chapter_generation",
+  "context": {"chapter_num": 3}
+}
+```
+
+SSE streams always return HTTP 200, so `status_code` in the body tells clients the actual error severity.
+
+### Error Codes
+
+| Status | Codes |
+|--------|-------|
+| 400 | `INVALID_MODEL`, `INVALID_JSON`, `INVALID_FILE_TYPE`, `FILE_TOO_LARGE`, `FILE_LIMIT_EXCEEDED`, `MISSING_REQUIRED_FIELD`, `MISSING_SOURCE`, `INVALID_EXAM_SIZE`, `INVALID_ANSWERS_FORMAT`, `INVALID_URL_FORMAT`, `NO_CONTENT_EXTRACTED` |
+| 404 | `COURSE_NOT_FOUND`, `CHAPTER_NOT_FOUND`, `NOTES_NOT_FOUND`, `FLASHCARDS_NOT_FOUND`, `QUIZ_NOT_FOUND`, `STUDY_GUIDE_NOT_FOUND`, `EXAM_NOT_FOUND`, `ATTEMPT_NOT_FOUND` |
+| 500 | `GENERATION_FAILED`, `OUTLINE_GENERATION_FAILED`, `CHAPTER_GENERATION_FAILED`, `EXAM_GENERATION_FAILED`, `NOTES_GENERATION_FAILED`, `FILE_PROCESSING_FAILED`, `STORAGE_ERROR`, `INTERNAL_ERROR` |
+
+### Exception Hierarchy (`utils/exceptions.py`)
+```
+NutonError (base)
+├── ValidationError          → 400
+├── NotFoundError            → 404
+├── GenerationError          → 500
+│   ├── OutlineGenerationError
+│   └── ChapterGenerationError
+└── StorageError             → 500
+```
+
+Three global exception handlers in `pipeline.py` catch all exceptions:
+1. `NutonError` → structured JSON response
+2. `ValueError` → heuristic mapping (safety net during migration)
+3. `Exception` → sanitized `INTERNAL_ERROR` (traceback logged server-side only)
+
+### Example Error Responses
+```bash
+# 404 - Course not found
+curl http://localhost:8000/api/v1/courses/nonexistent-id
+# → {"error":"COURSE_NOT_FOUND","message":"Course not found","detail":"Course not found","status_code":404,"context":{"course_id":"nonexistent-id"}}
+
+# 400 - Invalid model
+curl -X POST http://localhost:8000/api/v1/courses/from-topic -F "user_id=x" -F "topic=test topic here" -F "model=invalid"
+# → {"error":"INVALID_MODEL","message":"Unknown model: invalid...","detail":"...","status_code":400,"context":{"model":"invalid"}}
+
+# 400 - Missing source
+curl -X POST http://localhost:8000/api/v1/courses/from-files -F "user_id=x"
+# → {"error":"MISSING_SOURCE","message":"At least one source required","detail":"...","status_code":400,"context":null}
 ```
 
 ## Key Features
