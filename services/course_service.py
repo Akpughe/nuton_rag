@@ -968,9 +968,13 @@ Return ONLY a JSON object:
         prompt: str,
         model_config: Dict[str, Any],
         expect_json: bool = True,
-        use_search: bool = False
+        use_search: bool = False,
+        max_tokens_override: Optional[int] = None
     ) -> Dict[str, Any]:
         """Call appropriate model based on configuration"""
+
+        if max_tokens_override:
+            model_config = {**model_config, "max_tokens": max_tokens_override}
 
         provider = model_config["provider"]
 
@@ -1046,7 +1050,8 @@ Return ONLY a JSON object:
                 query=prompt,
                 context_chunks=[],
                 system_prompt=system_prompt,
-                model=model_config["model"]
+                model=model_config["model"],
+                max_tokens=model_config.get("max_tokens")
             )
 
             if expect_json and isinstance(response, tuple):
@@ -2257,7 +2262,7 @@ Return ONLY a JSON object:
         course_id: str,
         question: str,
         model: Optional[str] = None,
-        top_k: int = 5,
+        top_k: int = 3,
         user_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
@@ -2336,7 +2341,7 @@ Return ONLY a JSON object:
             question=question
         )
 
-        response = await self._call_model(prompt, model_config, expect_json=False)
+        response = await self._call_model(prompt, model_config, expect_json=False, max_tokens_override=2048)
         answer = response.get("content", "")
 
         source_excerpts = [

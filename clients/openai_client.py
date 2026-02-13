@@ -15,7 +15,8 @@ def generate_answer(
     context_chunks: List[Dict],
     system_prompt: str,
     model: str = "gpt-4o",
-    conversation_history: Optional[List[Dict[str, str]]] = None
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+    max_tokens: Optional[int] = None
 ) -> Tuple[str, List[Dict]]:
     """
     Generate an answer using OpenAI GPT-4o, given a query and context chunks.
@@ -53,10 +54,10 @@ def generate_answer(
     messages.append({"role": "user", "content": f"{query}\n\nContext:\n{context}"})
 
     try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages
-        )
+        params = {"model": model, "messages": messages}
+        if max_tokens:
+            params["max_tokens"] = max_tokens
+        response = client.chat.completions.create(**params)
         answer = response.choices[0].message.content
         return answer, context_chunks
     except Exception as e:
