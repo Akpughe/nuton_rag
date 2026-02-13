@@ -30,6 +30,7 @@ from prompts.course_prompts import (
     build_final_exam_prompt,
     build_theory_grading_prompt,
     build_course_chat_prompt,
+    build_topic_course_chat_prompt,
     build_course_notes_intro_prompt,
     build_course_notes_section_prompt,
     build_course_notes_conclusion_prompt,
@@ -41,24 +42,15 @@ from prompts.course_prompts import (
 import clients.openai_client as openai_client
 from clients.groq_client import generate_answer
 
+from utils.exceptions import (
+    NutonError, NotFoundError, ValidationError, GenerationError,
+    OutlineGenerationError, ChapterGenerationError, StorageError,
+)
+
+# Backward-compat alias used by routes
+CourseGenerationError = GenerationError
+
 logger = logging.getLogger(__name__)
-
-
-class CourseGenerationError(Exception):
-    """Base exception for course generation errors"""
-    pass
-
-
-class OutlineGenerationError(CourseGenerationError):
-    """Failed to generate course outline"""
-    pass
-
-
-class ChapterGenerationError(CourseGenerationError):
-    """Failed to generate chapter"""
-    def __init__(self, chapter_num: int, message: str):
-        self.chapter_num = chapter_num
-        super().__init__(f"Chapter {chapter_num} generation failed: {message}")
 
 
 class CourseService:
@@ -624,9 +616,12 @@ Return ONLY a JSON object:
             logger.error(f"Batched chapter generation failed: {e}")
             yield {
                 "type": "error",
+                "error": "CHAPTER_GENERATION_FAILED",
                 "message": f"Chapter generation failed: {e}",
+                "status_code": 500,
                 "course_id": course_id,
-                "phase": "chapter_generation"
+                "phase": "chapter_generation",
+                "context": None,
             }
             return
 
@@ -826,9 +821,12 @@ Return ONLY a JSON object:
             logger.error(f"Batched chapter generation failed: {e}")
             yield {
                 "type": "error",
+                "error": "CHAPTER_GENERATION_FAILED",
                 "message": f"Chapter generation failed: {e}",
+                "status_code": 500,
                 "course_id": course_id,
-                "phase": "chapter_generation"
+                "phase": "chapter_generation",
+                "context": None,
             }
             return
 
@@ -985,7 +983,7 @@ Return ONLY a JSON object:
         elif provider == "groq":
             return await self._call_groq(prompt, model_config, expect_json)
         else:
-            raise ValueError(f"Unknown provider: {provider}")
+            raise ValidationError(f"Unknown provider: {provider}", error_code="INVALID_MODEL")
     
     async def _call_claude(
         self,
@@ -1195,7 +1193,7 @@ Return ONLY a JSON object:
                     continue
         
         logger.error(f"Could not extract JSON from: {text[:500]}")
-        raise ValueError("Failed to parse JSON response")
+        raise GenerationError("Failed to parse JSON response", error_code="GENERATION_FAILED")
     
     def _get_or_create_profile(
         self,
@@ -1286,7 +1284,7 @@ Return ONLY a JSON object:
         doc_map = await self._call_model(prompt, model_config, expect_json=True)
 
         if not doc_map or "topics" not in doc_map:
-            raise ValueError("Failed to generate document map")
+            raise GenerationError("Failed to generate document map", error_code="GENERATION_FAILED")
 
         # Verify coverage - every chunk should be in at least one topic
         mapped_indices = set()
@@ -1659,9 +1657,12 @@ Return ONLY a JSON object:
             logger.error(f"Streaming course generation failed: {e}")
             yield {
                 "type": "error",
+                "error": "GENERATION_FAILED",
                 "message": str(e),
+                "status_code": 500,
                 "course_id": course_id,
-                "phase": "generation"
+                "phase": "generation",
+                "context": None,
             }
 
     async def create_course_from_topic_with_files_stream(
@@ -1740,9 +1741,12 @@ Return ONLY a JSON object:
             logger.error(f"Streaming topic+files course generation failed: {e}")
             yield {
                 "type": "error",
+                "error": "GENERATION_FAILED",
                 "message": str(e),
+                "status_code": 500,
                 "course_id": course_id,
-                "phase": "generation"
+                "phase": "generation",
+                "context": None,
             }
 
     async def create_course_from_files_stream(
@@ -1850,9 +1854,12 @@ Return ONLY a JSON object:
             logger.error(f"Streaming file course generation failed: {e}")
             yield {
                 "type": "error",
+                "error": "GENERATION_FAILED",
                 "message": str(e),
+                "status_code": 500,
                 "course_id": course_id,
-                "phase": "generation"
+                "phase": "generation",
+                "context": None,
             }
 
     # Public API methods
@@ -2020,11 +2027,11 @@ Return ONLY a JSON object:
         model_config = ModelConfig.get_config(model)
         course = self.storage.get_course(course_id)
         if not course:
-            raise ValueError(f"Course not found: {course_id}")
+            raise NotFoundError("Course not found", error_code="COURSE_NOT_FOUND", context={"course_id": course_id})
 
         chapters = course.get("chapters", [])
         if not chapters:
-            raise ValueError(f"Course {course_id} has no chapters")
+            raise NotFoundError("Course has no chapters", error_code="CHAPTER_NOT_FOUND", context={"course_id": course_id})
 
         chapters_summary = self._build_chapters_summary(chapters)
 
@@ -2087,7 +2094,7 @@ Return ONLY a JSON object:
         # Fetch exam
         exam = self.exam_storage.get_exam_by_id(exam_id)
         if not exam:
-            raise ValueError(f"Exam not found: {exam_id}")
+            raise NotFoundError("Exam not found", error_code="EXAM_NOT_FOUND", context={"exam_id": exam_id})
 
         model_config = ModelConfig.get_config(model)
 
@@ -2278,7 +2285,7 @@ Return ONLY a JSON object:
         # Get course for context
         course = self.get_course(course_id)
         if not course:
-            raise ValueError(f"Course not found: {course_id}")
+            raise NotFoundError("Course not found", error_code="COURSE_NOT_FOUND", context={"course_id": course_id})
 
         # Determine the correct space_id for Pinecone search
         # Space-based courses store chunks under the original space_id,
@@ -2333,13 +2340,30 @@ Return ONLY a JSON object:
 
         rag_context = "\n\n---\n\n".join(context_parts)
 
-        # Build prompt with chat history
-        prompt = build_course_chat_prompt(
-            course_title=course.get("title", ""),
-            rag_context=rag_context,
-            chat_history=chat_history[-10:],  # Last 10 messages
-            question=question
-        )
+        # Build prompt — topic courses get expanded prompt with domain context + broader knowledge
+        source_type = course.get("source_type", "files")
+        if source_type == "topic":
+            outline = course.get("outline", {})
+            chapter_titles = [ch.get("title", "") for ch in outline.get("chapters", [])]
+            personalization = course.get("personalization_params", {})
+
+            prompt = build_topic_course_chat_prompt(
+                course_title=course.get("title", ""),
+                topic=course.get("topic", ""),
+                description=outline.get("description", course.get("description", "")),
+                outline_chapters=chapter_titles,
+                personalization=personalization,
+                rag_context=rag_context,
+                chat_history=chat_history[-10:],
+                question=question
+            )
+        else:
+            prompt = build_course_chat_prompt(
+                course_title=course.get("title", ""),
+                rag_context=rag_context,
+                chat_history=chat_history[-10:],
+                question=question
+            )
 
         response = await self._call_model(prompt, model_config, expect_json=False, max_tokens_override=2048)
         answer = response.get("content", "")
@@ -2497,9 +2521,9 @@ Return ONLY a JSON object:
         # 1. Validate course
         course = get_course_by_id(course_id)
         if not course:
-            raise ValueError(f"Course not found: {course_id}")
+            raise NotFoundError("Course not found", error_code="COURSE_NOT_FOUND", context={"course_id": course_id})
         if course.get("user_id") != user_id:
-            raise ValueError("Not authorized to generate notes for this course")
+            raise ValidationError("Not authorized to generate notes for this course", error_code="MISSING_REQUIRED_FIELD")
 
         space_id = course.get("space_id")
         source_urls: List[Dict[str, str]] = []
@@ -2509,8 +2533,6 @@ Return ONLY a JSON object:
             # Space-based course: fetch chunks from all documents in the space
             docs = get_documents_in_space(space_id)
             doc_ids = []
-            print('docs', docs)
-
 
             for pdf in docs.get("pdfs", []):
                 doc_ids.append(pdf["id"])
@@ -2526,9 +2548,8 @@ Return ONLY a JSON object:
                 if url:
                     source_urls.append({"name": name, "url": url})
 
-            print('')
             if not doc_ids:
-                raise ValueError(f"No documents found in space {space_id}")
+                raise NotFoundError(f"No documents found in space {space_id}", error_code="MISSING_SOURCE", context={"space_id": space_id})
 
             raw_chunks = fetch_chunks_by_space(
                 space_id=space_id,
@@ -2570,7 +2591,7 @@ Return ONLY a JSON object:
             )
 
         if not raw_chunks:
-            raise ValueError("No source material found for this course. Upload files or add to a space first.")
+            raise NotFoundError("No source material found for this course. Upload files or add to a space first.", error_code="MISSING_SOURCE", context={"course_id": course_id})
 
         logger.info(f"Fetched {len(raw_chunks)} raw chunks for notes generation")
 
@@ -2590,7 +2611,7 @@ Return ONLY a JSON object:
         doc_map = await self._build_document_map(normalized_chunks, model_config)
         topics = doc_map.get("topics", [])
         if not topics:
-            raise ValueError("Document map produced no topics")
+            raise GenerationError("Document map produced no topics", error_code="NOTES_GENERATION_FAILED", context={"course_id": course_id})
 
         # 5. Update course title, topic, and slug from document map
         new_title = doc_map.get("document_title", course.get("title", ""))
@@ -3154,9 +3175,9 @@ Return ONLY a JSON object:
 
         course = get_course_by_id(course_id)
         if not course:
-            raise ValueError(f"Course not found: {course_id}")
+            raise NotFoundError("Course not found", error_code="COURSE_NOT_FOUND", context={"course_id": course_id})
         if course.get("user_id") != user_id:
-            raise ValueError("Not authorized for this course")
+            raise ValidationError("Not authorized for this course", error_code="MISSING_REQUIRED_FIELD")
 
         space_id = course.get("space_id")
 
@@ -3165,7 +3186,7 @@ Return ONLY a JSON object:
             doc_ids = [pdf["id"] for pdf in docs.get("pdfs", [])]
             doc_ids += [yt["id"] for yt in docs.get("yts", [])]
             if not doc_ids:
-                raise ValueError(f"No documents found in space {space_id}")
+                raise NotFoundError(f"No documents found in space {space_id}", error_code="MISSING_SOURCE", context={"space_id": space_id})
             raw_chunks = fetch_chunks_by_space(
                 space_id=space_id,
                 document_ids=doc_ids,
@@ -3181,7 +3202,7 @@ Return ONLY a JSON object:
             )
 
         if not raw_chunks:
-            raise ValueError("No source material found for this course.")
+            raise NotFoundError("No source material found for this course.", error_code="MISSING_SOURCE", context={"course_id": course_id})
 
         normalized_chunks = []
         for i, chunk in enumerate(raw_chunks):
@@ -3195,7 +3216,7 @@ Return ONLY a JSON object:
         doc_map = await self._build_document_map(normalized_chunks, model_config)
         topics = doc_map.get("topics", [])
         if not topics:
-            raise ValueError("Document map produced no topics")
+            raise GenerationError("Document map produced no topics", error_code="NOTES_GENERATION_FAILED", context={"course_id": course_id})
 
         profile = self._get_or_create_profile(user_id, {})
         title = course.get("title", "")

@@ -903,6 +903,115 @@ RESPONSE GUIDELINES:
 - Ground answers in the source material above. Reference conversation history naturally if relevant."""
 
 
+def build_topic_course_chat_prompt(
+    course_title: str,
+    topic: str,
+    description: str,
+    outline_chapters: List[str],
+    personalization: Dict[str, Any],
+    rag_context: str,
+    chat_history: List[Dict[str, str]],
+    question: str
+) -> str:
+    """
+    Build prompt for topic-generated course chat.
+
+    Unlike file-based courses, topic courses have no fixed source documents.
+    The LLM uses RAG context from generated chapters as primary reference
+    but is free to draw on broader knowledge to give complete answers.
+    """
+    history_text = ""
+    if chat_history:
+        for msg in chat_history:
+            role_label = "Student" if msg["role"] == "user" else "Assistant"
+            history_text += f"{role_label}: {msg['content']}\n\n"
+
+    history_section = f"""CONVERSATION HISTORY:
+{history_text}""" if history_text else ""
+
+    # Build outline summary
+    outline_text = "\n".join(f"  {i+1}. {ch}" for i, ch in enumerate(outline_chapters))
+
+    # Build personalization context
+    expertise = personalization.get("expertise", "intermediate")
+    role = personalization.get("role", "student")
+    goal = personalization.get("learning_goal", "curiosity")
+    depth = personalization.get("depth_pref", "detailed")
+    example_pref = personalization.get("example_pref", "real_world")
+
+    expertise_map = {
+        "beginner": "The student is a beginner — use plain language, define technical terms, and use analogies.",
+        "intermediate": "The student has foundational knowledge — build on what they know, clarify nuances.",
+        "advanced": "The student is advanced — skip basics, focus on nuances, trade-offs, and edge cases."
+    }
+
+    role_map = {
+        "student": "They are a student — support their learning with clear structure and reinforcement.",
+        "professional": "They are a working professional — be direct, skip academic fluff, focus on actionable knowledge.",
+        "graduate_student": "They are a graduate student — engage with rigor, reference theory, and connect to research."
+    }
+
+    goal_map = {
+        "exams": "They're studying for exams — emphasize testable concepts and precision.",
+        "curiosity": "They're learning out of curiosity — connect to big-picture ideas and make it engaging.",
+        "career": "They're building career skills — tie concepts to real-world applications and industry practice.",
+        "supplement": "They're supplementing coursework — fill gaps and reinforce key points."
+    }
+
+    depth_map = {
+        "quick": "Keep explanations tight and direct. One strong example per concept.",
+        "detailed": "Explain the 'why' behind the 'what'. Multiple examples are welcome when asked.",
+        "conversational": "Be conversational — use 'you' and 'we', pose rhetorical questions, make it a dialogue.",
+        "academic": "Maintain academic rigor — precise language, cite principles, structured reasoning."
+    }
+
+    example_map = {
+        "real_world": "Favor real-world, hands-on examples.",
+        "technical": "Use technical examples, code snippets, and formal demonstrations.",
+        "stories": "Use narrative examples and mini-stories to make concepts memorable.",
+        "analogies": "Use extended analogies mapping abstract concepts to familiar systems."
+    }
+
+    expertise_line = expertise_map.get(expertise, expertise_map["intermediate"])
+    role_line = role_map.get(role, role_map["student"])
+    goal_line = goal_map.get(goal, goal_map["curiosity"])
+    depth_line = depth_map.get(depth, depth_map["detailed"])
+    example_line = example_map.get(example_pref, example_map["real_world"])
+
+    return f"""You are an expert course assistant for the course "{course_title}".
+
+DOMAIN CONTEXT:
+- Topic: {topic}
+- Description: {description}
+- Course outline:
+{outline_text}
+
+STUDENT PROFILE:
+- {expertise_line}
+- {role_line}
+- {goal_line}
+- {depth_line}
+- {example_line}
+
+{history_section}
+COURSE MATERIAL (from this course's chapters):
+{rag_context}
+
+QUESTION: {question}
+
+RESPONSE GUIDELINES:
+- Prioritize the course material above when it covers the topic — cite as [Source N] when referencing it.
+- You are NOT limited to the course material. This course was generated from a topic, not from fixed documents. If the question goes beyond what the course chapters cover, draw on your broader knowledge to give a complete, accurate answer.
+- When supplementing beyond the course material, do so naturally — do not announce "this is beyond the course" unless the student specifically asks what the course covers.
+- Stay within the domain of this course. If the question is unrelated to the topic, briefly redirect.
+- Be CONCISE by default. Answer directly — no preamble, no filler.
+- For factual or definitional questions: 1-3 sentences.
+- For "explain" or "break down" requests: structured, thorough response with examples.
+- Use bullet points or numbered lists for multi-part answers.
+- Adapt your tone and depth to the student profile above.
+- Reference conversation history naturally when relevant."""
+
+
 # Error recovery prompts
 def build_course_notes_intro_prompt(
     document_title: str,

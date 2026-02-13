@@ -12,6 +12,7 @@ from .course_prompts import (
     build_final_exam_prompt,
     build_theory_grading_prompt,
     build_course_chat_prompt,
+    build_topic_course_chat_prompt,
     RETRY_PROMPT_ADDENDUM
 )
 
@@ -26,5 +27,6 @@ __all__ = [
     'build_final_exam_prompt',
     'build_theory_grading_prompt',
     'build_course_chat_prompt',
+    'build_topic_course_chat_prompt',
     'RETRY_PROMPT_ADDENDUM'
 ]
