@@ -344,6 +344,49 @@ class FinalExam(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 
+# Error Response Models (for OpenAPI docs)
+class ErrorCode(str, Enum):
+    # 400
+    INVALID_MODEL = "INVALID_MODEL"
+    INVALID_JSON = "INVALID_JSON"
+    INVALID_FILE_TYPE = "INVALID_FILE_TYPE"
+    FILE_TOO_LARGE = "FILE_TOO_LARGE"
+    FILE_LIMIT_EXCEEDED = "FILE_LIMIT_EXCEEDED"
+    MISSING_REQUIRED_FIELD = "MISSING_REQUIRED_FIELD"
+    MISSING_SOURCE = "MISSING_SOURCE"
+    INVALID_EXAM_SIZE = "INVALID_EXAM_SIZE"
+    INVALID_ANSWERS_FORMAT = "INVALID_ANSWERS_FORMAT"
+    INVALID_URL_FORMAT = "INVALID_URL_FORMAT"
+    NO_CONTENT_EXTRACTED = "NO_CONTENT_EXTRACTED"
+    # 404
+    COURSE_NOT_FOUND = "COURSE_NOT_FOUND"
+    CHAPTER_NOT_FOUND = "CHAPTER_NOT_FOUND"
+    NOTES_NOT_FOUND = "NOTES_NOT_FOUND"
+    FLASHCARDS_NOT_FOUND = "FLASHCARDS_NOT_FOUND"
+    QUIZ_NOT_FOUND = "QUIZ_NOT_FOUND"
+    STUDY_GUIDE_NOT_FOUND = "STUDY_GUIDE_NOT_FOUND"
+    EXAM_NOT_FOUND = "EXAM_NOT_FOUND"
+    ATTEMPT_NOT_FOUND = "ATTEMPT_NOT_FOUND"
+    # 500
+    GENERATION_FAILED = "GENERATION_FAILED"
+    OUTLINE_GENERATION_FAILED = "OUTLINE_GENERATION_FAILED"
+    CHAPTER_GENERATION_FAILED = "CHAPTER_GENERATION_FAILED"
+    EXAM_GENERATION_FAILED = "EXAM_GENERATION_FAILED"
+    NOTES_GENERATION_FAILED = "NOTES_GENERATION_FAILED"
+    FILE_PROCESSING_FAILED = "FILE_PROCESSING_FAILED"
+    STORAGE_ERROR = "STORAGE_ERROR"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
+
+
+class ErrorResponse(BaseModel):
+    """Unified error response shape."""
+    error: str = Field(..., description="Machine-readable error code")
+    message: str = Field(..., description="Human-readable error description")
+    detail: str = Field(..., description="Same as message (backward compat)")
+    status_code: int = Field(..., description="HTTP status code")
+    context: Optional[Dict[str, Any]] = Field(default=None, description="Optional structured metadata")
+
+
 # Model Configuration
 class ModelConfig(BaseModel):
     """Configuration for AI model"""
