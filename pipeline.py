@@ -38,6 +38,62 @@ from routes.course_routes import router as course_router
 
 app = FastAPI()
 
+# ---------------------------------------------------------------------------
+# Global exception handlers — unified error response format
+# ---------------------------------------------------------------------------
+from fastapi import Request
+from utils.exceptions import NutonError
+import traceback
+
+@app.exception_handler(NutonError)
+async def nuton_error_handler(request: Request, exc: NutonError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.error_code,
+            "message": exc.message,
+            "detail": exc.message,
+            "status_code": exc.status_code,
+            "context": exc.context or None,
+        },
+    )
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError):
+    msg = str(exc)
+    if "not found" in msg.lower():
+        status = 404
+        code = "COURSE_NOT_FOUND"
+    else:
+        status = 400
+        code = "INVALID_JSON"
+    return JSONResponse(
+        status_code=status,
+        content={
+            "error": code,
+            "message": msg,
+            "detail": msg,
+            "status_code": status,
+            "context": None,
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_error_handler(request: Request, exc: Exception):
+    logging.getLogger(__name__).error(f"Unhandled exception: {traceback.format_exc()}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "INTERNAL_ERROR",
+            "message": "An internal error occurred",
+            "detail": "An internal error occurred",
+            "status_code": 500,
+            "context": None,
+        },
+    )
+
 # Include course generation routes
 app.include_router(course_router)
 
