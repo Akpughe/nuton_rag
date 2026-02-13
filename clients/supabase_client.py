@@ -5,6 +5,12 @@ from supabase import create_client, Client
 from datetime import datetime
 import logging
 
+
+def _storage_error(message: str) -> Exception:
+    """Lazy import to avoid circular dependency with utils package."""
+    from utils.exceptions import StorageError
+    return StorageError(message)
+
 load_dotenv()
 
 _supabase_client: Optional[Client] = None
@@ -32,7 +38,7 @@ def insert_pdf_record(metadata: Dict[str, Any]) -> str:
     """
     response = get_supabase().table("pdfs").insert(metadata).execute()
     if not response.data or "id" not in response.data[0]:
-        raise Exception(f"Supabase insert failed or id not returned: {response}")
+        raise _storage_error(f"Supabase insert failed or id not returned: {response}")
     return str(response.data[0]["id"])
 
 def insert_yts_record(metadata: Dict[str, Any]) -> str:
@@ -47,7 +53,7 @@ def insert_yts_record(metadata: Dict[str, Any]) -> str:
     """
     response = get_supabase().table("yts").insert(metadata).execute()
     if not response.data or "id" not in response.data[0]:
-        raise Exception(f"Supabase insert failed or id not returned: {response}")
+        raise _storage_error(f"Supabase insert failed or id not returned: {response}")
     return str(response.data[0]["id"])
 
 # get id of generated_content by pdf_id or yt_id
@@ -55,9 +61,9 @@ def get_generated_content_id(document_id: str) -> str:
     response = get_supabase().table('generated_content').select('id').or_(f"pdf_id.eq.{document_id},yt_id.eq.{document_id}").execute()
     print('response', response)
     if not response.data or len(response.data) == 0:
-        raise Exception(f"Supabase get failed or no content found for document: {document_id}")
+        raise _storage_error(f"Supabase get failed or no content found for document: {document_id}")
     if "id" not in response.data[0]:
-        raise Exception(f"Supabase get failed or id not returned: {response}")
+        raise _storage_error(f"Supabase get failed or id not returned: {response}")
     return str(response.data[0]["id"])
 
 def update_generated_content(document_id: str, content: Dict[str, Any]) -> None:
@@ -128,7 +134,7 @@ def insert_flashcard_set(
         response = get_supabase().table("flashcard_sets").update(update_data).eq("id", existing_id).execute()
         
         if not response.data or len(response.data) == 0:
-            raise Exception(f"Flashcard set update failed: {response}")
+            raise _storage_error(f"Flashcard set update failed: {response}")
             
         logging.info(f"Flashcard set updated successfully with created_by: {created_by}, is_shared: {is_shared}")
         return existing_id
@@ -149,7 +155,7 @@ def insert_flashcard_set(
         response = get_supabase().table("flashcard_sets").insert(insert_data).execute()
         
         if not response.data or "id" not in response.data[0]:
-            raise Exception(f"Flashcard set insertion failed: {response}")
+            raise _storage_error(f"Flashcard set insertion failed: {response}")
         
         logging.info(f"Flashcard set created successfully with id: {response.data[0]['id']}, created_by: {created_by}, is_shared: {is_shared}")
         return str(response.data[0]["id"])
@@ -370,7 +376,7 @@ def insert_quiz_set(
         response = get_supabase().table("quiz_sets").update(update_data).eq("id", existing_id).execute()
         
         if not response.data or len(response.data) == 0:
-            raise Exception(f"Quiz set update failed: {response}")
+            raise _storage_error(f"Quiz set update failed: {response}")
         
         logging.info(f"Quiz set updated successfully with created_by: {created_by}, is_shared: {is_shared}")
         return existing_id
@@ -395,7 +401,7 @@ def insert_quiz_set(
         response = get_supabase().table("quiz_sets").insert(insert_data).execute()
         
         if not response.data or "id" not in response.data[0]:
-            raise Exception(f"Quiz set insertion failed: {response}")
+            raise _storage_error(f"Quiz set insertion failed: {response}")
         
         logging.info(f"Quiz set created successfully with id: {response.data[0]['id']}, created_by: {created_by}, is_shared: {is_shared}")
             
@@ -427,7 +433,7 @@ def insert_course_flashcard_set(
 
         response = get_supabase().table("flashcard_sets").update(update_data).eq("id", existing_id).execute()
         if not response.data or len(response.data) == 0:
-            raise Exception(f"Course flashcard set update failed: {response}")
+            raise _storage_error(f"Course flashcard set update failed: {response}")
         return existing_id
     else:
         logging.info(f"Creating new course flashcard set (course_id: {course_id}, set: {set_number})")
@@ -442,7 +448,7 @@ def insert_course_flashcard_set(
 
         response = get_supabase().table("flashcard_sets").insert(insert_data).execute()
         if not response.data or "id" not in response.data[0]:
-            raise Exception(f"Course flashcard set insertion failed: {response}")
+            raise _storage_error(f"Course flashcard set insertion failed: {response}")
         return str(response.data[0]["id"])
 
 
@@ -478,7 +484,7 @@ def insert_course_quiz_set(
 
         response = get_supabase().table("quiz_sets").update(update_data).eq("id", existing_id).execute()
         if not response.data or len(response.data) == 0:
-            raise Exception(f"Course quiz set update failed: {response}")
+            raise _storage_error(f"Course quiz set update failed: {response}")
         return existing_id
     else:
         logging.info(f"Creating new course quiz set (course_id: {course_id}, set: {set_number})")
@@ -497,7 +503,7 @@ def insert_course_quiz_set(
 
         response = get_supabase().table("quiz_sets").insert(insert_data).execute()
         if not response.data or "id" not in response.data[0]:
-            raise Exception(f"Course quiz set insertion failed: {response}")
+            raise _storage_error(f"Course quiz set insertion failed: {response}")
         return str(response.data[0]["id"])
 
 
@@ -635,7 +641,7 @@ def check_document_type(document_id: str) -> Tuple[str, str]:
             return ("youtube", document_id)
         
         # Document not found in either table
-        raise Exception(f"Document {document_id} not found in pdfs or yts table")
+        raise _storage_error(f"Document {document_id} not found in pdfs or yts table")
         
     except Exception as e:
         logging.error(f"Error checking document type for {document_id}: {e}")
@@ -692,7 +698,7 @@ def upsert_generated_content_notes(document_id: str, notes_markdown: str, space_
             response = get_supabase().table("generated_content").update(update_data).eq("id", existing_id).execute()
             
             if not response.data or len(response.data) == 0:
-                raise Exception(f"Failed to update generated_content record: {response}")
+                raise _storage_error(f"Failed to update generated_content record: {response}")
             
             return existing_id
         else:
@@ -703,7 +709,7 @@ def upsert_generated_content_notes(document_id: str, notes_markdown: str, space_
             response = get_supabase().table("generated_content").insert(insert_data).execute()
             
             if not response.data or "id" not in response.data[0]:
-                raise Exception(f"Failed to insert generated_content record: {response}")
+                raise _storage_error(f"Failed to insert generated_content record: {response}")
             
             return str(response.data[0]["id"])
             
@@ -778,7 +784,7 @@ def upsert_learning_profile(profile_data: Dict[str, Any]) -> Dict[str, Any]:
         data, on_conflict="user_id"
     ).execute()
     if not response.data:
-        raise Exception(f"Failed to upsert learning profile: {response}")
+        raise _storage_error(f"Failed to upsert learning profile: {response}")
     return response.data[0]
 
 
@@ -800,7 +806,7 @@ def upsert_course(course_data: Dict[str, Any]) -> Dict[str, Any]:
         data, on_conflict="id"
     ).execute()
     if not response.data:
-        raise Exception(f"Failed to upsert course: {response}")
+        raise _storage_error(f"Failed to upsert course: {response}")
     return response.data[0]
 
 
@@ -838,7 +844,7 @@ def update_course_summary_md(course_id: str, summary_md: str) -> None:
         "summary_md": summary_md
     }).eq("id", course_id).execute()
     if not response.data:
-        raise Exception(f"Failed to update summary_md for course {course_id}")
+        raise _storage_error(f"Failed to update summary_md for course {course_id}")
     logging.info(f"Updated summary_md for course {course_id} ({len(summary_md)} chars)")
 
 
@@ -858,7 +864,7 @@ def upsert_chapter(chapter_data: Dict[str, Any]) -> Dict[str, Any]:
         data, on_conflict="course_id,order_index"
     ).execute()
     if not response.data:
-        raise Exception(f"Failed to upsert chapter: {response}")
+        raise _storage_error(f"Failed to upsert chapter: {response}")
     return response.data[0]
 
 
@@ -904,7 +910,7 @@ def upsert_chapter_progress(
     response = get_supabase().table("course_progress") \
         .upsert(data, on_conflict="user_id,chapter_id").execute()
     if not response.data:
-        raise Exception(f"Failed to upsert chapter progress: {response}")
+        raise _storage_error(f"Failed to upsert chapter progress: {response}")
     return response.data[0]
 
 
@@ -952,7 +958,7 @@ def insert_course_quiz_attempt(
         data["time_taken_seconds"] = time_taken_seconds
     response = get_supabase().table("course_quiz_attempts").insert(data).execute()
     if not response.data:
-        raise Exception(f"Failed to insert quiz attempt: {response}")
+        raise _storage_error(f"Failed to insert quiz attempt: {response}")
     return response.data[0]
 
 

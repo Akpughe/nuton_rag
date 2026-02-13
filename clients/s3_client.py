@@ -33,6 +33,15 @@ def get_s3_url(key: str) -> str:
     return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
 
 
+def get_s3_presigned_url(key: str, expires_in: int = 900) -> str:
+    """Generate a presigned URL valid for expires_in seconds (default 15 min)."""
+    return _get_s3_client().generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": key},
+        ExpiresIn=expires_in,
+    )
+
+
 def build_s3_key(file_id: str, filename: str) -> str:
     """Build a deterministic S3 key: sources/{file_id}/{filename}"""
     return f"{S3_PREFIX}/{file_id}/{filename}"
@@ -97,6 +106,10 @@ CONTENT_TYPES = {
     ".doc": "application/msword",
     ".txt": "text/plain",
     ".md": "text/markdown",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
 }
 
 
