@@ -129,6 +129,17 @@ class ModelConfig:
         return MODEL_CONFIGS[key]
 
     @staticmethod
+    def get_key_by_model_name(model_name: str) -> Optional[str]:
+        """Reverse lookup: find the friendly key for a raw API model name.
+        e.g. 'meta-llama/llama-4-scout-17b-16e-instruct' -> 'llama-4-scout'
+        Returns None if not found.
+        """
+        for key, cfg in MODEL_CONFIGS.items():
+            if cfg["model"] == model_name:
+                return key
+        return None
+
+    @staticmethod
     def get_available_models() -> list:
         """List all available models"""
         return list(MODEL_CONFIGS.keys())

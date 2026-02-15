@@ -191,16 +191,14 @@ class CourseService:
         personalization = course.get("personalization_params", {})
         profile = self._get_or_create_profile(user_id, personalization)
 
-        # Model config
-        model_config = ModelConfig.get_config(model or course.get("model_used"))
+        # Model config — resolve friendly key from stored raw model name
+        model_key = model  # user override (already a friendly key)
+        if not model_key:
+            stored_model = course.get("model_used", "")
+            model_key = ModelConfig.get_key_by_model_name(stored_model) or stored_model
+        model_config = ModelConfig.get_config(model_key)
 
         # Search mode
-        model_key = None
-        from utils.model_config import MODEL_CONFIGS
-        for key, cfg in MODEL_CONFIGS.items():
-            if cfg["model"] == model_config["model"]:
-                model_key = key
-                break
         search_mode = get_search_mode(model_key)
 
         # File contexts from Pinecone (for file-based courses)
@@ -2302,14 +2300,13 @@ Return ONLY a JSON object:
         personalization = course.get("personalization_params", {})
         profile = self._get_or_create_profile(user_id, personalization)
 
-        model_config = ModelConfig.get_config(model or course.get("model_used"))
+        # Model config — resolve friendly key from stored raw model name
+        model_key = model  # user override (already a friendly key)
+        if not model_key:
+            stored_model = course.get("model_used", "")
+            model_key = ModelConfig.get_key_by_model_name(stored_model) or stored_model
+        model_config = ModelConfig.get_config(model_key)
 
-        model_key = None
-        from utils.model_config import MODEL_CONFIGS
-        for key, cfg in MODEL_CONFIGS.items():
-            if cfg["model"] == model_config["model"]:
-                model_key = key
-                break
         search_mode = get_search_mode(model_key)
 
         # File contexts from Pinecone (for file-based courses)
