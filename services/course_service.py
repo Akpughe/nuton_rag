@@ -2395,17 +2395,23 @@ Return ONLY a JSON object:
             for batch_start in range(0, len(sorted_missing_outlines), BATCH_SIZE):
                 batch = sorted_missing_outlines[batch_start:batch_start + BATCH_SIZE]
                 batch_tasks = [generate_single_chapter(ch) for ch in batch]
-                for future in asyncio.as_completed(batch_tasks):
-                    chapter = await future
-                    generated_chapters.append(chapter)
-                    yield {
-                        "type": "chapter_ready",
-                        "course_id": course_id,
-                        "chapter_order": chapter["order"],
-                        "chapter_title": chapter["title"],
-                        "total_chapters": total_chapters,
-                        "chapter": chapter,
-                    }
+                results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+                for ch_outline, result in zip(batch, results):
+                    if isinstance(result, Exception):
+                        failed_orders.append(ch_outline["order"])
+                        logger.error(f"[resume-stream] Chapter {ch_outline['order']} generation failed: {result}")
+                    else:
+                        generated_chapters.append(result)
+                        yield {
+                            "type": "chapter_ready",
+                            "course_id": course_id,
+                            "chapter_order": result["order"],
+                            "chapter_title": result["title"],
+                            "total_chapters": total_chapters,
+                            "chapter": result,
+                        }
+
                 if batch_start + BATCH_SIZE < len(sorted_missing_outlines):
                     await asyncio.sleep(1)
         except Exception as e:
