@@ -167,9 +167,12 @@ class CourseService:
                 "course": course,
                 "resume_summary": {
                     "already_complete": True,
-                    "total_chapters": len(all_outline_orders),
+                    "chapters_total": len(all_outline_orders),
+                    "chapters_existed": len(all_outline_orders),
                     "chapters_generated": 0,
-                    "generation_time_seconds": 0,
+                    "chapters_failed": [],
+                    "study_guide_generated": False,
+                    "flashcards_generated": False,
                 },
             }
 
@@ -283,6 +286,8 @@ class CourseService:
             raise GenerationError(f"Resume chapter generation failed: {e}")
 
         # ── 4. Generate study guide & flashcards if missing ─────────
+        sg_generated = False
+        fc_generated = False
         try:
             refreshed_course = self.storage.get_course(course_id)
             all_chapters = refreshed_course.get("chapters", [])
@@ -292,20 +297,27 @@ class CourseService:
             has_flashcards = self.flashcard_storage.get_flashcards(course_id) is not None
 
             extras_tasks = []
+            extras_labels = []
             if not has_study_guide:
                 extras_tasks.append(
                     self._generate_study_guide(course_id, all_chapters, profile, model_config, topic)
                 )
+                extras_labels.append("study_guide")
             if not has_flashcards:
                 extras_tasks.append(
                     self._generate_course_flashcards(course_id, all_chapters, profile, model_config)
                 )
+                extras_labels.append("flashcards")
 
             if extras_tasks:
                 extras_results = await asyncio.gather(*extras_tasks, return_exceptions=True)
-                for r in extras_results:
+                for label, r in zip(extras_labels, extras_results):
                     if isinstance(r, Exception):
                         logger.warning(f"[resume] Extras generation failed (non-fatal): {r}")
+                    elif label == "study_guide":
+                        sg_generated = True
+                    elif label == "flashcards":
+                        fc_generated = True
         except Exception as e:
             logger.warning(f"[resume] Study guide / flashcard generation error (non-fatal): {e}")
 
@@ -337,11 +349,12 @@ class CourseService:
             "generation_time_seconds": generation_time,
             "resume_summary": {
                 "already_complete": False,
-                "total_chapters": total_chapters,
+                "chapters_total": total_chapters,
                 "chapters_existed": len(ready_orders),
                 "chapters_generated": len(generated_chapters),
                 "chapters_failed": len(missing_orders) - len(generated_chapters),
-                "generation_time_seconds": generation_time,
+                "study_guide_generated": sg_generated,
+                "flashcards_generated": fc_generated,
             },
         }
 
