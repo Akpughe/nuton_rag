@@ -129,7 +129,306 @@ class CourseService:
                 "error": str(e)
             })
             raise
-    
+
+    async def resume_course(
+        self,
+        course_id: str,
+        model: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Resume a partially-generated course by generating only missing/errored chapters.
+        Blocking operation - returns full course when all gaps are filled.
+        """
+        import asyncio
+        start_time = time.time()
+
+        # ── 1. Load course and validate ──────────────────────────────
+        course = self.storage.get_course(course_id)
+        if not course:
+            raise NotFoundError(f"Course {course_id} not found")
+
+        outline = course.get("outline")
+        if not outline or not outline.get("chapters"):
+            raise ValidationError(f"Course {course_id} has no outline — cannot resume")
+
+        existing_chapters = course.get("chapters", [])
+        ready_orders = {
+            ch["order"] for ch in existing_chapters if ch.get("status") == "ready"
+        }
+        all_outline_orders = {ch["order"] for ch in outline["chapters"]}
+        missing_orders = all_outline_orders - ready_orders
+
+        # Early return if already complete
+        if not missing_orders:
+            logger.info(f"Course {course_id} is already complete ({len(ready_orders)} chapters)")
+            return {
+                "course_id": course_id,
+                "status": course.get("status", CourseStatus.READY),
+                "course": course,
+                "resume_summary": {
+                    "already_complete": True,
+                    "total_chapters": len(all_outline_orders),
+                    "chapters_generated": 0,
+                    "generation_time_seconds": 0,
+                },
+            }
+
+        logger.info(
+            f"Resuming course {course_id}: {len(missing_orders)} missing chapters "
+            f"out of {len(all_outline_orders)} total"
+        )
+
+        # ── 2. Reconstruct context ──────────────────────────────────
+        # Profile
+        user_id = course.get("user_id", "unknown")
+        personalization = course.get("personalization_params", {})
+        profile = self._get_or_create_profile(user_id, personalization)
+
+        # Model config
+        model_config = ModelConfig.get_config(model or course.get("model_used"))
+
+        # Search mode
+        model_key = None
+        from utils.model_config import MODEL_CONFIGS
+        for key, cfg in MODEL_CONFIGS.items():
+            if cfg["model"] == model_config["model"]:
+                model_key = key
+                break
+        search_mode = get_search_mode(model_key)
+
+        # File contexts from Pinecone (for file-based courses)
+        missing_outlines = [
+            ch for ch in outline["chapters"] if ch["order"] in missing_orders
+        ]
+        chapter_contexts = self._retrieve_chunks_for_resume(course_id, missing_outlines)
+
+        # Web sources for Perplexity models
+        chapter_web_sources: Dict[int, Dict] = {}
+        if search_mode == "perplexity":
+            from clients.perplexity_client import search_for_chapters_parallel
+            chapter_web_sources = search_for_chapters_parallel(
+                chapters=missing_outlines,
+                course_topic=course.get("topic", course.get("title", ""))
+            )
+
+        # ── 3. Generate missing chapters in batched parallel ────────
+        course_title = outline["title"]
+        total_chapters = len(outline["chapters"])
+        all_chapter_outlines = {ch["order"]: ch for ch in outline["chapters"]}
+
+        # Update status to generating
+        course["status"] = CourseStatus.GENERATING
+        self.storage.save_course(course)
+
+        def get_chapter_search_mode(chapter_order: int) -> str:
+            if search_mode == "perplexity" and chapter_web_sources.get(chapter_order, {}).get("sources"):
+                return "provided"
+            return search_mode
+
+        def get_chapter_web_sources_fn(chapter_order: int) -> Optional[List[Dict]]:
+            if search_mode == "perplexity":
+                return chapter_web_sources.get(chapter_order, {}).get("sources")
+            return None
+
+        async def generate_single_chapter(chapter_outline):
+            ch_order = chapter_outline["order"]
+            ch_search_mode = get_chapter_search_mode(ch_order)
+            ch_web_sources = get_chapter_web_sources_fn(ch_order)
+            ch_file_context = chapter_contexts.get(ch_order)
+            ch_use_search = (search_mode == "native" and model_config["provider"] == "openai")
+
+            prev_order = ch_order - 1
+            next_order = ch_order + 1
+            prev_title = all_chapter_outlines[prev_order]["title"] if prev_order in all_chapter_outlines else None
+            next_title = all_chapter_outlines[next_order]["title"] if next_order in all_chapter_outlines else None
+
+            chapter = await self._generate_chapter(
+                course_id=course_id,
+                course_title=course_title,
+                chapter_outline=chapter_outline,
+                total_chapters=total_chapters,
+                profile=profile,
+                model_config=model_config,
+                prev_chapter_title=prev_title,
+                next_chapter_title=next_title,
+                file_context=ch_file_context,
+                search_mode=ch_search_mode,
+                web_sources=ch_web_sources,
+                use_search=ch_use_search,
+            )
+            self.storage.save_chapter(course_id, chapter)
+            logger.info(f"[resume] Generated chapter {ch_order}/{total_chapters}: {chapter['title']}")
+            return chapter
+
+        BATCH_SIZE = 4
+        generated_chapters = []
+
+        try:
+            sorted_missing = sorted(missing_outlines, key=lambda ch: ch["order"])
+            for batch_start in range(0, len(sorted_missing), BATCH_SIZE):
+                batch = sorted_missing[batch_start:batch_start + BATCH_SIZE]
+                batch_tasks = [generate_single_chapter(ch) for ch in batch]
+                results = await asyncio.gather(*batch_tasks, return_exceptions=True)
+
+                for result in results:
+                    if isinstance(result, Exception):
+                        logger.error(f"[resume] Chapter generation failed: {result}")
+                    else:
+                        generated_chapters.append(result)
+
+                if batch_start + BATCH_SIZE < len(sorted_missing):
+                    await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"[resume] Batched chapter generation failed: {e}")
+            raise GenerationError(f"Resume chapter generation failed: {e}")
+
+        # ── 4. Generate study guide & flashcards if missing ─────────
+        try:
+            refreshed_course = self.storage.get_course(course_id)
+            all_chapters = refreshed_course.get("chapters", [])
+            topic = course.get("topic", course.get("title", ""))
+
+            has_study_guide = self.study_guide_storage.get_study_guide(course_id) is not None
+            has_flashcards = self.flashcard_storage.get_flashcards(course_id) is not None
+
+            extras_tasks = []
+            if not has_study_guide:
+                extras_tasks.append(
+                    self._generate_study_guide(course_id, all_chapters, profile, model_config, topic)
+                )
+            if not has_flashcards:
+                extras_tasks.append(
+                    self._generate_course_flashcards(course_id, all_chapters, profile, model_config)
+                )
+
+            if extras_tasks:
+                extras_results = await asyncio.gather(*extras_tasks, return_exceptions=True)
+                for r in extras_results:
+                    if isinstance(r, Exception):
+                        logger.warning(f"[resume] Extras generation failed (non-fatal): {r}")
+        except Exception as e:
+            logger.warning(f"[resume] Study guide / flashcard generation error (non-fatal): {e}")
+
+        # ── 5. Finalize ─────────────────────────────────────────────
+        course["status"] = CourseStatus.READY
+        course["completed_at"] = datetime.utcnow()
+        self.storage.save_course(course)
+
+        generation_time = round(time.time() - start_time, 2)
+
+        # Reload final course state
+        final_course = self.storage.get_course(course_id)
+
+        self.logger.log_generation({
+            "type": "resume_course",
+            "user_id": user_id,
+            "course_id": course_id,
+            "model": model_config["model"],
+            "chapters_resumed": len(generated_chapters),
+            "total_chapters": total_chapters,
+            "generation_time": generation_time,
+            "status": "success",
+        })
+
+        return {
+            "course_id": course_id,
+            "status": CourseStatus.READY,
+            "course": final_course,
+            "generation_time_seconds": generation_time,
+            "resume_summary": {
+                "already_complete": False,
+                "total_chapters": total_chapters,
+                "chapters_existed": len(ready_orders),
+                "chapters_generated": len(generated_chapters),
+                "chapters_failed": len(missing_orders) - len(generated_chapters),
+                "generation_time_seconds": generation_time,
+            },
+        }
+
+    def _retrieve_chunks_for_resume(
+        self,
+        course_id: str,
+        missing_chapter_outlines: List[Dict[str, Any]],
+        max_context_tokens: int = 3000
+    ) -> Dict[int, str]:
+        """
+        Query Pinecone by course_id to retrieve stored chunks,
+        then map them to missing chapter outlines using keyword overlap.
+
+        Returns:
+            Dict mapping chapter order -> context string.
+            Empty dict if Pinecone has no data for this course.
+        """
+        try:
+            from clients.pinecone_client import fetch_all_document_chunks
+        except ImportError:
+            logger.warning("[resume] Pinecone client not available, skipping chunk retrieval")
+            return {}
+
+        try:
+            chunks = fetch_all_document_chunks(
+                document_id=course_id,
+                space_id=f"course_{course_id}",
+                max_chunks=500,
+                enable_gap_filling=False,
+            )
+        except Exception as e:
+            logger.warning(f"[resume] Failed to fetch chunks from Pinecone: {e}")
+            return {}
+
+        if not chunks:
+            logger.info(f"[resume] No Pinecone chunks found for course {course_id} (topic-only course)")
+            return {}
+
+        logger.info(f"[resume] Retrieved {len(chunks)} chunks from Pinecone for course {course_id}")
+
+        # Map chunks to missing chapters using keyword overlap
+        stop_words = {
+            "the", "a", "an", "and", "or", "to", "of", "in", "for", "is",
+            "on", "with", "this", "that", "be", "can", "will", "are", "after",
+            "students", "chapter", "learn", "understand",
+        }
+
+        chapter_contexts: Dict[int, str] = {}
+        for chapter_outline in missing_chapter_outlines:
+            ch_order = chapter_outline["order"]
+            ch_title = chapter_outline["title"].lower()
+            ch_objectives = " ".join(chapter_outline.get("objectives", [])).lower()
+            ch_concepts = " ".join(chapter_outline.get("key_concepts", [])).lower()
+            chapter_text = f"{ch_title} {ch_objectives} {ch_concepts}"
+            chapter_words = set(chapter_text.split()) - stop_words
+
+            # Score each chunk by keyword overlap with this chapter
+            scored_chunks = []
+            for chunk in chunks:
+                chunk_text = chunk.get("metadata", {}).get("text", "")
+                if not chunk_text:
+                    continue
+                chunk_words = set(chunk_text.lower().split()[:200]) - stop_words
+                overlap = len(chapter_words & chunk_words)
+                if overlap > 0:
+                    scored_chunks.append((overlap, chunk_text))
+
+            scored_chunks.sort(key=lambda x: x[0], reverse=True)
+
+            # Build context string, respecting token limit
+            context_parts = []
+            token_count = 0
+            for _, text in scored_chunks:
+                chunk_tokens = len(text) // 4  # rough estimate: 1 token ~ 4 chars
+                if token_count + chunk_tokens > max_context_tokens:
+                    break
+                context_parts.append(text)
+                token_count += chunk_tokens
+
+            if context_parts:
+                chapter_contexts[ch_order] = "\n\n---\n\n".join(context_parts)
+
+        logger.info(
+            f"[resume] Mapped chunks to {len(chapter_contexts)}/{len(missing_chapter_outlines)} chapters"
+        )
+        return chapter_contexts
+
     async def create_course_from_files(
         self,
         user_id: str,
