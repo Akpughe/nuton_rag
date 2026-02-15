@@ -158,8 +158,12 @@ class CourseService:
         all_outline_orders = {ch["order"] for ch in outline["chapters"]}
         missing_orders = all_outline_orders - ready_orders
 
-        # Early return if already complete
-        if not missing_orders:
+        # Check extras status before deciding if truly complete
+        needs_study_guide = self.study_guide_storage.get_study_guide(course_id) is None
+        needs_flashcards = self.flashcard_storage.get_flashcards(course_id) is None
+
+        # Early return if already complete (chapters + extras)
+        if not missing_orders and not needs_study_guide and not needs_flashcards:
             logger.info(f"Course {course_id} is already complete ({len(ready_orders)} chapters)")
             return {
                 "course_id": course_id,
@@ -298,17 +302,14 @@ class CourseService:
             all_chapters = refreshed_course.get("chapters", [])
             topic = course.get("topic", course.get("title", ""))
 
-            has_study_guide = self.study_guide_storage.get_study_guide(course_id) is not None
-            has_flashcards = self.flashcard_storage.get_flashcards(course_id) is not None
-
             extras_tasks = []
             extras_labels = []
-            if not has_study_guide:
+            if needs_study_guide:
                 extras_tasks.append(
                     self._generate_study_guide(course_id, all_chapters, profile, model_config, topic)
                 )
                 extras_labels.append("study_guide")
-            if not has_flashcards:
+            if needs_flashcards:
                 extras_tasks.append(
                     self._generate_course_flashcards(course_id, all_chapters, profile, model_config)
                 )
@@ -328,14 +329,17 @@ class CourseService:
 
         # ── 5. Finalize ─────────────────────────────────────────────
         if not failed_orders:
+            self.storage.save_course({
+                "id": course_id,
+                "status": CourseStatus.READY,
+                "completed_at": datetime.utcnow(),
+            })
             course["status"] = CourseStatus.READY
-            course["completed_at"] = datetime.utcnow()
         else:
             logger.warning(
                 f"[resume] {len(failed_orders)} chapters failed (orders: {failed_orders}), "
                 f"leaving course {course_id} in GENERATING status"
             )
-        self.storage.save_course(course)
 
         generation_time = round(time.time() - start_time, 2)
 
@@ -2263,8 +2267,12 @@ Return ONLY a JSON object:
         all_outline_orders = {ch["order"] for ch in outline["chapters"]}
         missing_orders = all_outline_orders - ready_orders
 
-        # Early return if already complete
-        if not missing_orders:
+        # Check extras status before deciding if truly complete
+        has_study_guide = self.study_guide_storage.get_study_guide(course_id) is not None
+        has_flashcards = self.flashcard_storage.get_flashcards(course_id) is not None
+
+        # Early return if already complete (chapters + extras)
+        if not missing_orders and has_study_guide and has_flashcards:
             logger.info(f"Course {course_id} is already complete ({len(ready_orders)} chapters)")
             yield {
                 "type": "course_complete",
@@ -2321,10 +2329,6 @@ Return ONLY a JSON object:
                 chapters=missing_outlines,
                 course_topic=course.get("topic", course.get("title", ""))
             )
-
-        # ── 3. Determine extras needed ────────────────────────────────────
-        has_study_guide = self.study_guide_storage.get_study_guide(course_id) is not None
-        has_flashcards = self.flashcard_storage.get_flashcards(course_id) is not None
 
         # Yield resume_started event
         sorted_missing = sorted(missing_orders)
@@ -2464,14 +2468,17 @@ Return ONLY a JSON object:
 
         # ── 6. Finalize ──────────────────────────────────────────────────
         if not failed_orders:
+            self.storage.save_course({
+                "id": course_id,
+                "status": CourseStatus.READY,
+                "completed_at": datetime.utcnow(),
+            })
             course["status"] = CourseStatus.READY
-            course["completed_at"] = datetime.utcnow()
         else:
             logger.warning(
                 f"[resume-stream] {len(failed_orders)} chapters failed "
                 f"(orders: {failed_orders}), leaving course {course_id} in GENERATING status"
             )
-        self.storage.save_course(course)
 
         generation_time = round(time.time() - start_time, 2)
 
