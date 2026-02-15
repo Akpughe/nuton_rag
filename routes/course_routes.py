@@ -515,6 +515,13 @@ async def resume_course(course_id: str, model: Optional[str] = None):
     Query params:
         model: Optional model override (defaults to course's original model)
     """
+    if model and model not in ModelConfig.get_available_models():
+        raise ValidationError(
+            f"Invalid model. Available: {ModelConfig.get_available_models()}",
+            error_code="INVALID_MODEL",
+            context={"model": model},
+        )
+
     result = await course_service.resume_course(
         course_id=course_id,
         model=model,
@@ -528,6 +535,13 @@ async def resume_course_stream(course_id: str, model: Optional[str] = None):
     SSE streaming version of course resume.
     Emits: resume_started, chapter_ready, study_guide_ready, flashcards_ready, course_complete, error
     """
+    if model and model not in ModelConfig.get_available_models():
+        raise ValidationError(
+            f"Invalid model. Available: {ModelConfig.get_available_models()}",
+            error_code="INVALID_MODEL",
+            context={"model": model},
+        )
+
     async def event_generator():
         try:
             async for event in course_service.resume_course_stream(
