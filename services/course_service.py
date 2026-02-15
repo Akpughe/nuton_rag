@@ -203,7 +203,10 @@ class CourseService:
         missing_outlines = [
             ch for ch in outline["chapters"] if ch["order"] in missing_orders
         ]
-        chapter_contexts = self._retrieve_chunks_for_resume(course_id, missing_outlines)
+        chapter_contexts: Dict[int, str] = {}
+        source_type = course.get("source_type", "")
+        if source_type in ("files", "mixed"):
+            chapter_contexts = self._retrieve_chunks_for_resume(course_id, missing_outlines)
 
         # Web sources for Perplexity models
         chapter_web_sources: Dict[int, Dict] = {}
@@ -265,6 +268,7 @@ class CourseService:
 
         BATCH_SIZE = 4
         generated_chapters = []
+        failed_orders = []
 
         try:
             sorted_missing = sorted(missing_outlines, key=lambda ch: ch["order"])
@@ -273,9 +277,10 @@ class CourseService:
                 batch_tasks = [generate_single_chapter(ch) for ch in batch]
                 results = await asyncio.gather(*batch_tasks, return_exceptions=True)
 
-                for result in results:
+                for ch_outline, result in zip(batch, results):
                     if isinstance(result, Exception):
-                        logger.error(f"[resume] Chapter generation failed: {result}")
+                        failed_orders.append(ch_outline["order"])
+                        logger.error(f"[resume] Chapter {ch_outline['order']} generation failed: {result}")
                     else:
                         generated_chapters.append(result)
 
@@ -322,8 +327,14 @@ class CourseService:
             logger.warning(f"[resume] Study guide / flashcard generation error (non-fatal): {e}")
 
         # ── 5. Finalize ─────────────────────────────────────────────
-        course["status"] = CourseStatus.READY
-        course["completed_at"] = datetime.utcnow()
+        if not failed_orders:
+            course["status"] = CourseStatus.READY
+            course["completed_at"] = datetime.utcnow()
+        else:
+            logger.warning(
+                f"[resume] {len(failed_orders)} chapters failed (orders: {failed_orders}), "
+                f"leaving course {course_id} in GENERATING status"
+            )
         self.storage.save_course(course)
 
         generation_time = round(time.time() - start_time, 2)
@@ -344,7 +355,7 @@ class CourseService:
 
         return {
             "course_id": course_id,
-            "status": CourseStatus.READY,
+            "status": course["status"],
             "course": final_course,
             "generation_time_seconds": generation_time,
             "resume_summary": {
@@ -352,7 +363,7 @@ class CourseService:
                 "chapters_total": total_chapters,
                 "chapters_existed": len(ready_orders),
                 "chapters_generated": len(generated_chapters),
-                "chapters_failed": len(missing_orders) - len(generated_chapters),
+                "chapters_failed": failed_orders,
                 "study_guide_generated": sg_generated,
                 "flashcards_generated": fc_generated,
             },
