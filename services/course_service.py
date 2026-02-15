@@ -1039,11 +1039,43 @@ Return ONLY a JSON object:
             if use_search and model_config.get("supports_search"):
                 return await self._call_openai_responses(prompt, model_config, expect_json)
 
-            # Standard Chat Completions path
             system_prompt = "You are an expert educational content creator."
             if expect_json:
                 system_prompt += " You MUST respond with ONLY a valid JSON object. No markdown code blocks, no extra text. Start your response with { and end with }."
 
+            # JSON path: call OpenAI directly with response_format for reliability
+            if expect_json:
+                import os
+                from openai import OpenAI
+                client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+                params = {
+                    "model": model_config["model"],
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "response_format": {"type": "json_object"},
+                }
+                if model_config.get("max_tokens"):
+                    params["max_tokens"] = model_config["max_tokens"]
+
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        response = client.chat.completions.create(**params)
+                        answer = response.choices[0].message.content
+                        return self._extract_json(answer)
+                    except GenerationError:
+                        if attempt < max_retries - 1:
+                            import asyncio
+                            backoff = 2 ** (attempt + 1)
+                            logger.warning(f"OpenAI JSON parse failed (attempt {attempt + 1}/{max_retries}). Retrying in {backoff}s...")
+                            await asyncio.sleep(backoff)
+                            continue
+                        raise
+
+            # Non-JSON path: use existing client wrapper
             response = openai_client.generate_answer(
                 query=prompt,
                 context_chunks=[],
@@ -1052,14 +1084,12 @@ Return ONLY a JSON object:
                 max_tokens=model_config.get("max_tokens")
             )
 
-            if expect_json and isinstance(response, tuple):
-                answer = response[0]
-                return self._extract_json(answer)
-            elif isinstance(response, tuple):
+            if isinstance(response, tuple):
                 return {"content": response[0]}
-            else:
-                return response
+            return response
 
+        except GenerationError:
+            raise
         except Exception as e:
             logger.error(f"OpenAI API error: {e}")
             raise
@@ -1125,8 +1155,9 @@ Return ONLY a JSON object:
 
         system_prompt = "You are an expert educational content creator."
         if expect_json:
-            system_prompt += " Always respond with valid JSON."
+            system_prompt += " Always respond with valid JSON. Ensure all string values have properly escaped inner quotes."
 
+        temperature = model_config.get("temperature", 0.7)
         completion_params = {
             "model": model_config["model"],
             "messages": [
@@ -1134,7 +1165,7 @@ Return ONLY a JSON object:
                 {"role": "user", "content": prompt}
             ],
             "max_tokens": model_config.get("max_tokens", 8192),
-            "temperature": model_config.get("temperature", 0.7),
+            "temperature": temperature,
             "stream": False
         }
 
@@ -1147,20 +1178,37 @@ Return ONLY a JSON object:
                 response = client.chat.completions.create(**completion_params)
                 answer = response.choices[0].message.content
 
-                # Log if response was truncated
+                # Truncated response — JSON is guaranteed invalid
                 if response.choices[0].finish_reason == "length":
-                    logger.warning(f"Groq response truncated (finish_reason=length). Response length: {len(answer)}")
+                    if attempt < max_retries - 1:
+                        completion_params["temperature"] = max(0.3, temperature - 0.2)
+                        logger.warning(f"Groq response truncated (attempt {attempt + 1}/{max_retries}). Retrying with lower temperature...")
+                        await asyncio.sleep(2 ** (attempt + 1))
+                        continue
+                    logger.warning(f"Groq response truncated after all retries. Response length: {len(answer)}")
 
                 if expect_json:
                     return self._extract_json(answer)
                 return {"content": answer}
 
+            except GenerationError:
+                # _extract_json failed to parse — retry with backoff
+                if attempt < max_retries - 1:
+                    backoff = 2 ** (attempt + 1)
+                    logger.warning(f"Groq JSON parse failed (attempt {attempt + 1}/{max_retries}). Retrying in {backoff}s...")
+                    await asyncio.sleep(backoff)
+                    continue
+                raise
+
             except Exception as e:
                 error_str = str(e).lower()
                 is_rate_limit = "429" in str(e) or "rate_limit" in error_str or "rate limit" in error_str
-                if is_rate_limit and attempt < max_retries - 1:
-                    backoff = 2 ** (attempt + 1)  # 2s, 4s, 8s
-                    logger.warning(f"Groq rate limit hit (attempt {attempt + 1}/{max_retries}). Retrying in {backoff}s...")
+                is_json_fail = "json_validate_failed" in error_str or "json_validate" in error_str
+
+                if (is_rate_limit or is_json_fail) and attempt < max_retries - 1:
+                    backoff = 2 ** (attempt + 1)
+                    reason = "rate limit" if is_rate_limit else "json_validate_failed"
+                    logger.warning(f"Groq {reason} (attempt {attempt + 1}/{max_retries}). Retrying in {backoff}s...")
                     await asyncio.sleep(backoff)
                     continue
                 logger.error(f"Groq API error: {e}")
