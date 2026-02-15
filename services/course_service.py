@@ -2233,6 +2233,270 @@ Return ONLY a JSON object:
                 "context": None,
             }
 
+    async def resume_course_stream(
+        self,
+        course_id: str,
+        model: Optional[str] = None
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """
+        Streaming variant of resume_course.
+        Yields SSE events as missing chapters are generated.
+        Raises NotFoundError / ValidationError BEFORE any yield so the route
+        handler can catch them before the stream starts.
+        """
+        import asyncio
+        start_time = time.time()
+
+        # ── 1. Load course and validate (pre-yield — exceptions propagate) ──
+        course = self.storage.get_course(course_id)
+        if not course:
+            raise NotFoundError(f"Course {course_id} not found")
+
+        outline = course.get("outline")
+        if not outline or not outline.get("chapters"):
+            raise ValidationError(f"Course {course_id} has no outline — cannot resume")
+
+        existing_chapters = course.get("chapters", [])
+        ready_orders = {
+            ch["order"] for ch in existing_chapters if ch.get("status") == "ready"
+        }
+        all_outline_orders = {ch["order"] for ch in outline["chapters"]}
+        missing_orders = all_outline_orders - ready_orders
+
+        # Early return if already complete
+        if not missing_orders:
+            logger.info(f"Course {course_id} is already complete ({len(ready_orders)} chapters)")
+            yield {
+                "type": "course_complete",
+                "course_id": course_id,
+                "status": course.get("status", CourseStatus.READY),
+                "total_chapters": len(all_outline_orders),
+                "generation_time_seconds": 0,
+                "resume_summary": {
+                    "already_complete": True,
+                    "chapters_total": len(all_outline_orders),
+                    "chapters_existed": len(all_outline_orders),
+                    "chapters_generated": 0,
+                    "chapters_failed": [],
+                    "study_guide_generated": False,
+                    "flashcards_generated": False,
+                },
+            }
+            return
+
+        logger.info(
+            f"[resume-stream] Resuming course {course_id}: {len(missing_orders)} missing "
+            f"chapters out of {len(all_outline_orders)} total"
+        )
+
+        # ── 2. Reconstruct context ───────────────────────────────────────
+        user_id = course.get("user_id", "unknown")
+        personalization = course.get("personalization_params", {})
+        profile = self._get_or_create_profile(user_id, personalization)
+
+        model_config = ModelConfig.get_config(model or course.get("model_used"))
+
+        model_key = None
+        from utils.model_config import MODEL_CONFIGS
+        for key, cfg in MODEL_CONFIGS.items():
+            if cfg["model"] == model_config["model"]:
+                model_key = key
+                break
+        search_mode = get_search_mode(model_key)
+
+        # File contexts from Pinecone (for file-based courses)
+        missing_outlines = [
+            ch for ch in outline["chapters"] if ch["order"] in missing_orders
+        ]
+        chapter_contexts: Dict[int, str] = {}
+        source_type = course.get("source_type", "")
+        if source_type in ("files", "mixed"):
+            chapter_contexts = self._retrieve_chunks_for_resume(course_id, missing_outlines)
+
+        # Web sources for Perplexity models
+        chapter_web_sources: Dict[int, Dict] = {}
+        if search_mode == "perplexity":
+            from clients.perplexity_client import search_for_chapters_parallel
+            chapter_web_sources = search_for_chapters_parallel(
+                chapters=missing_outlines,
+                course_topic=course.get("topic", course.get("title", ""))
+            )
+
+        # ── 3. Determine extras needed ────────────────────────────────────
+        has_study_guide = self.study_guide_storage.get_study_guide(course_id) is not None
+        has_flashcards = self.flashcard_storage.get_flashcards(course_id) is not None
+
+        # Yield resume_started event
+        sorted_missing = sorted(missing_orders)
+        yield {
+            "type": "resume_started",
+            "course_id": course_id,
+            "missing_chapters": sorted_missing,
+            "total_to_generate": len(sorted_missing),
+            "needs_study_guide": not has_study_guide,
+            "needs_flashcards": not has_flashcards,
+        }
+
+        # ── 4. Generate missing chapters in batched parallel ──────────────
+        course_title = outline["title"]
+        total_chapters = len(outline["chapters"])
+        all_chapter_outlines = {ch["order"]: ch for ch in outline["chapters"]}
+
+        # Update status to generating
+        course["status"] = CourseStatus.GENERATING
+        self.storage.save_course(course)
+
+        def get_chapter_search_mode(chapter_order: int) -> str:
+            if search_mode == "perplexity" and chapter_web_sources.get(chapter_order, {}).get("sources"):
+                return "provided"
+            return search_mode
+
+        def get_chapter_web_sources_fn(chapter_order: int) -> Optional[List[Dict]]:
+            if search_mode == "perplexity":
+                return chapter_web_sources.get(chapter_order, {}).get("sources")
+            return None
+
+        async def generate_single_chapter(chapter_outline):
+            ch_order = chapter_outline["order"]
+            ch_search_mode = get_chapter_search_mode(ch_order)
+            ch_web_sources = get_chapter_web_sources_fn(ch_order)
+            ch_file_context = chapter_contexts.get(ch_order)
+            ch_use_search = (search_mode == "native" and model_config["provider"] == "openai")
+
+            prev_order = ch_order - 1
+            next_order = ch_order + 1
+            prev_title = all_chapter_outlines[prev_order]["title"] if prev_order in all_chapter_outlines else None
+            next_title = all_chapter_outlines[next_order]["title"] if next_order in all_chapter_outlines else None
+
+            chapter = await self._generate_chapter(
+                course_id=course_id,
+                course_title=course_title,
+                chapter_outline=chapter_outline,
+                total_chapters=total_chapters,
+                profile=profile,
+                model_config=model_config,
+                prev_chapter_title=prev_title,
+                next_chapter_title=next_title,
+                file_context=ch_file_context,
+                search_mode=ch_search_mode,
+                web_sources=ch_web_sources,
+                use_search=ch_use_search,
+            )
+            self.storage.save_chapter(course_id, chapter)
+            logger.info(f"[resume-stream] Generated chapter {ch_order}/{total_chapters}: {chapter['title']}")
+            return chapter
+
+        BATCH_SIZE = 4
+        generated_chapters = []
+        failed_orders: List[int] = []
+
+        try:
+            sorted_missing_outlines = sorted(missing_outlines, key=lambda ch: ch["order"])
+            for batch_start in range(0, len(sorted_missing_outlines), BATCH_SIZE):
+                batch = sorted_missing_outlines[batch_start:batch_start + BATCH_SIZE]
+                batch_tasks = [generate_single_chapter(ch) for ch in batch]
+                for future in asyncio.as_completed(batch_tasks):
+                    chapter = await future
+                    generated_chapters.append(chapter)
+                    yield {
+                        "type": "chapter_ready",
+                        "course_id": course_id,
+                        "chapter_order": chapter["order"],
+                        "chapter_title": chapter["title"],
+                        "total_chapters": total_chapters,
+                        "chapter": chapter,
+                    }
+                if batch_start + BATCH_SIZE < len(sorted_missing_outlines):
+                    await asyncio.sleep(1)
+        except Exception as e:
+            logger.error(f"[resume-stream] Batched chapter generation failed: {e}")
+            yield {
+                "type": "error",
+                "error": "CHAPTER_GENERATION_FAILED",
+                "message": f"Resume chapter generation failed: {e}",
+                "status_code": 500,
+                "course_id": course_id,
+                "phase": "chapter_generation",
+                "context": None,
+            }
+            return
+
+        # ── 5. Generate study guide & flashcards if missing (non-fatal) ───
+        sg_generated = False
+        fc_generated = False
+        try:
+            refreshed_course = self.storage.get_course(course_id)
+            all_chapters = refreshed_course.get("chapters", [])
+            topic = course.get("topic", course.get("title", ""))
+
+            extras_tasks = []
+            extras_labels = []
+            if not has_study_guide:
+                extras_tasks.append(
+                    self._generate_study_guide(course_id, all_chapters, profile, model_config, topic)
+                )
+                extras_labels.append("study_guide")
+            if not has_flashcards:
+                extras_tasks.append(
+                    self._generate_course_flashcards(course_id, all_chapters, profile, model_config)
+                )
+                extras_labels.append("flashcards")
+
+            if extras_tasks:
+                extras_results = await asyncio.gather(*extras_tasks, return_exceptions=True)
+                for label, r in zip(extras_labels, extras_results):
+                    if isinstance(r, Exception):
+                        logger.warning(f"[resume-stream] Extras generation failed (non-fatal): {r}")
+                    elif label == "study_guide":
+                        sg_generated = True
+                        yield {"type": "study_guide_ready", "course_id": course_id}
+                    elif label == "flashcards":
+                        fc_generated = True
+                        yield {"type": "flashcards_ready", "course_id": course_id}
+        except Exception as e:
+            logger.warning(f"[resume-stream] Study guide / flashcard generation error (non-fatal): {e}")
+
+        # ── 6. Finalize ──────────────────────────────────────────────────
+        if not failed_orders:
+            course["status"] = CourseStatus.READY
+            course["completed_at"] = datetime.utcnow()
+        else:
+            logger.warning(
+                f"[resume-stream] {len(failed_orders)} chapters failed "
+                f"(orders: {failed_orders}), leaving course {course_id} in GENERATING status"
+            )
+        self.storage.save_course(course)
+
+        generation_time = round(time.time() - start_time, 2)
+
+        self.logger.log_generation({
+            "type": "resume_course_stream",
+            "user_id": user_id,
+            "course_id": course_id,
+            "model": model_config["model"],
+            "chapters_resumed": len(generated_chapters),
+            "total_chapters": total_chapters,
+            "generation_time": generation_time,
+            "status": "success",
+        })
+
+        yield {
+            "type": "course_complete",
+            "course_id": course_id,
+            "status": course["status"],
+            "total_chapters": total_chapters,
+            "generation_time_seconds": generation_time,
+            "resume_summary": {
+                "already_complete": False,
+                "chapters_total": total_chapters,
+                "chapters_existed": len(ready_orders),
+                "chapters_generated": len(generated_chapters),
+                "chapters_failed": failed_orders,
+                "study_guide_generated": sg_generated,
+                "flashcards_generated": fc_generated,
+            },
+        }
+
     # Public API methods
 
     def get_course(self, course_id: str) -> Optional[Dict[str, Any]]:
