@@ -504,6 +504,46 @@ async def get_course(course_id: str):
     }
 
 
+@router.post("/courses/{course_id}/resume")
+async def resume_course(course_id: str, model: Optional[str] = None):
+    """
+    Resume generation of a partially-completed course.
+    Detects missing or errored chapters and generates only the gaps.
+    Also generates study guide and flashcards if missing.
+    Re-entrant: safe to call multiple times.
+
+    Query params:
+        model: Optional model override (defaults to course's original model)
+    """
+    result = await course_service.resume_course(
+        course_id=course_id,
+        model=model,
+    )
+    return result
+
+
+@router.post("/courses/{course_id}/resume/stream")
+async def resume_course_stream(course_id: str, model: Optional[str] = None):
+    """
+    SSE streaming version of course resume.
+    Emits: resume_started, chapter_ready, study_guide_ready, flashcards_ready, course_complete, error
+    """
+    async def event_generator():
+        try:
+            async for event in course_service.resume_course_stream(
+                course_id=course_id,
+                model=model,
+            ):
+                yield _sse_event(event)
+                if event.get("type") == "error":
+                    return
+        except Exception as e:
+            logger.error(f"Resume SSE stream error: {e}")
+            yield _sse_error_event(e, phase="resume")
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 @router.get("/courses/by-slug/{slug}")
 async def get_course_by_slug(slug: str):
     """
