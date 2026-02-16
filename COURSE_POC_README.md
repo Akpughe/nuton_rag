@@ -26,6 +26,7 @@ Complete POC for AI-powered course generation with the following features:
 17. **Notes Flashcards**: On-demand spaced-repetition flashcards from source materials. Text-based LLM output parsed into JSON. Format mix: cloze, application, compare/contrast, cause-effect, reversal. Saved to both `courses.flashcards` JSONB and `flashcard_sets` table.
 18. **Notes Quiz**: On-demand comprehensive quiz from source materials. Bloom's taxonomy distribution, MCQ + fill-in-gap + scenario question types. Saved to `quiz_sets` table.
 19. **Unified Error Responses**: Machine-readable error codes across all ~29 endpoints. Structured `{error, message, detail, status_code, context}` shape for REST, `{type, error, message, status_code, phase, context}` for SSE streams. Global exception handlers eliminate per-route try/except boilerplate.
+20. **Course Resume**: Resume partially-generated courses without regenerating from scratch. Detects missing/errored chapters via gap analysis, generates only what's needed, fills in missing study guide and flashcards. Re-entrant (safe to call multiple times). Supports both blocking and SSE streaming. File-based courses retrieve original chunks from Pinecone.
 
 ### File Structure
 ```
@@ -56,6 +57,10 @@ nuton_rag/
 ### Course Generation (SSE Streaming)
 - `POST /api/v1/courses/from-topic/stream` - Stream course generation from topic via SSE
 - `POST /api/v1/courses/from-files/stream` - Stream course generation from files via SSE
+
+### Course Resume (complete partially-generated courses)
+- `POST /api/v1/courses/{course_id}/resume` - Resume generation (blocking, returns full course when done)
+- `POST /api/v1/courses/{course_id}/resume/stream` - Resume generation via SSE (streams chapter_ready events)
 
 ### Course Access
 - `GET /api/v1/courses/{course_id}` - Full course with chapters
@@ -222,7 +227,58 @@ curl -N -X POST http://localhost:8000/api/v1/courses/from-files/stream \
   -F "model=claude-haiku-4-5"
 ```
 
-### 8. Ask a Question (with Chat History)
+### 8. Resume a Partially-Generated Course
+```bash
+curl -X POST http://localhost:8000/api/v1/courses/{course_id}/resume
+```
+
+With optional model override:
+```bash
+curl -X POST "http://localhost:8000/api/v1/courses/{course_id}/resume?model=claude-haiku-4-5"
+```
+
+**Response** (generates only missing chapters + extras):
+```json
+{
+  "course_id": "uuid",
+  "status": "ready",
+  "course": { "..." },
+  "generation_time_seconds": 29.9,
+  "resume_summary": {
+    "chapters_total": 10,
+    "chapters_existed": 7,
+    "chapters_generated": 3,
+    "chapters_failed": [],
+    "study_guide_generated": true,
+    "flashcards_generated": true,
+    "already_complete": false
+  }
+}
+```
+
+If the course is already complete, returns immediately with `"already_complete": true` and zero generation time.
+
+### 9. Resume via SSE Streaming
+```bash
+curl -N -X POST http://localhost:8000/api/v1/courses/{course_id}/resume/stream
+```
+
+**SSE Events** (streamed progressively):
+```
+data: {"type": "resume_started", "course_id": "uuid", "missing_chapters": [5, 8], "total_to_generate": 2}
+
+data: {"type": "chapter_ready", "chapter_order": 5, "chapter_title": "...", "chapter": {...}}
+
+data: {"type": "chapter_ready", "chapter_order": 8, "chapter_title": "...", "chapter": {...}}
+
+data: {"type": "study_guide_ready", "course_id": "uuid"}
+
+data: {"type": "flashcards_ready", "course_id": "uuid"}
+
+data: {"type": "course_complete", "course_id": "uuid", "resume_summary": {"chapters_generated": 2, "already_complete": false, ...}}
+```
+
+### 10. Ask a Question (with Chat History)
 ```bash
 curl -X POST http://localhost:8000/api/v1/courses/{course_id}/ask \
   -F "question=Explain quantum entanglement in simpler terms" \
@@ -232,17 +288,17 @@ curl -X POST http://localhost:8000/api/v1/courses/{course_id}/ask \
 
 Subsequent questions with the same `user_id` will include prior conversation context.
 
-### 9. Get Chat History
+### 11. Get Chat History
 ```bash
 curl http://localhost:8000/api/v1/courses/{course_id}/chat-history?user_id=user-123&limit=20
 ```
 
-### 10. Clear Chat History
+### 12. Clear Chat History
 ```bash
 curl -X DELETE http://localhost:8000/api/v1/courses/{course_id}/chat-history?user_id=user-123
 ```
 
-### 11. Get Study Guide
+### 13. Get Study Guide
 ```bash
 curl http://localhost:8000/api/v1/courses/{course_id}/study-guide
 ```
@@ -264,7 +320,7 @@ curl http://localhost:8000/api/v1/courses/{course_id}/study-guide
 }
 ```
 
-### 12. Get Flashcards
+### 14. Get Flashcards
 ```bash
 curl http://localhost:8000/api/v1/courses/{course_id}/flashcards
 ```
@@ -288,7 +344,7 @@ curl http://localhost:8000/api/v1/courses/{course_id}/flashcards
 }
 ```
 
-### 13. Generate Final Exam
+### 15. Generate Final Exam
 ```bash
 curl -X POST http://localhost:8000/api/v1/courses/{course_id}/generate-exam \
   -F "user_id=user-123" \
@@ -317,12 +373,12 @@ curl -X POST http://localhost:8000/api/v1/courses/{course_id}/generate-exam \
 
 Exam sizes: `30` (15 MCQ / 8 fill-in / 7 theory) or `50` (25 MCQ / 15 fill-in / 10 theory)
 
-### 14. Get Existing Exam
+### 16. Get Existing Exam
 ```bash
 curl http://localhost:8000/api/v1/courses/{course_id}/exam?user_id=user-123
 ```
 
-### 15. Submit Exam Answers for Grading
+### 17. Submit Exam Answers for Grading
 ```bash
 curl -X POST http://localhost:8000/api/v1/courses/{course_id}/exam/{exam_id}/submit \
   -F "user_id=user-123" \
@@ -349,17 +405,17 @@ curl -X POST http://localhost:8000/api/v1/courses/{course_id}/exam/{exam_id}/sub
 
 Scoring: MCQ 40%, Fill-in-gap 25%, Theory 35%. Theory uses LLM-based per-rubric-point grading (covered/partial/missed).
 
-### 16. Get Exam Attempts
+### 18. Get Exam Attempts
 ```bash
 curl "http://localhost:8000/api/v1/courses/{course_id}/exam/{exam_id}/attempts?user_id=user-123"
 ```
 
-### 17. Get Attempt Detail (with rubric breakdowns)
+### 19. Get Attempt Detail (with rubric breakdowns)
 ```bash
 curl http://localhost:8000/api/v1/courses/{course_id}/exam/{exam_id}/attempts/{attempt_id}
 ```
 
-### 18. Generate Course Notes
+### 20. Generate Course Notes
 ```bash
 curl -X POST http://localhost:8000/api/v1/courses/{course_id}/generate-notes \
   -F "user_id=user-123" \
@@ -390,7 +446,7 @@ Notes generation flow:
 5. Saves to `courses.summary_md` column
 6. Generates a study guide from the notes content
 
-### 19. Get Course Notes
+### 21. Get Course Notes
 ```bash
 curl http://localhost:8000/api/v1/courses/{course_id}/notes
 ```
@@ -405,7 +461,7 @@ curl http://localhost:8000/api/v1/courses/{course_id}/notes
 }
 ```
 
-### 20. Generate Notes Flashcards
+### 22. Generate Notes Flashcards
 ```bash
 curl -X POST http://localhost:8000/api/v1/courses/{course_id}/generate-notes-flashcards \
   -F "user_id=user-123" \
@@ -424,7 +480,7 @@ curl -X POST http://localhost:8000/api/v1/courses/{course_id}/generate-notes-fla
 
 Flashcard format mix: cloze (~40%), application (~25%), compare/contrast (~15%), cause-effect (~10%), reversal (~10%). Each card includes front, back, hint, concept, difficulty, and section reference. Saved to both `courses.flashcards` JSONB and `flashcard_sets` table.
 
-### 21. Generate Notes Quiz
+### 23. Generate Notes Quiz
 ```bash
 curl -X POST http://localhost:8000/api/v1/courses/{course_id}/generate-notes-quiz \
   -F "user_id=user-123" \
@@ -446,7 +502,7 @@ curl -X POST http://localhost:8000/api/v1/courses/{course_id}/generate-notes-qui
 
 Quiz uses Bloom's taxonomy distribution calibrated to learner expertise. Question types: MCQ (~50%), fill-in-gap (~25%), scenario-based (~25%). Saved to `quiz_sets` table.
 
-### 22. Get Notes Flashcards (incremental)
+### 24. Get Notes Flashcards (incremental)
 ```bash
 curl http://localhost:8000/api/v1/courses/{course_id}/notes-flashcards
 ```
@@ -463,7 +519,7 @@ curl http://localhost:8000/api/v1/courses/{course_id}/notes-flashcards
 }
 ```
 
-### 23. Get Notes Quiz (incremental)
+### 25. Get Notes Quiz (incremental)
 ```bash
 curl http://localhost:8000/api/v1/courses/{course_id}/notes-quiz
 ```
