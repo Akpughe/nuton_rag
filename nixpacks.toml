@@ -1,0 +1,22 @@
+[phases.setup]
+nixPkgs = [
+  "python311",
+  "python311Packages.pip",
+  "tesseract",
+  "poppler_utils",
+  "libGL",
+  "libGLU",
+  "file",
+  "ffmpeg",
+  "gcc",
+  "stdenv.cc.cc.lib",
+]
+
+[phases.install]
+cmds = [
+  "pip install --upgrade pip",
+  "pip install -r requirements.txt",
+]
+
+[start]
+cmd = 'hypercorn pipeline:app --bind "[::]:$PORT"'
