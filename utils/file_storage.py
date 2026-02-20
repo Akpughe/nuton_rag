@@ -593,6 +593,67 @@ class ChatStorage:
             return False
 
 
+class SpaceConversationStorage:
+    """
+    Save and retrieve chat messages for a space conversation.
+    Uses the space_conversations table which stores a JSONB messages array
+    per (space_id, user_id) pair.
+    """
+
+    @staticmethod
+    def get_messages(space_id: str, user_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """Retrieve the most recent messages from a space conversation.
+
+        Uses a SECURITY DEFINER RPC function to bypass RLS (the backend
+        uses the anon key, so direct table SELECTs are blocked by the
+        ``auth.uid() = user_id`` policy).
+        """
+        try:
+            response = get_supabase().rpc(
+                "get_space_conversation_messages",
+                {
+                    "p_space_id": space_id,
+                    "p_user_id": user_id,
+                    "p_limit": limit,
+                },
+            ).execute()
+            # RPC returns a single JSONB value (the messages array)
+            messages = response.data if isinstance(response.data, list) else []
+            return messages
+        except Exception as e:
+            logger.error(f"Error getting space conversation messages for space={space_id}: {e}")
+            return []
+
+    @staticmethod
+    def save_messages(
+        space_id: str,
+        user_id: str,
+        new_messages: List[Dict[str, Any]],
+    ) -> bool:
+        """
+        Atomically append new messages to the space conversation via Postgres RPC.
+        Creates the row if it doesn't exist. Thread-safe — no read-modify-write race.
+        Each message dict should have: role, content, sources (optional), created_at.
+        """
+        try:
+            response = get_supabase().rpc(
+                "append_space_conversation_messages",
+                {
+                    "p_space_id": space_id,
+                    "p_user_id": user_id,
+                    "p_new_messages": new_messages,
+                },
+            ).execute()
+            logger.info(
+                f"Space conversation saved to Supabase — space_id={space_id}, "
+                f"user_id={user_id}, ssee aved_data={response.data}"
+            )
+            return True
+        except Exception as e:
+            logger.error(f"Error saving space conversation for space={space_id}: {e}")
+            return False
+
+
 # Generation Logging (stays local — no DB table)
 class GenerationLogger:
     """Log course generation for debugging and cost tracking"""
