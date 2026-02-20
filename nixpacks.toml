@@ -14,9 +14,10 @@ nixPkgs = [
 
 [phases.install]
 cmds = [
-  "pip install --upgrade pip",
-  "pip install -r requirements.txt",
+  "python3.11 -m venv /opt/venv",
+  "/opt/venv/bin/pip install --upgrade pip",
+  "/opt/venv/bin/pip install -r requirements.txt",
 ]
 
 [start]
-cmd = 'hypercorn pipeline:app --bind "[::]:$PORT"'
+cmd = '/opt/venv/bin/hypercorn pipeline:app --bind "[::]:$PORT"'
