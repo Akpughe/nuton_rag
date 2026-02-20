@@ -21,7 +21,7 @@ from note_generation_prompts import (
     get_level_config,
     FORMATTING_GUIDELINES
 )
-from clients.pinecone_client import fetch_all_document_chunks
+from clients.qdrant_client import fetch_all_document_chunks
 
 # Import LLM clients
 import clients.openai_client as openai_client

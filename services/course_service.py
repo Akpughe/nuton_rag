@@ -386,9 +386,9 @@ class CourseService:
             Empty dict if Pinecone has no data for this course.
         """
         try:
-            from clients.pinecone_client import fetch_all_document_chunks
+            from clients.qdrant_client import fetch_all_document_chunks
         except ImportError:
-            logger.warning("[resume] Pinecone client not available, skipping chunk retrieval")
+            logger.warning("[resume] Qdrant client not available, skipping chunk retrieval")
             return {}
 
         try:
@@ -1759,7 +1759,7 @@ Return ONLY a JSON object:
         Uses existing Chonkie multimodal embeddings + Pinecone upsert pattern.
         """
         from clients.chonkie_client import embed_chunks_multimodal
-        from clients.pinecone_client import upsert_vectors
+        from clients.qdrant_client import upsert_vectors
 
         if not all_chunks:
             logger.warning("No chunks to embed/upsert")
@@ -2923,7 +2923,7 @@ Return ONLY a JSON object:
         Supports persistent chat history when user_id is provided.
         """
         from clients.chonkie_client import embed_query_multimodal
-        from clients.pinecone_client import hybrid_search, rerank_results
+        from clients.qdrant_client import hybrid_search, rerank_results
 
         model_config = ModelConfig.get_config(model)
 
@@ -2962,6 +2962,7 @@ Return ONLY a JSON object:
         # Search Pinecone filtered by course's space
         search_results = hybrid_search(
             query_emb=query_emb,
+            query_text=question,
             space_id=pinecone_space_id,
             top_k=top_k * 2  # Over-fetch for reranking
         )
@@ -3058,7 +3059,7 @@ Return ONLY a JSON object:
         Processes YouTube videos (via extracted_text) and PDFs (via Mistral OCR).
         """
         from clients.chonkie_client import embed_chunks_multimodal
-        from clients.pinecone_client import upsert_vectors
+        from clients.qdrant_client import upsert_vectors
         from clients.supabase_client import get_yt_extracted_text
 
         # Process YouTube videos
@@ -3153,7 +3154,7 @@ Return ONLY a JSON object:
         7. Generate study guide
         """
         import asyncio
-        from clients.pinecone_client import (
+        from clients.qdrant_client import (
             fetch_all_document_chunks, fetch_chunks_by_space, update_vector_metadata
         )
         from clients.supabase_client import (
@@ -3811,7 +3812,7 @@ Return ONLY a JSON object:
         Shared setup for notes-based flashcard/quiz generation.
         Fetches chunks, builds doc map, returns (course, topics, normalized_chunks, profile).
         """
-        from clients.pinecone_client import (
+        from clients.qdrant_client import (
             fetch_all_document_chunks, fetch_chunks_by_space
         )
         from clients.supabase_client import (

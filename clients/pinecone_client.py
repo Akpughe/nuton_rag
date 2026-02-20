@@ -1101,6 +1101,64 @@ def fetch_all_document_chunks(
         return []
 
 
+def fetch_document_vector_ids(
+    document_id: str,
+    max_ids: int = 5000
+) -> List[str]:
+    """
+    Fetch all Pinecone vector IDs for a given document_id.
+
+    Uses multiple semantically diverse query embeddings to maximise HNSW graph coverage,
+    then deduplicates. A single query against a zero vector is unreliable because Pinecone
+    uses approximate nearest-neighbour traversal — remote graph nodes can be missed.
+
+    Args:
+        document_id: The document/course ID to fetch vectors for.
+        max_ids: Upper bound on total unique IDs to retrieve (default 5000).
+
+    Returns:
+        List of deduplicated vector ID strings.
+    """
+    from clients.chonkie_client import embed_query_multimodal
+
+    dense_index = pc.Index(DENSE_INDEX)
+    filter_dict = {"document_id": {"$eq": document_id}}
+
+    # Diverse seed queries to maximise HNSW coverage across different semantic neighbourhoods
+    seed_queries = [
+        "concepts definitions principles theory",
+        "examples applications methods steps",
+        "data results analysis summary",
+        "introduction overview background context",
+    ]
+
+    seen_ids: set = set()
+    top_k_per_query = min(max_ids, 10000)  # Pinecone hard cap is 10 000
+
+    for seed in seed_queries:
+        if len(seen_ids) >= max_ids:
+            break
+        try:
+            emb = embed_query_multimodal(seed)["embedding"]
+            results = dense_index.query(
+                vector=emb,
+                filter=filter_dict,
+                top_k=top_k_per_query,
+                include_metadata=False,
+                include_values=False,
+            )
+            for match in results.matches:
+                seen_ids.add(match.id)
+                if len(seen_ids) >= max_ids:
+                    break
+        except Exception as e:
+            logging.warning(f"fetch_document_vector_ids: seed query failed ({seed!r}): {e}")
+
+    ids = list(seen_ids)
+    logging.info(f"fetch_document_vector_ids: found {len(ids)} vectors for document {document_id}")
+    return ids
+
+
 def update_vector_metadata(
     vector_ids: List[str],
     metadata_update: Dict[str, Any],

@@ -11,7 +11,7 @@ import time
 from functools import lru_cache
 
 from clients.chonkie_client import chunk_document, embed_chunks, embed_chunks_v2, embed_query, embed_query_v2, embed_chunks_multimodal, embed_query_multimodal
-from clients.pinecone_client import upsert_vectors, upsert_image_vectors, hybrid_search, hybrid_search_parallel, rerank_results, hybrid_search_document_aware, rerank_results_document_aware
+from clients.qdrant_client import upsert_vectors, upsert_image_vectors, hybrid_search, hybrid_search_parallel, rerank_results, hybrid_search_document_aware, rerank_results_document_aware
 from clients.supabase_client import insert_pdf_record, insert_yts_record, get_documents_in_space, check_document_type, upsert_generated_content_notes, get_supabase
 from clients.groq_client import generate_answer, generate_answer_document_aware
 import clients.openai_client as openai_client
@@ -34,6 +34,7 @@ from prompts.enhanced_prompts import get_domain_from_context
 from clients.websearch_client import analyze_and_generate_queries, perform_contextual_websearch_async, synthesize_rag_and_web_results
 from services.google_drive_service import GoogleDriveService
 from routes.course_routes import router as course_router
+from routes.space_routes import router as space_router
 
 
 app = FastAPI()
@@ -96,6 +97,8 @@ async def generic_error_handler(request: Request, exc: Exception):
 
 # Include course generation routes
 app.include_router(course_router)
+# Include space routes
+app.include_router(space_router)
 
 # Add CORS middleware
 app.add_middleware(
@@ -854,6 +857,7 @@ async def answer_query(
         search_start = time.time()
         hits = hybrid_search_document_aware(
             query_emb=query_emb,
+            query_text=query,
             query_sparse=query_sparse,
             document_ids=all_document_ids,
             space_id=space_id,
@@ -996,6 +1000,7 @@ async def answer_query(
         search_start = time.time()
         hits = hybrid_search_parallel(
             query_emb=query_emb,
+            query_text=query,
             query_sparse=query_sparse,
             top_k=max(20, rerank_top_n * 2),  # Ensure we have enough results for reranking
             doc_id=doc_id_param,
