@@ -27,19 +27,23 @@ Complete POC for AI-powered course generation with the following features:
 18. **Notes Quiz**: On-demand comprehensive quiz from source materials. Bloom's taxonomy distribution, MCQ + fill-in-gap + scenario question types. Saved to `quiz_sets` table.
 19. **Unified Error Responses**: Machine-readable error codes across all ~29 endpoints. Structured `{error, message, detail, status_code, context}` shape for REST, `{type, error, message, status_code, phase, context}` for SSE streams. Global exception handlers eliminate per-route try/except boilerplate.
 20. **Course Resume**: Resume partially-generated courses without regenerating from scratch. Detects missing/errored chapters via gap analysis, generates only what's needed, fills in missing study guide and flashcards. Re-entrant (safe to call multiple times). Supports both blocking and SSE streaming. File-based courses retrieve original chunks from Pinecone.
+21. **Space-Level Q&A**: Query across multiple courses in a space with parallel Pinecone search, multi-course citations, SSE streaming, and personalized responses. Falls back to web search (Claude) or general knowledge (other providers) when no course material is relevant. Chat history persisted to `space_conversations`.
 
 ### File Structure
 ```
 nuton_rag/
 ├── models/course_models.py           # Pydantic schemas
 ├── services/course_service.py        # Core generation logic
-├── routes/course_routes.py           # FastAPI endpoints
+├── services/space_service.py         # Space-level RAG query + Pinecone metadata updates
+├── routes/course_routes.py           # FastAPI endpoints (course operations)
+├── routes/space_routes.py            # FastAPI endpoints (space operations)
 ├── clients/supabase_client.py        # Supabase DB operations
 ├── clients/redis_client.py           # Async Redis client for chat caching
 ├── utils/file_storage.py             # Storage layer (Supabase-backed)
 ├── utils/model_config.py             # Model switching
 ├── utils/exceptions.py               # Unified exception hierarchy (NutonError base)
-├── prompts/course_prompts.py         # All prompts
+├── prompts/course_prompts.py         # Course-level prompts
+├── prompts/space_prompts.py          # Space-level query prompts (multi-course citations + web fallback)
 ├── supabase/migrations/              # DB schema migrations
 └── pipeline.py                       # Main app (updated with routes)
 ```
@@ -97,6 +101,10 @@ nuton_rag/
 ### Progress
 - `POST /api/v1/courses/{course_id}/progress` - Update completion
 - `GET /api/v1/users/{user_id}/progress` - All progress stats
+
+### Space Operations
+- `POST /api/v1/spaces/{space_id}/courses` - Batch-add courses to a space (updates Pinecone metadata)
+- `POST /api/v1/spaces/{space_id}/query/stream` - Stream a RAG query across all courses in a space (SSE)
 
 ### Models
 - `GET /api/v1/models` - List available models
@@ -539,6 +547,206 @@ curl http://localhost:8000/api/v1/courses/{course_id}/notes-quiz
 }
 ```
 
+### 26. Add Courses to a Space
+```bash
+curl -X POST http://localhost:8000/api/v1/spaces/{space_id}/courses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "course_ids": ["uuid-1", "uuid-2", "uuid-3"]
+  }'
+```
+
+Updates Pinecone vector metadata for each course to record `nuton_space_id`, enabling space-scoped search. All courses are processed in parallel (1–50 course IDs accepted).
+
+**Response**:
+```json
+{
+  "space_id": "space-uuid",
+  "courses_processed": 3,
+  "total_vectors_updated": 847,
+  "results": [
+    {"course_id": "uuid-1", "vectors_updated": 312, "status": "ok"},
+    {"course_id": "uuid-2", "vectors_updated": 535, "status": "ok"},
+    {"course_id": "uuid-3", "vectors_updated": 0, "status": "no_vectors"}
+  ]
+}
+```
+
+`status` values: `ok` (updated), `no_vectors` (no Pinecone vectors found for this course), `error` (update failed).
+
+### 27. Query a Space (SSE Streaming)
+```bash
+curl -N -X POST http://localhost:8000/api/v1/spaces/{space_id}/query/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "course_ids": ["uuid-1", "uuid-2", "uuid-3"],
+    "query": "How does gradient descent work?",
+    "user_id": "user-123",
+    "model": "claude-haiku-4-5"
+  }'
+```
+
+Searches all provided courses in parallel via Pinecone hybrid search + reranking, filters by relevance score (≥0.25), then streams a personalized LLM response with inline citations.
+
+**SSE Events** (streamed progressively):
+```
+data: {"type": "status", "phase": "searching", "total_courses": 3}
+
+data: {"type": "course_found", "course_id": "uuid-2", "course_title": "Machine Learning Basics", "chunks_found": 6}
+
+data: {"type": "course_found", "course_id": "uuid-1", "course_title": "Deep Learning", "chunks_found": 5}
+
+data: {"type": "status", "phase": "synthesizing"}
+
+data: {"type": "token", "text": "Gradient descent is an optimization algorithm [Source 1]..."}
+data: {"type": "token", "text": " used to minimize a loss function [Source 3]..."}
+
+data: {
+  "type": "citations",
+  "source_map": {"1": 0, "2": 0, "3": 1, "4": 1, "5": 2, "6": 2},
+  "sources": [
+    {
+      "course_id": "uuid-2",
+      "course_title": "Machine Learning Basics",
+      "chapter_title": "Optimization Fundamentals",
+      "source_file": "youtube_dQw4w9WgXcQ.txt",
+      "score": 0.892,
+      "course_link": "https://nuton.app/learn/machine-learning-basics?space=space-uuid",
+      "source_link": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    },
+    {
+      "course_id": "uuid-1",
+      "course_title": "Deep Learning",
+      "chapter_title": "Backpropagation",
+      "source_file": "dl_notes.pdf",
+      "score": 0.847,
+      "course_link": "https://nuton.app/learn/deep-learning?space=space-uuid",
+      "source_link": null
+    }
+  ]
+}
+
+data: {"type": "done", "from_web": false, "sources_used": 2}
+```
+
+**Web fallback** (when no relevant course content is found):
+```
+data: {"type": "status", "phase": "no_results", "falling_back_to_web": true, "message": "No relevant content found in your courses. Searching the web..."}
+
+data: {"type": "token", "text": "⚠️ This answer is not from your course materials..."}
+
+data: {"type": "done", "from_web": true, "sources_used": 0}
+```
+
+For non-Claude models, `falling_back_to_web` is `false` and the response comes from general knowledge (clearly labeled in the response).
+
+**SSE event types**:
+
+| Event | Fields | Description |
+|-------|--------|-------------|
+| `status` | `phase`, `total_courses`\|`falling_back_to_web`\|`message` | Phase transitions |
+| `course_found` | `course_id`, `course_title`, `chunks_found` | Emitted as each course returns relevant chunks |
+| `token` | `text` | Streaming LLM text delta (may contain `[Source N]` inline references) |
+| `citations` | `sources`, `source_map` | Deduplicated source list + inline reference map (see below) |
+| `done` | `from_web`, `sources_used` | End of stream |
+| `error` | `error`, `message`, `status_code` | On failure |
+
+**Request body**:
+- `course_ids`: List of 1–50 course UUIDs to search
+- `query`: The learner's question (must not be empty)
+- `user_id`: Used for personalization (learning profile) and chat history persistence
+- `model`: Optional model override (defaults to system default)
+
+Chat history is saved to the `space_conversations` table. The last 20 messages are included as conversation context for follow-up questions.
+
+---
+
+### Citations & Source Links — Full Reference
+
+#### `citations` event shape
+
+```json
+{
+  "type": "citations",
+  "source_map": {
+    "1": 0,
+    "2": 0,
+    "3": 1
+  },
+  "sources": [
+    {
+      "course_id": "uuid-2",
+      "course_title": "Machine Learning Basics",
+      "chapter_title": "Optimization Fundamentals",
+      "source_file": "youtube_dQw4w9WgXcQ.txt",
+      "score": 0.892,
+      "course_link": "https://nuton.app/learn/machine-learning-basics?space=space-uuid",
+      "source_link": "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    },
+    {
+      "course_id": "uuid-1",
+      "course_title": "Deep Learning",
+      "chapter_title": "Backpropagation",
+      "source_file": "dl_notes.pdf",
+      "score": 0.847,
+      "course_link": "https://nuton.app/learn/deep-learning?space=space-uuid",
+      "source_link": null
+    }
+  ]
+}
+```
+
+#### `sources` array — one entry per unique source
+
+Each entry is a deduplicated citation (collapsed by `course_id + source_file`, keeping the highest relevance score). Raw retrieval returns up to 6 chunks per course — after deduplication, the list reflects unique source files only.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `course_id` | string | Course UUID |
+| `course_title` | string | Display name of the course |
+| `chapter_title` | string | Chapter the best-matching chunk came from |
+| `source_file` | string | Original filename ingested into Pinecone |
+| `score` | number | Relevance score of the best matching chunk (0–1) |
+| `course_link` | string \| null | `https://nuton.app/learn/{slug}?space={space_id}` — always present if course has a slug |
+| `source_link` | string \| null | Direct link to the source material (see link resolution below) |
+
+#### `source_link` resolution rules
+
+| Source type | `source_file` pattern | `source_link` |
+|-------------|----------------------|---------------|
+| YouTube video | `youtube_{VIDEO_ID}.txt` | `https://www.youtube.com/watch?v={VIDEO_ID}` |
+| Web page | `web_{domain_parts}.txt` | `https://{domain}` (underscores → dots) |
+| Uploaded file (PPTX, etc.) | any, with stored URL | Direct S3/storage URL from `source_files.source_url` |
+| PDF (no stored URL) | `*.pdf` | `null` — use `course_link` instead |
+
+When `source_link` is `null`, fall back to `course_link` as the clickable destination.
+
+#### `source_map` — inline `[Source N]` → `sources` index
+
+The LLM response text contains inline references like `[Source 1]`, `[Source 3]`. The `source_map` maps each reference number (as a string key) to the zero-based index into the `sources` array.
+
+```
+source_map["1"] = 0  →  sources[0]  (Machine Learning Basics, YouTube)
+source_map["3"] = 1  →  sources[1]  (Deep Learning, PDF)
+```
+
+**Frontend usage pattern:**
+
+```js
+// After receiving the `citations` event:
+function resolveInlineSource(n, citations) {
+  const idx = citations.source_map[String(n)];
+  return citations.sources[idx];  // full citation object with links
+}
+
+// Render [Source N] as a clickable chip:
+const source = resolveInlineSource(1, citations);
+const href = source.source_link ?? source.course_link;
+// → render: <a href={href}>[Source 1]</a>
+```
+
+Because `citations` arrives after the full response has streamed, the recommended approach is to render the text as-is during streaming, then post-process `[Source N]` patterns into links once the `citations` event is received.
+
 ## Error Response Format
 
 All endpoints return structured, machine-readable error responses. No more inconsistent `{"detail": "string"}` shapes.
@@ -713,6 +921,7 @@ All data stored in Supabase (PostgreSQL):
 | `course_exam_attempts` | Graded exam submissions with scores and rubric breakdowns |
 | `flashcard_sets` | Standalone flashcard sets (course-based via `course_id` or content-based via `content_id`) |
 | `quiz_sets` | Standalone quiz sets with Bloom's taxonomy metadata |
+| `space_conversations` | Per-space, per-user chat history (`messages` JSONB, atomically appended via `append_space_conversation_messages` RPC) |
 
 Generation logs are still stored locally in `course_generation_logs.json` for debugging.
 
