@@ -6,8 +6,8 @@ import concurrent.futures
 from functools import partial
 
 from clients.chonkie_client import embed_query, embed_query_v2, embed_query_multimodal
-from clients.pinecone_client import hybrid_search, fetch_all_document_chunks
-from clients.pinecone_client import rerank_results
+from clients.qdrant_client import hybrid_search, fetch_all_document_chunks
+from clients.qdrant_client import rerank_results
 from groq import Groq
 import os
 from dotenv import load_dotenv
@@ -83,7 +83,7 @@ def generate_flashcards(
         logging.info(f"Retrieved {len(chunks)} chunks (target coverage: {target_coverage:.0%})")
 
         # Calculate actual coverage from chunks
-        from clients.pinecone_client import calculate_coverage_from_chunks
+        from clients.qdrant_client import calculate_coverage_from_chunks
         coverage_result = calculate_coverage_from_chunks(chunks)
         actual_coverage = coverage_result.get("coverage_percentage", 0.0)
         coverage_gaps = len(coverage_result.get("gaps", []))
@@ -399,7 +399,7 @@ OBJECTIVES:
 FORMAT — STRICTLY FOLLOW THIS STRUCTURE FOR EACH FLASHCARD:
 
 ---
-Question: [Clear, specific, and quiz-ready. Can be multiple choice, true/false, or open-ended.]
+Question: [Clear, specific, and quiz-ready. Can be multiple choice, true/false, or open-ended. NEVER use Anki cloze format like {{c1::...}}.]
 Answer: [Concise, 1–2 sentences max. Exact and unambiguous.]
 Hint: [A precise clue to aid memory. Should make the student think, not give away the answer.]
 Explanation: [Brief (1–3 sentences) but powerful clarification. Can include examples, context, or why it matters.]
@@ -569,6 +569,10 @@ def parse_flashcards_response(response_text: str) -> List[Dict[str, str]]:
 
             # Add card if it has at least Question and Answer (make Hint/Explanation optional)
             if "question" in current_card and "answer" in current_card:
+                # Strip any Anki cloze syntax the model may have generated
+                for field in ("question", "answer", "hint", "explanation"):
+                    if field in current_card:
+                        current_card[field] = strip_cloze_syntax(current_card[field])
                 # Fill in missing optional fields
                 current_card.setdefault("hint", "Review the material carefully")
                 current_card.setdefault("explanation", current_card["answer"])
@@ -642,6 +646,10 @@ def parse_streaming_content(text: str) -> List[Dict[str, str]]:
 
             # Add card if it has at least Question and Answer
             if "question" in card and "answer" in card:
+                # Strip any Anki cloze syntax the model may have generated
+                for field in ("question", "answer", "hint", "explanation"):
+                    if field in card:
+                        card[field] = strip_cloze_syntax(card[field])
                 # Fill in missing optional fields
                 card.setdefault("hint", "Review the material carefully")
                 card.setdefault("explanation", card["answer"])
@@ -725,6 +733,12 @@ def fast_deduplicate_flashcards(flashcards: List[Dict[str, str]]) -> List[Dict[s
         # Skip phase 2 for large result sets to avoid performance issues
         logging.info(f"Skipping similarity deduplication for large result set ({len(phase1_cards)} cards)")
         return phase1_cards
+
+
+def strip_cloze_syntax(text: str) -> str:
+    """Remove Anki cloze deletion markers like {{c1::answer}} → answer."""
+    import re
+    return re.sub(r'\{\{c\d+::([^}]+)\}\}', r'\1', text)
 
 
 def simplify_text(text: str) -> str:
@@ -917,7 +931,7 @@ def regenerate_flashcards(
         logging.info(f"Retrieved {len(chunks)} chunks for regeneration (target coverage: {target_coverage:.0%})")
 
         # Calculate actual coverage from chunks
-        from clients.pinecone_client import calculate_coverage_from_chunks
+        from clients.qdrant_client import calculate_coverage_from_chunks
         coverage_result = calculate_coverage_from_chunks(chunks)
         actual_coverage = coverage_result.get("coverage_percentage", 0.0)
         coverage_gaps = len(coverage_result.get("gaps", []))

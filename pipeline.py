@@ -11,8 +11,8 @@ import time
 from functools import lru_cache
 
 from clients.chonkie_client import chunk_document, embed_chunks, embed_chunks_v2, embed_query, embed_query_v2, embed_chunks_multimodal, embed_query_multimodal
-from clients.pinecone_client import upsert_vectors, upsert_image_vectors, hybrid_search, hybrid_search_parallel, rerank_results, hybrid_search_document_aware, rerank_results_document_aware
-from clients.supabase_client import insert_pdf_record, insert_yts_record, get_documents_in_space, check_document_type, upsert_generated_content_notes
+from clients.qdrant_client import upsert_vectors, upsert_image_vectors, hybrid_search, hybrid_search_parallel, rerank_results, hybrid_search_document_aware, rerank_results_document_aware
+from clients.supabase_client import insert_pdf_record, insert_yts_record, get_documents_in_space, check_document_type, upsert_generated_content_notes, get_supabase
 from clients.groq_client import generate_answer, generate_answer_document_aware
 import clients.openai_client as openai_client
 from services.wetrocloud_youtube import WetroCloudYouTubeService
@@ -33,9 +33,72 @@ from prompts.enrichment_examples import create_few_shot_enhanced_prompt
 from prompts.enhanced_prompts import get_domain_from_context
 from clients.websearch_client import analyze_and_generate_queries, perform_contextual_websearch_async, synthesize_rag_and_web_results
 from services.google_drive_service import GoogleDriveService
+from routes.course_routes import router as course_router
+from routes.space_routes import router as space_router
 
 
 app = FastAPI()
+
+# ---------------------------------------------------------------------------
+# Global exception handlers — unified error response format
+# ---------------------------------------------------------------------------
+from fastapi import Request
+from utils.exceptions import NutonError
+import traceback
+
+@app.exception_handler(NutonError)
+async def nuton_error_handler(request: Request, exc: NutonError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.error_code,
+            "message": exc.message,
+            "detail": exc.message,
+            "status_code": exc.status_code,
+            "context": exc.context or None,
+        },
+    )
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError):
+    msg = str(exc)
+    if "not found" in msg.lower():
+        status = 404
+        code = "COURSE_NOT_FOUND"
+    else:
+        status = 400
+        code = "INVALID_JSON"
+    return JSONResponse(
+        status_code=status,
+        content={
+            "error": code,
+            "message": msg,
+            "detail": msg,
+            "status_code": status,
+            "context": None,
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_error_handler(request: Request, exc: Exception):
+    logging.getLogger(__name__).error(f"Unhandled exception: {traceback.format_exc()}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "INTERNAL_ERROR",
+            "message": "An internal error occurred",
+            "detail": "An internal error occurred",
+            "status_code": 500,
+            "context": None,
+        },
+    )
+
+# Include course generation routes
+app.include_router(course_router)
+# Include space routes
+app.include_router(space_router)
 
 # Add CORS middleware
 app.add_middleware(
@@ -45,6 +108,15 @@ app.add_middleware(
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
 )
+
+@app.on_event("startup")
+async def startup():
+    try:
+        db = get_supabase()
+        db.table("user_list").select("id").limit(1).execute()
+        logger.info("Supabase connection OK")
+    except Exception as e:
+        logger.error(f"Supabase connection failed: {e}")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -785,6 +857,7 @@ async def answer_query(
         search_start = time.time()
         hits = hybrid_search_document_aware(
             query_emb=query_emb,
+            query_text=query,
             query_sparse=query_sparse,
             document_ids=all_document_ids,
             space_id=space_id,
@@ -927,6 +1000,7 @@ async def answer_query(
         search_start = time.time()
         hits = hybrid_search_parallel(
             query_emb=query_emb,
+            query_text=query,
             query_sparse=query_sparse,
             top_k=max(20, rerank_top_n * 2),  # Ensure we have enough results for reranking
             doc_id=doc_id_param,

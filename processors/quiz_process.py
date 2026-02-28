@@ -6,7 +6,7 @@ from functools import partial
 import random
 
 from clients.chonkie_client import embed_query, embed_query_v2, embed_query_multimodal
-from clients.pinecone_client import hybrid_search, fetch_all_document_chunks, rerank_results
+from clients.qdrant_client import hybrid_search, fetch_all_document_chunks, rerank_results
 from groq import Groq
 import os
 from dotenv import load_dotenv
@@ -236,7 +236,7 @@ def generate_quiz(
         logging.info(f"Retrieved {len(chunks)} chunks (target coverage: {target_coverage:.0%})")
 
         # Calculate actual coverage from chunks
-        from clients.pinecone_client import calculate_coverage_from_chunks
+        from clients.qdrant_client import calculate_coverage_from_chunks
         coverage_result = calculate_coverage_from_chunks(chunks)
         actual_coverage = coverage_result.get("coverage_percentage", 0.0)
         coverage_gaps = len(coverage_result.get("gaps", []))
