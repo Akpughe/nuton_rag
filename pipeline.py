@@ -10,33 +10,95 @@ import json
 import time
 from functools import lru_cache
 
-from chonkie_client import chunk_document, embed_chunks, embed_chunks_v2, embed_query, embed_query_v2, embed_chunks_multimodal, embed_query_multimodal
-from pinecone_client import upsert_vectors, upsert_image_vectors, hybrid_search, hybrid_search_parallel, rerank_results, hybrid_search_document_aware, rerank_results_document_aware
-from supabase_client import insert_pdf_record, insert_yts_record, get_documents_in_space, check_document_type, upsert_generated_content_notes
-from groq_client import generate_answer, generate_answer_document_aware
-import openai_client
+from clients.chonkie_client import chunk_document, embed_chunks, embed_chunks_v2, embed_query, embed_query_v2, embed_chunks_multimodal, embed_query_multimodal
+from clients.qdrant_client import upsert_vectors, upsert_image_vectors, hybrid_search, hybrid_search_parallel, rerank_results, hybrid_search_document_aware, rerank_results_document_aware
+from clients.supabase_client import insert_pdf_record, insert_yts_record, get_documents_in_space, check_document_type, upsert_generated_content_notes, get_supabase
+from clients.groq_client import generate_answer, generate_answer_document_aware
+import clients.openai_client as openai_client
 from services.wetrocloud_youtube import WetroCloudYouTubeService
 from services.youtube_transcript_service import YouTubeTranscriptService
 from services.ytdlp_transcript_service import YTDLPTranscriptService
-from flashcard_process import generate_flashcards, regenerate_flashcards
+from processors.flashcard_process import generate_flashcards, regenerate_flashcards
 from pydantic import BaseModel
 from typing import Optional, List
-from quiz_process import generate_quiz, regenerate_quiz
-from hybrid_pdf_processor import extract_and_chunk_pdf_async
-from diagram_explainer import explain_diagrams_batch
-from mistral_ocr_extractor import MistralOCRExtractor, MistralOCRConfig
+from processors.quiz_process import generate_quiz, regenerate_quiz
+from processors.hybrid_pdf_processor import extract_and_chunk_pdf_async
+from processors.diagram_explainer import explain_diagrams_batch
+from processors.mistral_ocr_extractor import MistralOCRExtractor, MistralOCRConfig
 from chonkie import RecursiveChunker
 from chonkie.tokenizer import AutoTokenizer
 
-from prompts import main_prompt, general_knowledge_prompt, simple_general_knowledge_prompt, no_docs_in_space_prompt, no_relevant_in_scope_prompt, additional_space_only_prompt
-from intelligent_enrichment import create_enriched_system_prompt
-from enrichment_examples import create_few_shot_enhanced_prompt
-from enhanced_prompts import get_domain_from_context
-from websearch_client import analyze_and_generate_queries, perform_contextual_websearch_async, synthesize_rag_and_web_results
+from prompts.prompts import main_prompt, general_knowledge_prompt, simple_general_knowledge_prompt, no_docs_in_space_prompt, no_relevant_in_scope_prompt, additional_space_only_prompt
+from prompts.enrichment_examples import create_few_shot_enhanced_prompt
+from prompts.enhanced_prompts import get_domain_from_context
+from clients.websearch_client import analyze_and_generate_queries, perform_contextual_websearch_async, synthesize_rag_and_web_results
 from services.google_drive_service import GoogleDriveService
+from routes.course_routes import router as course_router
+from routes.space_routes import router as space_router
 
 
 app = FastAPI()
+
+# ---------------------------------------------------------------------------
+# Global exception handlers — unified error response format
+# ---------------------------------------------------------------------------
+from fastapi import Request
+from utils.exceptions import NutonError
+import traceback
+
+@app.exception_handler(NutonError)
+async def nuton_error_handler(request: Request, exc: NutonError):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": exc.error_code,
+            "message": exc.message,
+            "detail": exc.message,
+            "status_code": exc.status_code,
+            "context": exc.context or None,
+        },
+    )
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError):
+    msg = str(exc)
+    if "not found" in msg.lower():
+        status = 404
+        code = "COURSE_NOT_FOUND"
+    else:
+        status = 400
+        code = "INVALID_JSON"
+    return JSONResponse(
+        status_code=status,
+        content={
+            "error": code,
+            "message": msg,
+            "detail": msg,
+            "status_code": status,
+            "context": None,
+        },
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_error_handler(request: Request, exc: Exception):
+    logging.getLogger(__name__).error(f"Unhandled exception: {traceback.format_exc()}")
+    return JSONResponse(
+        status_code=500,
+        content={
+            "error": "INTERNAL_ERROR",
+            "message": "An internal error occurred",
+            "detail": "An internal error occurred",
+            "status_code": 500,
+            "context": None,
+        },
+    )
+
+# Include course generation routes
+app.include_router(course_router)
+# Include space routes
+app.include_router(space_router)
 
 # Add CORS middleware
 app.add_middleware(
@@ -46,6 +108,15 @@ app.add_middleware(
     allow_methods=["*"],  # Allows all methods
     allow_headers=["*"],  # Allows all headers
 )
+
+@app.on_event("startup")
+async def startup():
+    try:
+        db = get_supabase()
+        db.table("user_list").select("id").limit(1).execute()
+        logger.info("Supabase connection OK")
+    except Exception as e:
+        logger.error(f"Supabase connection failed: {e}")
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -63,6 +134,9 @@ class FlashcardRequest(BaseModel):
     user_id: str
     num_questions: Optional[int] = None
     acl_tags: Optional[List[str]] = None
+    max_chunks: int = 1000
+    target_coverage: float = 0.80
+    enable_gap_filling: bool = True
 
 
 class QuizRequest(BaseModel):
@@ -72,6 +146,9 @@ class QuizRequest(BaseModel):
     question_type: str = "both"
     num_questions: int = 30
     acl_tags: Optional[str] = None
+    max_chunks: int = 1000
+    target_coverage: float = 0.80
+    enable_gap_filling: bool = True
     rerank_top_n: int = 50
     use_openai_embeddings: bool = False  # Deprecated: Always uses multimodal embeddings (1024 dims) to match Pinecone index
     set_id: int = 1
@@ -426,7 +503,7 @@ async def process_document_with_openai(
                 logging.info(f"🧠 Embedding {len(images_with_data)} images with Jina CLIP-v2")
 
                 try:
-                    from multimodal_embeddings import MultimodalEmbedder
+                    from embeddings.multimodal_embeddings import MultimodalEmbedder
 
                     # Initialize embedder
                     embedder = MultimodalEmbedder(model="jina-clip-v2", batch_size=batch_size)
@@ -780,6 +857,7 @@ async def answer_query(
         search_start = time.time()
         hits = hybrid_search_document_aware(
             query_emb=query_emb,
+            query_text=query,
             query_sparse=query_sparse,
             document_ids=all_document_ids,
             space_id=space_id,
@@ -922,6 +1000,7 @@ async def answer_query(
         search_start = time.time()
         hits = hybrid_search_parallel(
             query_emb=query_emb,
+            query_text=query,
             query_sparse=query_sparse,
             top_k=max(20, rerank_top_n * 2),  # Ensure we have enough results for reranking
             doc_id=doc_id_param,
@@ -1174,17 +1253,37 @@ def process_youtube(
             file.write(transcript_text)
         logging.info(f"Saved transcript to file: {file_path}")
         
-        # Direct chunking of transcript text without requiring file
-        logging.info(f"Chunking transcript directly from text")
-        chunks = chunk_document(
-            text=transcript_text,  # Pass text directly to chunker
+        # Chunk with Chonkie RecursiveChunker (matching process_document_with_openai)
+        logging.info(f"✂️ Chunking transcript with Chonkie RecursiveChunker (size={chunk_size})")
+
+        # Initialize tokenizer
+        chonkie_tokenizer = AutoTokenizer("cl100k_base")  # OpenAI tokenizer
+
+        # Initialize RecursiveChunker
+        chunker = RecursiveChunker(
+            tokenizer=chonkie_tokenizer,
             chunk_size=chunk_size,
-            overlap_tokens=overlap_tokens,
-            recipe="markdown",  # Use text recipe for transcript format with timestamps
-            lang="en",
             min_characters_per_chunk=12
         )
-        chunks = flatten_chunks(chunks)
+
+        # Chunk the text
+        chunk_objects = chunker.chunk(transcript_text)
+
+        # Convert to dicts (matching test format)
+        chunks = []
+        for i, chunk_obj in enumerate(chunk_objects):
+            chunk_dict = {
+                "text": chunk_obj.text,
+                "start_index": chunk_obj.start_index,
+                "end_index": chunk_obj.end_index,
+                "token_count": chunk_obj.token_count,
+                "chunk_index": i
+            }
+            chunks.append(chunk_dict)
+
+        logging.info(f"✅ Chunking complete: {len(chunks)} chunks")
+        logging.info(f"   Total tokens: {sum(c['token_count'] for c in chunks)}")
+        logging.info(f"   Avg tokens/chunk: {sum(c['token_count'] for c in chunks) / len(chunks):.1f}")
         
         if not chunks:
             logging.error(f"No chunks generated from transcript")
@@ -2033,25 +2132,31 @@ async def generate_flashcards_endpoint(
     request: FlashcardRequest
 ) -> JSONResponse:
     """
-    Endpoint to generate flashcards from a document.
-    
+    Endpoint to generate flashcards from a document with comprehensive coverage.
+
+    Uses fetch_all_document_chunks with gap-filling to ensure flashcards are generated
+    from throughout the document, not just semantically similar sections.
+
     Args:
-        request: FlashcardRequest with document_id, space_id, user_id, etc.
-        
+        request: FlashcardRequest with document_id, space_id, user_id, coverage params, etc.
+
     Returns:
-        JSON response with flashcards or error message.
+        JSON response with flashcards, coverage metadata, or error message.
     """
-    logging.info(f"Generate flashcards endpoint called for document: {request.document_id}, user: {request.user_id}")
-    
+    logging.info(f"Generate flashcards endpoint called for document: {request.document_id}, user: {request.user_id}, target_coverage: {request.target_coverage:.0%}")
+
     try:
         result = generate_flashcards(
             document_id=request.document_id,
             space_id=request.space_id,
             user_id=request.user_id,
             num_questions=request.num_questions,
-            acl_tags=request.acl_tags
+            acl_tags=request.acl_tags,
+            max_chunks=request.max_chunks,
+            target_coverage=request.target_coverage,
+            enable_gap_filling=request.enable_gap_filling
         )
-        
+
         return JSONResponse(result)
     except Exception as e:
         logging.exception(f"Error in generate_flashcards_endpoint: {e}")
@@ -2063,25 +2168,30 @@ async def regenerate_flashcards_endpoint(
     request: FlashcardRequest
 ) -> JSONResponse:
     """
-    Endpoint to regenerate flashcards from a document.
-    
+    Endpoint to regenerate flashcards from a document with comprehensive coverage.
+
+    Uses fetch_all_document_chunks to ensure new flashcards cover different parts of the document.
+
     Args:
-        request: FlashcardRequest with document_id, space_id, user_id, etc.
-        
+        request: FlashcardRequest with document_id, space_id, user_id, coverage params, etc.
+
     Returns:
-        JSON response with flashcards or error message.
+        JSON response with flashcards, coverage metadata, or error message.
     """
-    logging.info(f"Re-Generate flashcards endpoint called for document: {request.document_id}, user: {request.user_id}")
-    
+    logging.info(f"Re-Generate flashcards endpoint called for document: {request.document_id}, user: {request.user_id}, target_coverage: {request.target_coverage:.0%}")
+
     try:
         result = regenerate_flashcards(
             document_id=request.document_id,
             space_id=request.space_id,
             user_id=request.user_id,
             num_questions=request.num_questions,
-            acl_tags=request.acl_tags
+            acl_tags=request.acl_tags,
+            max_chunks=request.max_chunks,
+            target_coverage=request.target_coverage,
+            enable_gap_filling=request.enable_gap_filling
         )
-        
+
         return JSONResponse(result)
     except Exception as e:
         logging.exception(f"Error in regenerate_flashcards_endpoint: {e}")
@@ -2093,7 +2203,11 @@ async def generate_quiz_endpoint(
     request: QuizRequest
 ) -> JSONResponse:
     """
-    Endpoint to generate a quiz from a document.
+    Endpoint to generate a quiz from a document with comprehensive coverage.
+
+    Uses fetch_all_document_chunks with gap-filling to ensure quiz questions are distributed
+    throughout the document, not just from semantically similar sections.
+
     Args:
         request: QuizRequest containing parameters:
             - document_id: The document to generate the quiz from.
@@ -2102,18 +2216,21 @@ async def generate_quiz_endpoint(
             - question_type: Type of questions to generate ("mcq", "true_false", or "both").
             - num_questions: Total number of questions to generate.
             - acl_tags: Optional comma-separated ACL tags.
-            - rerank_top_n: Number of results to rerank.
-            - use_openai_embeddings: Whether to use OpenAI for embeddings.
+            - max_chunks: Maximum chunks to retrieve (default: 1000).
+            - target_coverage: Target coverage percentage (0.0-1.0, default: 0.80).
+            - enable_gap_filling: Enable intelligent gap-filling (default: True).
+            - rerank_top_n: Number of results to rerank (deprecated).
+            - use_openai_embeddings: Whether to use OpenAI for embeddings (deprecated).
             - set_id: Quiz set number.
             - title: Optional quiz title.
             - description: Optional quiz description.
     Returns:
-        JSON response with quiz or error message.
+        JSON response with quiz, coverage metadata, or error message.
     """
     # Validate question_type
     if request.question_type not in ["mcq", "true_false", "both"]:
         return JSONResponse({"error": "question_type must be one of 'mcq', 'true_false', or 'both'"}, status_code=400)
-        
+
     acl_list = [tag.strip() for tag in request.acl_tags.split(",")] if request.acl_tags else None
     try:
         result = generate_quiz(
@@ -2123,6 +2240,9 @@ async def generate_quiz_endpoint(
             question_type=request.question_type,
             num_questions=request.num_questions,
             acl_tags=acl_list,
+            max_chunks=request.max_chunks,
+            target_coverage=request.target_coverage,
+            enable_gap_filling=request.enable_gap_filling,
             rerank_top_n=request.rerank_top_n,
             use_openai_embeddings=request.use_openai_embeddings,
             set_id=request.set_id,

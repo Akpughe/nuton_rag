@@ -21,11 +21,11 @@ from note_generation_prompts import (
     get_level_config,
     FORMATTING_GUIDELINES
 )
-from pinecone_client import fetch_all_document_chunks
+from clients.qdrant_client import fetch_all_document_chunks
 
 # Import LLM clients
-import openai_client
-from groq_client import generate_answer as groq_generate
+import clients.openai_client as openai_client
+from clients.groq_client import generate_answer as groq_generate
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
